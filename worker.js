@@ -1499,7 +1499,11 @@ function renderWatchlist(items) {
         const code = tr.dataset.code;
         const item = watchlistItems.find(w => w.code === code);
         const live = byCodeMap[code];
-        openStockModal(live || { code, name: item ? item.name : code, price: 0, rate: 0, buyReq: 0, selReq: 0 });
+        const liveQuote = liveQuoteCache[code];
+        const lastKnown = watchlistLastKnownMap[code];
+        const fallbackPrice = liveQuote ? liveQuote.price : (lastKnown ? lastKnown.price : 0);
+        const fallbackRate = liveQuote ? liveQuote.rate : (lastKnown ? lastKnown.change_rate : 0);
+        openStockModal(live || { code, name: item ? item.name : code, price: fallbackPrice, rate: fallbackRate, buyReq: 0, selReq: 0 });
       });
     });
   }
@@ -1718,9 +1722,9 @@ let cachedToken = null;
 let cachedTokenExpiryMs = 0;
 const TOKEN_CACHE_MS = 3 * 60 * 60 * 1000; // 3시간 (실제 유효기간보다 넉넉히 짧게 잡아 안전마진)
 
-async function kiwoomIssueToken(env) {
+async function kiwoomIssueToken(env, forceRefresh) {
   const now = Date.now();
-  if (cachedToken && now < cachedTokenExpiryMs) {
+  if (!forceRefresh && cachedToken && now < cachedTokenExpiryMs) {
     return cachedToken;
   }
   const res = await fetch(`${kiwoomHost(env)}/oauth2/token`, {
@@ -1974,23 +1978,41 @@ async function classifyNewsSentiment(env, items) {
   return items;
 }
 
+// 키움이 "토큰이 유효하지 않습니다" 류의 인증 에러를 주면 true
+function isTokenInvalidError(data) {
+  return data && (data.return_code === 3 || /토큰|Token/i.test(JSON.stringify(data.return_msg || "")));
+}
+
 async function kiwoomQuote(env, token, code) {
-  const res = await fetch(`${kiwoomHost(env)}/api/dostk/mrkcond`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      authorization: `Bearer ${token}`,
-      "cont-yn": "N",
-      "next-key": "",
-      "api-id": "ka10007", // 시세표성정보요청
-    },
-    body: JSON.stringify({ stk_cd: code }),
-  });
-  const data = await res.json();
-  if (!res.ok || data.return_code !== 0) {
-    throw new Error(`ka10007 실패(code=${code}): ${JSON.stringify(data)}`);
+  const call = async (tok) => {
+    const res = await fetch(`${kiwoomHost(env)}/api/dostk/mrkcond`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json;charset=UTF-8",
+        authorization: `Bearer ${tok}`,
+        "cont-yn": "N",
+        "next-key": "",
+        "api-id": "ka10007", // 시세표성정보요청
+      },
+      body: JSON.stringify({ stk_cd: code }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.return_code !== 0) {
+      const err = new Error(`ka10007 실패(code=${code}): ${JSON.stringify(data)}`);
+      err.kiwoomData = data;
+      throw err;
+    }
+    return data;
+  };
+  try {
+    return await call(token);
+  } catch (e) {
+    if (isTokenInvalidError(e.kiwoomData)) {
+      const freshToken = await kiwoomIssueToken(env, true); // 캐시된 토큰이 무효화됐으므로 강제 재발급 후 한 번 더 시도
+      return await call(freshToken);
+    }
+    throw e;
   }
-  return data;
 }
 
 function abs(v) {
@@ -2038,22 +2060,36 @@ async function kiwoomChart(env, token, code, period) {
     body = { stk_cd: code, tic_scope: period, upd_stkpc_tp: "1" };
   }
 
-  const res = await fetch(`${kiwoomHost(env)}/api/dostk/chart`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      authorization: `Bearer ${token}`,
-      "cont-yn": "N",
-      "next-key": "",
-      "api-id": apiId,
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!res.ok || data.return_code !== 0) {
-    throw new Error(`${apiId} 실패(code=${code}): ${JSON.stringify(data)}`);
+  const call = async (tok) => {
+    const res = await fetch(`${kiwoomHost(env)}/api/dostk/chart`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json;charset=UTF-8",
+        authorization: `Bearer ${tok}`,
+        "cont-yn": "N",
+        "next-key": "",
+        "api-id": apiId,
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok || data.return_code !== 0) {
+      const err = new Error(`${apiId} 실패(code=${code}): ${JSON.stringify(data)}`);
+      err.kiwoomData = data;
+      throw err;
+    }
+    return data;
+  };
+
+  try {
+    return await call(token);
+  } catch (e) {
+    if (isTokenInvalidError(e.kiwoomData)) {
+      const freshToken = await kiwoomIssueToken(env, true); // 캐시된 토큰이 무효화됐으므로 강제 재발급 후 한 번 더 시도
+      return await call(freshToken);
+    }
+    throw e;
   }
-  return data;
 }
 
 // ---------- 손절/익절 라인 계산 (ATR 기반) ----------
