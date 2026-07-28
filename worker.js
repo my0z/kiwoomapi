@@ -245,9 +245,6 @@ function renderDashboard() {
 <title>급등주 스크리너 (5~15%)</title>
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#111111">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="급등주">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
@@ -2339,8 +2336,8 @@ export default {
           description: "5~15% 상승 종목 실시간 스크리너",
           start_url: "/",
           scope: "/",
-          display: "fullscreen",
-          display_override: ["fullscreen", "standalone"],
+          display: "browser",
+          display_override: ["browser"],
           orientation: "portrait",
           background_color: "#111111",
           theme_color: "#111111",
