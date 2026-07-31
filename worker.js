@@ -113,7 +113,48 @@ function isMarketHoursKST(date) {
   const day = kst.getDay(); // 0=Sun
   if (day === 0 || day === 6) return false;
   const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 32; // 09:01 ~ 15:32 (15:30 장마감 종가까지 반영)
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 36; // 09:01 ~ 15:36 (15:35 근처 정확한 종가 재조회 포함)
+}
+
+// 장마감(15:30) 직후, 그 시점 화면에 떠 있던 종목들을 하나씩 정확하게 재조회해서
+// 배치 수집(2분 간격이라 정각과 살짝 어긋날 수 있음)보다 정확한 최종 종가를 남김.
+// ka10027(배치) 대신 종목별 ka10007(개별 시세)이라 초당1건 제한 때문에 종목당 1.1초 걸림.
+async function collectFinalAccurateQuotes(env) {
+  const capturedAt = new Date().toISOString();
+  const timesRes = await env.DB.prepare(
+    `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`
+  ).all();
+  if (!timesRes.results.length) return { saved: 0 };
+  const lastTime = timesRes.results[0].captured_at;
+  const codesRes = await env.DB.prepare(
+    `SELECT DISTINCT code, name, market FROM snapshots WHERE captured_at = ?`
+  )
+    .bind(lastTime)
+    .all();
+  const targets = codesRes.results;
+  if (!targets.length) return { saved: 0 };
+
+  const token = await kiwoomIssueToken(env);
+  const rows = [];
+  for (const t of targets) {
+    try {
+      const raw = await kiwoomQuote(env, token, t.code);
+      const q = parseKiwoomQuote(raw);
+      rows.push({ code: t.code, name: t.name, price: q.price, rate: q.rate, volume: q.volume, market: t.market });
+    } catch (e) {
+      // 개별 종목 조회 실패는 건너뜀 (그 종목만 최종 갱신 안 됨, 나머지는 계속 진행)
+    }
+    await sleep(1100); // 키움 TR 초당1건 제한
+  }
+  if (!rows.length) return { saved: 0 };
+
+  const stmt = env.DB.prepare(
+    `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`
+  );
+  const batch = rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, capturedAt));
+  await env.DB.batch(batch);
+  return { saved: rows.length, capturedAt };
 }
 
 // ---------- Cron: 저장 ----------
@@ -2752,10 +2793,16 @@ self.addEventListener('fetch', (e) => {
   },
 
   async scheduled(event, env, ctx) {
-    if (!isMarketHoursKST(new Date())) return;
+    const now = new Date();
+    if (!isMarketHoursKST(now)) return;
+    const kst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+    const minutes = kst.getHours() * 60 + kst.getMinutes();
+    // cron이 짝수분마다 도니까 15:35 정각은 못 맞고, 가장 가까운 15:36 틱에 한 번만 정확한 종가로 재조회
+    const isFinalCloseTick = minutes === 15 * 60 + 36;
+
     ctx.waitUntil(
-      collectAndStore(env).catch((e) => {
-        console.error("scheduled collectAndStore 실패:", e.message || e);
+      (isFinalCloseTick ? collectFinalAccurateQuotes(env) : collectAndStore(env)).catch((e) => {
+        console.error("scheduled 수집 실패:", e.message || e);
       })
     );
   },
