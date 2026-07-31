@@ -1454,7 +1454,7 @@ function renderWatchlist(items) {
     // (배치 데이터는 오늘자 마지막 5~15% 스냅샷일 뿐이라, 그 이후 밴드를 벗어나며 크게 움직이면 낡은 값일 수 있음)
     const currentPrice = liveQuote ? liveQuote.price : (live ? live.price : (lastKnown ? lastKnown.price : null));
     const currentRate = liveQuote ? liveQuote.rate : (live ? live.rate : (lastKnown ? lastKnown.change_rate : null));
-    const entryPrice = w.entry_price || 0;
+    const entryPrice = w.entry_price; // null(확정중)과 0(조회실패)을 구분하기 위해 그대로 둠
     let pnl = null;
     if (currentPrice !== null && entryPrice > 0) {
       pnl = computeRealisticPnl(entryPrice, currentPrice, 1000000);
@@ -1476,13 +1476,13 @@ function renderWatchlist(items) {
       const pnlHtml = r.pnl
         ? '<span class="' + (r.pnl.netPnlPct >= 0 ? 'pnlPositive' : 'pnlNegative') + '">' +
           (r.pnl.netPnlPct >= 0 ? '+' : '') + r.pnl.netPnlPct.toFixed(2) + '% (' + (r.pnl.netPnlAmount >= 0 ? '+' : '') + fmt(r.pnl.netPnlAmount) + '원)</span>'
-        : '<span class="empty">시세 없음</span>';
+        : (r.entryPrice === null ? '<span class="empty">진입가 확정중</span>' : '<span class="empty">시세 없음</span>');
       return (
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
           '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
           '<td>' + rateHtml + '</td>' +
-          '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : '-') + '</td>' +
+          '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : (r.entryPrice === null ? '<span class="empty">확정중</span>' : '-')) + '</td>' +
           '<td>' + pnlHtml + '</td>' +
           '<td><span class="tradeDelBtn noRowClick" data-code="' + r.code + '">🗑️</span></td>' +
         '</tr>' +
@@ -1543,14 +1543,23 @@ function updateStarButton(code, name, price) {
       updateStarButton(code, name, price);
       fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
     } else {
-      watchlistItems = [{ code, name, entry_price: price, added_at: new Date().toISOString() }, ...watchlistItems];
+      // entry_price는 아직 미확정(null) — 화면엔 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
+      watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString() }, ...watchlistItems];
       renderWatchlist(watchlistItems);
       updateStarButton(code, name, price);
       fetch('/api/watchlist', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, name, price }),
-      }).catch(() => {});
+        body: JSON.stringify({ code, name }),
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (data.ok) {
+            const w = watchlistItems.find(x => x.code === code);
+            if (w) { w.entry_price = data.entryPrice; renderWatchlist(watchlistItems); }
+          }
+        })
+        .catch(() => {});
     }
   };
 }
@@ -1563,7 +1572,6 @@ document.querySelector('#topPicks tbody').addEventListener('click', (e) => {
   if (!star) return;
   e.stopPropagation();
   const code = star.dataset.code, name = star.dataset.name;
-  const price = (byCodeMap[code] && byCodeMap[code].price) || 0;
 
   if (watchlistCodes.has(code)) {
     watchlistItems = watchlistItems.filter(w => w.code !== code);
@@ -1572,15 +1580,24 @@ document.querySelector('#topPicks tbody').addEventListener('click', (e) => {
     renderWatchlist(watchlistItems); // 서버 재조회 없이 로컬에서 즉시 반영
     fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
   } else {
-    watchlistItems = [{ code, name, entry_price: price, added_at: new Date().toISOString() }, ...watchlistItems];
+    // entry_price는 아직 미확정(null) — 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
+    watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString() }, ...watchlistItems];
     star.classList.add('active');
     star.textContent = '★';
     renderWatchlist(watchlistItems);
     fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, name, price }),
-    }).catch(() => {});
+      body: JSON.stringify({ code, name }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.ok) {
+          const w = watchlistItems.find(x => x.code === code);
+          if (w) { w.entry_price = data.entryPrice; renderWatchlist(watchlistItems); }
+        }
+      })
+      .catch(() => {});
   }
 });
 
@@ -2378,18 +2395,16 @@ self.addEventListener('fetch', (e) => {
 
       if (url.pathname === "/api/watchlist" && request.method === "POST") {
         try {
-          const { code, name, price } = await request.json();
+          const { code, name } = await request.json();
           if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
-          let entryPrice = Number(price) || 0;
-          if (!entryPrice) {
-            // 클라이언트가 현재가를 안 보내준 경우에만(예외적) 키움 API로 조회 (느림)
-            try {
-              const token = await kiwoomIssueToken(env);
-              const quoteRaw = await kiwoomQuote(env, token, code);
-              entryPrice = parseKiwoomQuote(quoteRaw).price || 0;
-            } catch (e) {
-              // 시세 조회 실패해도 관심종목 등록 자체는 진행 (진입가 0으로 저장)
-            }
+          // 진입가는 정확도가 제일 중요한 값이라 항상 키움에 새로 조회 (클라이언트가 들고 있던 캐시 가격은 안 씀)
+          let entryPrice = 0;
+          try {
+            const token = await kiwoomIssueToken(env);
+            const quoteRaw = await kiwoomQuote(env, token, code);
+            entryPrice = parseKiwoomQuote(quoteRaw).price || 0;
+          } catch (e) {
+            // 시세 조회 실패해도 관심종목 등록 자체는 진행 (진입가 0으로 저장, 프론트에서 재시도 유도)
           }
           await env.DB.prepare(`INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price) VALUES (?, ?, ?, ?)`)
             .bind(code, name, new Date().toISOString(), entryPrice)
