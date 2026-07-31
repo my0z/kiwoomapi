@@ -1,10 +1,12 @@
-# wrangler.toml
 name = "kiwoomapi"
 main = "worker.js"
 compatibility_date = "2026-07-15"
 
 [[d1_databases]]
 binding = "DB"
+# 주의: 이름은 "naver_sise"지만 usb.kr 프로젝트가 아니라 이 naversise 전용 DB입니다.
+# (Cloudflare는 database_name이 아니라 database_id로 실제 연결하므로 이름 자체는 기능에 영향 없음.
+#  대시보드에서 usbkr-db, threads 등 다른 D1이랑 헷갈리지 않도록 이 주석 참고할 것)
 database_name = "naver_sise"
 database_id = "e4bd43bd-8692-45ad-8e99-28519cc78520"
 
@@ -50,3 +52,4 @@ invocation_logs = true
 enabled = false
 persist = true
 head_sampling_rate = 1
+
