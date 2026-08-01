@@ -2057,7 +2057,16 @@ async function kiwoomQuote(env, token, code) {
       },
       body: JSON.stringify({ stk_cd: code }),
     });
-    const data = await res.json();
+    const rawText = await res.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (parseErr) {
+      // 키움이 JSON 대신 HTML(세션 만료 등)을 준 경우 - 토큰 무효와 동일하게 재시도 대상으로 처리
+      const err = new Error(`ka10007 응답이 JSON이 아님(code=${code}): ${rawText.slice(0, 200)}`);
+      err.kiwoomData = { return_code: 3, return_msg: "JSON 파싱 실패(비정상 응답)" };
+      throw err;
+    }
     if (!res.ok || data.return_code !== 0) {
       const err = new Error(`ka10007 실패(code=${code}): ${JSON.stringify(data)}`);
       err.kiwoomData = data;
@@ -2133,7 +2142,16 @@ async function kiwoomChart(env, token, code, period) {
       },
       body: JSON.stringify(body),
     });
-    const data = await res.json();
+    const rawText = await res.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (parseErr) {
+      // 키움이 JSON 대신 HTML(세션 만료 등)을 준 경우 - 토큰 무효와 동일하게 재시도 대상으로 처리
+      const err = new Error(`${apiId} 응답이 JSON이 아님(code=${code}): ${rawText.slice(0, 200)}`);
+      err.kiwoomData = { return_code: 3, return_msg: "JSON 파싱 실패(비정상 응답)" };
+      throw err;
+    }
     if (!res.ok || data.return_code !== 0) {
       const err = new Error(`${apiId} 실패(code=${code}): ${JSON.stringify(data)}`);
       err.kiwoomData = data;
