@@ -1691,7 +1691,13 @@ document.getElementById('collectBtn').addEventListener('click', (e) => {
   btn.classList.add('spinning');
   btn.disabled = true;
   fetch('/api/run-now')
-    .then(res => res.json())
+    .then(res => {
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error('서버가 JSON이 아닌 응답을 보냄 (일시적인 타임아웃/네트워크 문제일 가능성, 잠시 후 다시 시도해보세요)');
+      }
+      return res.json();
+    })
     .then(data => {
       if (data.saved !== undefined) {
         return load().then(() => {
@@ -2439,13 +2445,17 @@ self.addEventListener('fetch', (e) => {
           const { code, name } = await request.json();
           if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
           // 진입가는 정확도가 제일 중요한 값이라 항상 키움에 새로 조회 (클라이언트가 들고 있던 캐시 가격은 안 씀)
+          // 첫 시도 실패하면 잠깐 쉬었다가 한 번 더 시도 (일시적 오류로 0원 저장되는 것 방지)
           let entryPrice = 0;
-          try {
-            const token = await kiwoomIssueToken(env);
-            const quoteRaw = await kiwoomQuote(env, token, code);
-            entryPrice = parseKiwoomQuote(quoteRaw).price || 0;
-          } catch (e) {
-            // 시세 조회 실패해도 관심종목 등록 자체는 진행 (진입가 0으로 저장, 프론트에서 재시도 유도)
+          for (let attempt = 0; attempt < 2 && entryPrice === 0; attempt++) {
+            try {
+              if (attempt > 0) await sleep(500);
+              const token = await kiwoomIssueToken(env);
+              const quoteRaw = await kiwoomQuote(env, token, code);
+              entryPrice = parseKiwoomQuote(quoteRaw).price || 0;
+            } catch (e) {
+              // 이번 시도 실패, 다음 루프에서 재시도 (마지막 시도까지 실패하면 0으로 저장, 프론트에서 재시도 유도)
+            }
           }
           await env.DB.prepare(`INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price) VALUES (?, ?, ?, ?)`)
             .bind(code, name, new Date().toISOString(), entryPrice)
