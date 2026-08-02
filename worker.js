@@ -597,6 +597,21 @@ function fmt(n){ return Number(n).toLocaleString(); }
 // ---------- 종목 클릭 모달 ----------
 const modalOverlay = document.getElementById('modalOverlay');
 const modalName = document.getElementById('modalName');
+
+// 종목명 탭하면 키움 앱 실행 시도 (설치 안 돼있으면 그냥 아무 반응 없음)
+// 안드로이드는 영웅문S# 패키지명(com.kiwoom.heromts)으로 확실히 실행됨.
+// iOS는 공식 문서화된 URL scheme을 못 찾아서 추정치(kiwoomherosnew://) 사용 중 - 실기기에서 안 열리면 알려주세요.
+function openKiwoomApp() {
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) {
+    window.location.href = 'intent://#Intent;package=com.kiwoom.heromts;end';
+  } else if (/iPhone|iPad|iPod/i.test(ua)) {
+    window.location.href = 'kiwoomherosnew://';
+  }
+}
+modalName.style.cursor = 'pointer';
+modalName.addEventListener('click', openKiwoomApp);
+
 const modalPrice = document.getElementById('modalPrice');
 const modalRate = document.getElementById('modalRate');
 const modalDetail = document.getElementById('modalDetail');
