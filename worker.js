@@ -604,7 +604,7 @@ const modalName = document.getElementById('modalName');
 function openKiwoomApp() {
   const ua = navigator.userAgent;
   if (/Android/i.test(ua)) {
-    window.location.href = 'intent://#Intent;package=com.kiwoom.heromts;end';
+    window.location.href = 'intent://launch#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;package=com.kiwoom.heromts;end;';
   } else if (/iPhone|iPad|iPod/i.test(ua)) {
     window.location.href = 'kiwoomherosnew://';
   }
