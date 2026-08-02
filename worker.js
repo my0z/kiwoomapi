@@ -2914,10 +2914,15 @@ self.addEventListener('fetch', (e) => {
           const token = await kiwoomIssueToken(env);
           const raw = await kiwoomChart(env, token, code, "1");
           const parsed = parseKiwoomChartOHLC(raw);
+          // 휴일 등으로 오늘자 데이터가 없으면, 이미 받아온 응답 안에서 가장 최근 거래일로 자동 폴백
+          // (추가 조회 없음 - kiwoomChart가 원래 여러 날짜분을 한 번에 내려줌)
           const todayStr = todayYYYYMMDD();
-          // 오늘자 09:00 이후 데이터만 (cntr_tm = YYYYMMDDHHMMSS)
-          const candles = parsed.filter((c) => c.time.slice(0, 8) === todayStr && c.time.slice(8, 12) >= "0900");
-          return Response.json({ ok: true, candles });
+          const hasToday = parsed.some((c) => c.time.slice(0, 8) === todayStr);
+          const targetDate = hasToday
+            ? todayStr
+            : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
+          const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
+          return Response.json({ ok: true, candles, tradingDate: targetDate || null });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
