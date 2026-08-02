@@ -320,10 +320,15 @@ function renderDashboard() {
   .clickableName { cursor:pointer; text-decoration:underline dotted; font-size:12px; color:#999; white-space:nowrap; }
   .clickableName:active { opacity:0.6; }
   .modalHeadRow {
-    display:flex; align-items:baseline; flex-wrap:wrap; gap:6px 10px;
+    display:flex; align-items:center; gap:10px;
+    margin-bottom:4px;
+  }
+  #modalCodeBadge { font-size:12px; color:#999; margin-bottom:6px; }
+  .modalPriceRow {
+    display:flex; align-items:baseline; gap:10px;
     margin-bottom:16px;
   }
-  .modalPriceInline { font-size:15px; color:#eee; font-weight:600; }
+  .modalPriceInline { font-size:20px; color:#eee; font-weight:700; }
   .starBtn {
     font-size:26px; cursor:pointer; color:#666;
     display:inline-flex; align-items:center; justify-content:center;
@@ -336,7 +341,7 @@ function renderDashboard() {
     min-width:36px; min-height:36px; padding:6px; vertical-align:middle;
   }
   .topPickStar.active { color:#ffd43b; }
-  .modalHeadRow .up { color:#ff6b6b; font-size:14px; }
+  .modalPriceRow .up { color:#ff6b6b; font-size:16px; }
   #modalDetail:empty { display:none; }
   #modalOrderBook { margin-bottom:12px; }
   .orderBookBar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#151515; }
@@ -536,7 +541,9 @@ function renderDashboard() {
       <div class="modalHeadRow">
         <span id="modalStarBtn" class="starBtn">☆</span>
         <h3 id="modalName">-</h3>
-        <span id="modalCodeBadge">코드: -</span>
+      </div>
+      <div id="modalCodeBadge">코드: -</div>
+      <div class="modalPriceRow">
         <span id="modalPrice" class="modalPriceInline">-</span>
         <span class="up" id="modalRate">-</span>
       </div>
