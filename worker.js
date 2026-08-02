@@ -639,6 +639,29 @@ periodRow.addEventListener('click', (e) => {
   startChartAutoRefresh(); // 기간 바뀌면 갱신 타이머 리셋
 });
 
+// 모달 상단 가격/등락률 + 관심종목 리스트 캐시를 한 값으로 동기화 (모달이랑 리스트가 서로 다른 값 보여주는 것 방지)
+function syncPriceEverywhere(code, price, rate) {
+  if (currentModalCode === code) {
+    modalPrice.textContent = fmt(price) + '원';
+    const rateVal = Number(rate) || 0;
+    modalRate.textContent = (rateVal >= 0 ? '+' : '') + rateVal.toFixed(2) + '%';
+    modalRate.classList.toggle('up', rateVal >= 0);
+    modalRate.classList.toggle('down', rateVal < 0);
+  }
+  liveQuoteCache[code] = { price, rate, fetchedAt: Date.now() };
+  updateWatchlistPriceCells(code);
+}
+
+function refreshModalQuoteAndSync(code) {
+  fetch('/api/quote?code=' + code)
+    .then(res => res.json())
+    .then(data => {
+      if (!data.ok) return;
+      syncPriceEverywhere(code, data.price, data.rate);
+    })
+    .catch(() => {});
+}
+
 function startChartAutoRefresh() {
   stopChartAutoRefresh();
   chartRefreshTimer = setInterval(() => {
@@ -648,11 +671,13 @@ function startChartAutoRefresh() {
     }
     if (document.hidden) return; // 탭이 백그라운드면 갱신 스킵 (불필요한 API 호출 방지)
     if (currentModalView === 'quote') {
-      showQuote(currentModalCode, true);
-    } else if (currentModalView === 'chart') {
-      showChart(currentModalCode, currentModalPeriod, true);
+      showQuote(currentModalCode, true); // 이 안에서 자체적으로 syncPriceEverywhere 호출함 (중복 조회 방지)
+    } else {
+      refreshModalQuoteAndSync(currentModalCode); // chart/risk 뷰는 별도로 상단 가격만 동기화
+      if (currentModalView === 'chart') {
+        showChart(currentModalCode, currentModalPeriod, true);
+      }
     }
-    // 'risk'(손절/익절) 뷰는 일봉 기반이라 자동갱신 안 함
   }, CHART_REFRESH_MS);
 }
 
@@ -819,6 +844,7 @@ function showQuote(code, silent) {
         if (!silent) modalDetail.innerHTML = '<div class="detailError">조회 실패: ' + (data.error || '알 수 없는 오류') + '</div>';
         return;
       }
+      syncPriceEverywhere(code, data.price, data.rate);
       const gapFromHigh = data.high ? (((data.price - data.high) / data.high) * 100) : 0;
       const now = new Date().toLocaleTimeString('ko-KR');
       const cntrStr = (byCodeMap[code] && byCodeMap[code].cntrStr) || 0;
@@ -1099,6 +1125,13 @@ function computeMomentumScores(latest, streak3Codes, streak5Codes) {
 // 신호 점수: 4개 조건 체크(검증된 전략 아님, 참고용 필터일 뿐)
 // 1) 체결강도 105 이상  2) 매수잔량>매도잔량  3) 거래량 상위 30% 이내  4) 3연속 이상 상승중
 // 지금까지 만든 지표(신호점수/종합점수/연속상승) + 저가 동전주 감점(작전주 위험, 나무위키 단타매매 기법)
+// TOP20에서 쓰던 것과 똑같은 별표 마크업을 모든 리스트에서 공용으로 사용
+function starHtml(code, name) {
+  const active = watchlistCodes.has(code);
+  return '<span class="topPickStar noRowClick ' + (active ? 'active' : '') + '" data-code="' + code + '" data-name="' + (name || '').replace(/"/g, '&quot;') + '">' +
+    (active ? '★' : '☆') + '</span> ';
+}
+
 function computeTopPicks(latest, streak5Codes) {
   return [...latest]
     .map(r => {
@@ -1198,7 +1231,7 @@ function renderAllTable() {
   );
   const allBody = document.querySelector('#all tbody');
   patchTable(allBody, sorted, r => [
-    r.name,
+    starHtml(r.code, r.name) + r.name,
     fmt(r.price),
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
     fmt(r.volume),
@@ -1254,7 +1287,7 @@ async function load() {
 
   const streak5Body = document.querySelector('#streak5 tbody');
   patchTable(streak5Body, data.streak5, r => [
-    r.name,
+    starHtml(r.code, r.name) + r.name,
     fmt(r.price),
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
     '<span class="delta">5연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
@@ -1262,7 +1295,7 @@ async function load() {
 
   const streak3Body = document.querySelector('#streak3 tbody');
   patchTable(streak3Body, data.streak3, r => [
-    r.name,
+    starHtml(r.code, r.name) + r.name,
     fmt(r.price),
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
     '<span class="delta">3연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
@@ -1270,7 +1303,7 @@ async function load() {
 
   const top5Body = document.querySelector('#top5 tbody');
   patchTable(top5Body, data.risingTop5, r => [
-    r.name,
+    starHtml(r.code, r.name) + r.name,
     fmt(r.price),
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
     '<span class="delta">▲' + r.delta.toFixed(2) + '%p</span>',
@@ -1285,8 +1318,7 @@ async function load() {
   const topPicks = computeTopPicks(latestList, streak5Codes);
   const topPicksBody = document.querySelector('#topPicks tbody');
   patchTable(topPicksBody, topPicks, r => [
-    '<span class="topPickStar noRowClick ' + (watchlistCodes.has(r.code) ? 'active' : '') + '" data-code="' + r.code + '" data-name="' + r.name + '">' +
-      (watchlistCodes.has(r.code) ? '★' : '☆') + '</span> ' + r.name,
+    starHtml(r.code, r.name) + r.name,
     fmt(r.price),
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
     fmt(r.volume),
@@ -1608,7 +1640,7 @@ function updateStarButton(code, name, price) {
 // (초기 관심종목 표시는 아래 load() 최초 호출에 포함되어 처리됨 - 중복 요청 방지)
 
 // TOP10 표 안 별표 클릭 (행 전체 클릭인 코드복사+앱실행과 분리)
-document.querySelector('#topPicks tbody').addEventListener('click', (e) => {
+document.body.addEventListener('click', (e) => {
   const star = e.target.closest('.topPickStar');
   if (!star) return;
   e.stopPropagation();
