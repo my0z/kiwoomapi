@@ -32,6 +32,7 @@ binding = "AI"
 KIWOOM_MOCK = "true"
 KIWOOM_BUY_QTY = "1"
 KIWOOM_SELL_QTY = "1"
+RELAY_URL = "http://relay.usb.kr:8787"
 
 # KIWOOM_APP_KEY, KIWOOM_APP_SECRET 은 여기 넣지 말 것!
 # Cloudflare 대시보드 > Workers & Pages > 해당 Worker > Settings
