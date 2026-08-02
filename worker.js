@@ -253,27 +253,44 @@ async function getLatest(env) {
 
   const latest = latestRes.results;
 
-  let risingTop5 = [];
-  if (times.length > 1) {
-    const prevMap = new Map(prevRes.results.map((r) => [r.code, r.change_rate]));
-    risingTop5 = latest
-      .filter((r) => prevMap.has(r.code))
-      .map((r) => ({ ...r, delta: r.change_rate - prevMap.get(r.code) }))
-      .filter((r) => r.delta > 0)
-      .sort((a, b) => b.delta - a.delta)
-      .slice(0, 5);
-  }
-
   // 3연속/5연속 상승 계산에 필요한 스냅샷 (위에서 이미 병렬로 받아온 결과 매핑만)
   const snapByTime = {};
   times.forEach((t, i) => {
     snapByTime[t] = new Map(snapRows[i].results.map((row) => [row.code, row]));
   });
 
-  const streak3 = computeStreak(times, snapByTime, 3);
-  const streak5 = computeStreak(times, snapByTime, 5);
+  // 최근 5틱(수집주기 2분이라 실제로는 대략 2/4/6/8/10분전) 대비 등락률 변화
+  // - 추가 조회 없이 위에서 받아온 snapByTime 재사용, TOP20/전체목록/연속상승/TOP5 전부 공유
+  const now = new Date(times[0]);
+  const momentumMap = new Map();
+  for (const [code, row] of snapByTime[times[0]]) {
+    const momentum = [];
+    for (let i = 1; i < times.length; i++) {
+      const prevRow = snapByTime[times[i]]?.get(code);
+      if (!prevRow) break; // 그 시점에 없던 종목(리스트 진입 전)이면 더 과거는 의미 없으니 중단
+      const minutesAgo = Math.round((now - new Date(times[i])) / 60000);
+      momentum.push({ minutesAgo, delta: row.change_rate - prevRow.change_rate });
+    }
+    momentumMap.set(code, momentum);
+  }
+  const withMomentum = (r) => ({ ...r, momentum: momentumMap.get(r.code) || [] });
 
-  return { latest, risingTop5, streak3, streak5, capturedAt: times[0] };
+  let risingTop5 = [];
+  if (times.length > 1) {
+    const prevMap = new Map(prevRes.results.map((r) => [r.code, r.change_rate]));
+    risingTop5 = latest
+      .filter((r) => prevMap.has(r.code))
+      .map((r) => ({ ...withMomentum(r), delta: r.change_rate - prevMap.get(r.code) }))
+      .filter((r) => r.delta > 0)
+      .sort((a, b) => b.delta - a.delta)
+      .slice(0, 5);
+  }
+
+  const streak3 = computeStreak(times, snapByTime, 3).map(withMomentum);
+  const streak5 = computeStreak(times, snapByTime, 5).map(withMomentum);
+  const latestWithMomentum = latest.map(withMomentum);
+
+  return { latest: latestWithMomentum, risingTop5, streak3, streak5, capturedAt: times[0] };
 }
 
 // ---------- 대시보드 HTML ----------
@@ -305,6 +322,7 @@ function renderDashboard() {
   .up { color:#ff6b6b; }
   .down { color:#4d9fff; }
   .delta { color:#ffd43b; }
+  .momentumLine { font-size:11px; color:#888; margin-top:2px; }
   .empty { color:#666; padding:12px 0; }
   tr.clickable { cursor:pointer; }
   tr.clickable:active { background:#2a2a2a; }
@@ -1245,6 +1263,17 @@ function patchTable(tbody, items, renderCells, emptyMessage, onRowClick) {
   Object.values(existing).forEach(tr => tr.remove());
 }
 
+// 최근 5틱(약 2/4/6/8/10분전) 대비 등락률 변화를 buildLine2 다음 줄에 공용으로 표시
+function renderMomentumLine(momentum) {
+  if (!momentum || !momentum.length) return '';
+  const parts = momentum.map(m => {
+    const cls = m.delta > 0 ? 'up' : m.delta < 0 ? 'down' : '';
+    const sign = m.delta > 0 ? '+' : '';
+    return m.minutesAgo + '분전 <span class="' + cls + '">' + sign + m.delta.toFixed(2) + '%p</span>';
+  });
+  return '<div class="momentumLine">' + parts.join(' · ') + '</div>';
+}
+
 // 1줄: 별표+종목명+현재가, 2줄: 나머지 정보 — 모든 리스트(TOP20/연속상승/전체목록)가 공용으로 사용
 function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick) {
   onRowClick = onRowClick || (item => { const mapped = byCodeMap[item.code]; if (mapped) openStockModal(mapped); });
@@ -1263,7 +1292,7 @@ function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick) {
   let prevNode = null; // 직전 항목의 sub row (다음 항목의 main row가 이 바로 뒤에 와야 함)
   items.forEach(item => {
     const nameHtml = starHtml(item.code, item.name) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
-    const line2Html = buildLine2(item);
+    const line2Html = buildLine2(item) + renderMomentumLine(item.momentum);
     let mainTr = existingMain[item.code];
     let subTr;
 
