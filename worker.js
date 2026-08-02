@@ -2755,6 +2755,29 @@ self.addEventListener('fetch', (e) => {
         try {
           const code = url.searchParams.get("code");
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
+
+          // 장 마감 후에는 실시간 재조회 대신 15:35 최종 재조회로 D1에 박아둔 정확한 마감 데이터를 씀
+          // (마감 후 키움 실전 조회는 기준이 달라져 리스트와 등락률이 어긋나는 문제 있었음)
+          if (!isMarketHoursKST(new Date())) {
+            const row = await env.DB.prepare(
+              `SELECT price, change_rate AS rate, volume FROM snapshots WHERE code = ? ORDER BY captured_at DESC LIMIT 1`
+            )
+              .bind(code)
+              .first();
+            if (row) {
+              return Response.json({
+                ok: true,
+                price: row.price,
+                rate: row.rate,
+                open: row.price,
+                high: row.price,
+                low: row.price,
+                volume: row.volume,
+              });
+            }
+            // D1에 해당 종목 기록이 없으면 아래로 폴백해서 실시간 조회 시도
+          }
+
           const token = await kiwoomIssueToken(env);
           const raw = await kiwoomQuote(env, token, code);
           return Response.json({ ok: true, ...parseKiwoomQuote(raw) });
