@@ -614,6 +614,9 @@ function openStockModal(item) {
   chartFullPrices = []; chartWindowSize = 0; chartOffsetFromEnd = 0;
   showChart(item.code, '1');
   startChartAutoRefresh();
+  if (!history.state || !history.state.modalOpen) {
+    history.pushState({ modalOpen: true }, ''); // 모바일 뒤로가기 버튼으로 모달만 닫히게 하기 위한 히스토리 항목
+  }
 }
 
 function setHeavyButtonsDisabled(disabled) {
@@ -705,9 +708,22 @@ function closeStockModal() {
   setHeavyButtonsDisabled(false);
 }
 
-modalCancelBtn.addEventListener('click', closeStockModal);
+function closeStockModalAndHistory() {
+  closeStockModal();
+  if (history.state && history.state.modalOpen) {
+    history.back(); // 뒤로가기 버튼 눌렀을 때 엉뚱한 페이지로 안 가도록 히스토리 항목 정리
+  }
+}
+
+window.addEventListener('popstate', () => {
+  if (modalOverlay.classList.contains('open')) {
+    closeStockModal(); // 모바일 뒤로가기 버튼으로 도착한 경우 - 히스토리는 이미 넘어갔으니 UI만 닫음
+  }
+});
+
+modalCancelBtn.addEventListener('click', closeStockModalAndHistory);
 modalOverlay.addEventListener('click', (e) => {
-  if (e.target === modalOverlay) closeStockModal();
+  if (e.target === modalOverlay) closeStockModalAndHistory();
 });
 
 function renderOrderBook(buyReq, selReq) {
