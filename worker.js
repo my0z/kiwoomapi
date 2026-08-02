@@ -38,7 +38,7 @@ function isRegularStock(name) {
 // ---------- 키움 REST API: 등락률 상위 조회 (ka10027) ----------
 // mrktTp: "001"=코스피, "101"=코스닥
 async function kiwoomRankingUp(env, token, mrktTp) {
-  const res = await fetch(`${kiwoomHost(env)}/api/dostk/rkinfo`, {
+  const res = await kiwoomRelayFetch(env, "/api/dostk/rkinfo", {
     method: "POST",
     headers: {
       "Content-Type": "application/json;charset=UTF-8",
@@ -1893,6 +1893,21 @@ function kiwoomHost(env, kind) {
   return "https://api.kiwoom.com"; // 조회는 항상 실전 서버
 }
 
+// 조회(실전) 요청은 고정 IP 중계서버를 거쳐서 나감 (Cloudflare Workers는 IP가 안 고정돼서
+// 키움의 "지정단말기" 제한을 직접 통과할 수 없음 - 대신 고정 IP 서버가 중간에서 대신 요청함)
+async function kiwoomRelayFetch(env, path, options) {
+  if (!env.RELAY_URL || !env.RELAY_SECRET) {
+    throw new Error("RELAY_URL / RELAY_SECRET 시크릿이 설정되지 않았습니다.");
+  }
+  return fetch(`${env.RELAY_URL}${path}`, {
+    ...options,
+    headers: {
+      ...(options && options.headers),
+      "X-Relay-Secret": env.RELAY_SECRET,
+    },
+  });
+}
+
 function kiwoomCreds(env, kind) {
   if (kind === "order") {
     return { appkey: env.KIWOOM_APP_KEY, secretkey: env.KIWOOM_APP_SECRET }; // 기존 모의투자 키
@@ -1918,15 +1933,22 @@ async function kiwoomIssueToken(env, forceRefresh, kind) {
     if (!isOrder && cachedToken && now < cachedTokenExpiryMs) return cachedToken;
   }
   const creds = kiwoomCreds(env, kind);
-  const res = await fetch(`${kiwoomHost(env, kind)}/oauth2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json;charset=UTF-8" },
-    body: JSON.stringify({
-      grant_type: "client_credentials",
-      appkey: creds.appkey,
-      secretkey: creds.secretkey,
-    }),
+  const tokenBody = JSON.stringify({
+    grant_type: "client_credentials",
+    appkey: creds.appkey,
+    secretkey: creds.secretkey,
   });
+  const res = isOrder
+    ? await fetch(`${kiwoomHost(env, kind)}/oauth2/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json;charset=UTF-8" },
+        body: tokenBody,
+      })
+    : await kiwoomRelayFetch(env, "/oauth2/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json;charset=UTF-8" },
+        body: tokenBody,
+      });
   const data = await res.json();
   if (!res.ok || !data.token) {
     throw new Error(`토큰 발급 실패: ${JSON.stringify(data)}`);
@@ -2181,7 +2203,7 @@ function isTokenInvalidError(data) {
 
 async function kiwoomQuote(env, token, code) {
   const call = async (tok) => {
-    const res = await fetch(`${kiwoomHost(env)}/api/dostk/mrkcond`, {
+    const res = await kiwoomRelayFetch(env, "/api/dostk/mrkcond", {
       method: "POST",
       headers: {
         "Content-Type": "application/json;charset=UTF-8",
@@ -2266,7 +2288,7 @@ async function kiwoomChart(env, token, code, period) {
   }
 
   const call = async (tok) => {
-    const res = await fetch(`${kiwoomHost(env)}/api/dostk/chart`, {
+    const res = await kiwoomRelayFetch(env, "/api/dostk/chart", {
       method: "POST",
       headers: {
         "Content-Type": "application/json;charset=UTF-8",
