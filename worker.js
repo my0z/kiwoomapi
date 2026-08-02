@@ -1884,30 +1884,23 @@ window.addEventListener('beforeinstallprompt', (e) => e.preventDefault());
 </html>`;
 }
 
-// 조회(시세/차트/랭킹 등)는 정확도가 중요해서 항상 실전 서버를 씀.
-// 매수/매도 주문만 KIWOOM_MOCK 설정을 따름 (kind === "order" 로 명시했을 때만).
-function kiwoomHost(env, kind) {
-  if (kind === "order") {
-    return env.KIWOOM_MOCK === "false" ? "https://api.kiwoom.com" : "https://mockapi.kiwoom.com";
-  }
-  return "https://api.kiwoom.com"; // 조회는 항상 실전 서버 (모의투자 서버는 TR마다 시세가 따로 놀 수 있어서 부정확함)
+function kiwoomHost(env) {
+  return env.KIWOOM_MOCK === "false"
+    ? "https://api.kiwoom.com"
+    : "https://mockapi.kiwoom.com"; // 기본값: 모의투자
 }
 
-// 토큰 캐시: 조회용/주문용을 따로 관리 (서버가 다르면 토큰도 따로 발급받아야 함)
+// 토큰 캐시 (Worker 인스턴스가 살아있는 동안 재사용)
 let cachedToken = null;
 let cachedTokenExpiryMs = 0;
-let cachedOrderToken = null;
-let cachedOrderTokenExpiryMs = 0;
 const TOKEN_CACHE_MS = 3 * 60 * 60 * 1000; // 3시간 (실제 유효기간보다 넉넉히 짧게 잡아 안전마진)
 
-async function kiwoomIssueToken(env, forceRefresh, kind) {
-  const isOrder = kind === "order";
+async function kiwoomIssueToken(env, forceRefresh) {
   const now = Date.now();
-  if (!forceRefresh) {
-    if (isOrder && cachedOrderToken && now < cachedOrderTokenExpiryMs) return cachedOrderToken;
-    if (!isOrder && cachedToken && now < cachedTokenExpiryMs) return cachedToken;
+  if (!forceRefresh && cachedToken && now < cachedTokenExpiryMs) {
+    return cachedToken;
   }
-  const res = await fetch(`${kiwoomHost(env, kind)}/oauth2/token`, {
+  const res = await fetch(`${kiwoomHost(env)}/oauth2/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json;charset=UTF-8" },
     body: JSON.stringify({
@@ -1920,11 +1913,6 @@ async function kiwoomIssueToken(env, forceRefresh, kind) {
   if (!res.ok || !data.token) {
     throw new Error(`토큰 발급 실패: ${JSON.stringify(data)}`);
   }
-  if (isOrder) {
-    cachedOrderToken = data.token;
-    cachedOrderTokenExpiryMs = now + TOKEN_CACHE_MS;
-    return cachedOrderToken;
-  }
   cachedToken = data.token;
   cachedTokenExpiryMs = now + TOKEN_CACHE_MS;
   return cachedToken;
@@ -1935,9 +1923,9 @@ async function kiwoomBuyOrder(env, code) {
     throw new Error("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 시크릿이 설정되지 않았습니다.");
   }
   const qty = parseInt(env.KIWOOM_BUY_QTY || "1", 10);
-  const token = await kiwoomIssueToken(env, false, "order");
+  const token = await kiwoomIssueToken(env);
 
-  const res = await fetch(`${kiwoomHost(env, "order")}/api/dostk/ordr`, {
+  const res = await fetch(`${kiwoomHost(env)}/api/dostk/ordr`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json;charset=UTF-8",
@@ -1963,9 +1951,9 @@ async function kiwoomSellOrder(env, code) {
     throw new Error("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 시크릿이 설정되지 않았습니다.");
   }
   const qty = parseInt(env.KIWOOM_SELL_QTY || env.KIWOOM_BUY_QTY || "1", 10);
-  const token = await kiwoomIssueToken(env, false, "order");
+  const token = await kiwoomIssueToken(env);
 
-  const res = await fetch(`${kiwoomHost(env, "order")}/api/dostk/ordr`, {
+  const res = await fetch(`${kiwoomHost(env)}/api/dostk/ordr`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json;charset=UTF-8",
