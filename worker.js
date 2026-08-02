@@ -598,16 +598,11 @@ function fmt(n){ return Number(n).toLocaleString(); }
 const modalOverlay = document.getElementById('modalOverlay');
 const modalName = document.getElementById('modalName');
 
-// 종목명 탭하면 키움 앱 실행 시도 (설치 안 돼있으면 그냥 아무 반응 없음)
-// 안드로이드는 영웅문S# 패키지명(com.kiwoom.heromts)으로 확실히 실행됨.
-// iOS는 공식 문서화된 URL scheme을 못 찾아서 추정치(kiwoomherosnew://) 사용 중 - 실기기에서 안 열리면 알려주세요.
+// 종목명 탭하면 키움 앱 실행 (heromts://heromtshost는 APK 매니페스트에서 직접 확인한 실제 등록 스킴)
+// 종목코드로 특정 화면 이동은 안 됨(과거에 후보 URL들 실기기 테스트로 확인됨) - 앱만 켜짐
+const KIWOOM_SCHEME_URL = 'heromts://heromtshost';
 function openKiwoomApp() {
-  const ua = navigator.userAgent;
-  if (/Android/i.test(ua)) {
-    window.location.href = 'intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;package=com.kiwoom.heromts;end';
-  } else if (/iPhone|iPad|iPod/i.test(ua)) {
-    window.location.href = 'kiwoomherosnew://';
-  }
+  window.location.href = KIWOOM_SCHEME_URL;
 }
 modalName.style.cursor = 'pointer';
 modalName.addEventListener('click', openKiwoomApp);
