@@ -2648,9 +2648,22 @@ self.addEventListener('fetch', (e) => {
         try {
           const { code, name } = await request.json();
           if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
+
+          let entryPrice = 0;
+
+          // 장 마감 후/휴일에는 실시간 조회가 부정확한 값을 줄 수 있어서(모달과 동일 문제) D1 마지막 시세를 그대로 진입가로 씀
+          if (!isMarketHoursKST(new Date())) {
+            const row = await env.DB.prepare(
+              `SELECT price FROM snapshots WHERE code = ? ORDER BY captured_at DESC LIMIT 1`
+            )
+              .bind(code)
+              .first();
+            if (row) entryPrice = row.price;
+          }
+
+          // 장중이거나(정상 케이스), 위에서 D1에 데이터가 없었던 경우엔 실시간 조회
           // 진입가는 정확도가 제일 중요한 값이라 항상 키움에 새로 조회 (클라이언트가 들고 있던 캐시 가격은 안 씀)
           // 첫 시도 실패하면 잠깐 쉬었다가 한 번 더 시도 (일시적 오류로 0원 저장되는 것 방지)
-          let entryPrice = 0;
           for (let attempt = 0; attempt < 2 && entryPrice === 0; attempt++) {
             try {
               if (attempt > 0) await sleep(500);
