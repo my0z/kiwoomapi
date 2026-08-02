@@ -298,6 +298,10 @@ function renderDashboard() {
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { padding:6px 4px; text-align:right; border-bottom:1px solid #2a2a2a; }
   th:first-child, td:first-child { text-align:left; }
+  tr.twoLineRow td { padding-bottom:2px; font-size:14px; }
+  tr.twoLineRow .rowPrice { float:right; font-weight:700; font-size:15px; color:#eee; }
+  tr.twoLineSubRow td { padding-top:0; padding-bottom:10px; border-bottom:1px solid #232323; font-size:12px; color:#999; }
+  tr.twoLineSubRow { cursor:default; }
   .up { color:#ff6b6b; }
   .down { color:#4d9fff; }
   .delta { color:#ffd43b; }
@@ -316,14 +320,14 @@ function renderDashboard() {
     padding:20px 16px 24px; animation:slideUp .15s ease-out;
   }
   @keyframes slideUp { from{ transform:translateY(20px); opacity:0; } to{ transform:translateY(0); opacity:1; } }
-  #modalBox h3 { margin:0; font-size:16px; white-space:nowrap; }
+  #modalBox h3 { margin:0; font-size:22px; font-weight:700; white-space:nowrap; }
   .clickableName { cursor:pointer; text-decoration:underline dotted; font-size:12px; color:#999; white-space:nowrap; }
   .clickableName:active { opacity:0.6; }
   .modalHeadRow {
-    display:flex; align-items:center; gap:10px;
+    display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px;
     margin-bottom:4px;
   }
-  #modalCodeBadge { font-size:12px; color:#999; margin-bottom:6px; }
+  #modalCodeBadge { font-size:12px; color:#999; white-space:nowrap; }
   .modalPriceRow {
     display:flex; align-items:baseline; gap:10px;
     margin-bottom:16px;
@@ -487,7 +491,6 @@ function renderDashboard() {
   <div class="board topPicksBoard">
     <h2>🏆 오늘의 TOP 20</h2>
     <table id="topPicks">
-      <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>거래량</th><th>체결강도</th><th>점수</th></tr></thead>
       <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
     </table>
   </div>
@@ -531,7 +534,6 @@ function renderDashboard() {
       </div>
     </div>
     <table id="all">
-      <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>거래량</th><th>체결강도</th><th>신호</th></tr></thead>
       <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
     </table>
   </div>
@@ -541,8 +543,8 @@ function renderDashboard() {
       <div class="modalHeadRow">
         <span id="modalStarBtn" class="starBtn">☆</span>
         <h3 id="modalName">-</h3>
+        <span id="modalCodeBadge">-</span>
       </div>
-      <div id="modalCodeBadge">코드: -</div>
       <div class="modalPriceRow">
         <span id="modalPrice" class="modalPriceInline">-</span>
         <span class="up" id="modalRate">-</span>
@@ -603,7 +605,7 @@ function openStockModal(item) {
   currentModalPeriod = '1';
   currentModalView = 'chart';
   modalName.textContent = item.name;
-  modalCodeBadge.textContent = '코드: ' + item.code + ' (복사됨)';
+  modalCodeBadge.textContent = item.code + ' (복사됨)';
   modalPrice.textContent = fmt(item.price) + '원';
   const modalRateVal = Number(item.rate) || 0;
   modalRate.textContent = (modalRateVal >= 0 ? '+' : '') + modalRateVal.toFixed(2) + '%';
@@ -1243,6 +1245,72 @@ function patchTable(tbody, items, renderCells, emptyMessage, onRowClick) {
   Object.values(existing).forEach(tr => tr.remove());
 }
 
+// 1줄: 별표+종목명+현재가, 2줄: 나머지 정보 — 모든 리스트(TOP20/연속상승/전체목록)가 공용으로 사용
+function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick) {
+  onRowClick = onRowClick || (item => { const mapped = byCodeMap[item.code]; if (mapped) openStockModal(mapped); });
+  if (!items.length) {
+    if (tbody.children.length !== 1 || !tbody.querySelector('.empty')) {
+      tbody.innerHTML = '<tr><td class="empty">' + emptyMessage + '</td></tr>';
+    }
+    return;
+  }
+
+  const existingMain = {};
+  tbody.querySelectorAll('tr.twoLineRow[data-code]').forEach(tr => { existingMain[tr.dataset.code] = tr; });
+  const placeholder = tbody.querySelector('td.empty');
+  if (placeholder) placeholder.closest('tr').remove();
+
+  let prevNode = null; // 직전 항목의 sub row (다음 항목의 main row가 이 바로 뒤에 와야 함)
+  items.forEach(item => {
+    const nameHtml = starHtml(item.code, item.name) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
+    const line2Html = buildLine2(item);
+    let mainTr = existingMain[item.code];
+    let subTr;
+
+    if (mainTr) {
+      const td = mainTr.children[0];
+      if (td.innerHTML !== nameHtml) td.innerHTML = nameHtml; // 안 바뀌었으면 손 안 댐 (깜빡임 방지)
+      subTr = mainTr.nextElementSibling;
+      if (!subTr || !subTr.classList.contains('twoLineSubRow')) {
+        subTr = document.createElement('tr');
+        subTr.className = 'twoLineSubRow';
+        subTr.appendChild(document.createElement('td'));
+      }
+      const subTd = subTr.children[0];
+      if (subTd.innerHTML !== line2Html) subTd.innerHTML = line2Html;
+      delete existingMain[item.code];
+    } else {
+      mainTr = document.createElement('tr');
+      mainTr.className = 'clickable twoLineRow';
+      mainTr.dataset.code = item.code;
+      const td = document.createElement('td');
+      td.innerHTML = nameHtml;
+      mainTr.appendChild(td);
+      mainTr.addEventListener('click', (e) => {
+        if (e.target.closest('.noRowClick')) return;
+        onRowClick(item);
+      });
+
+      subTr = document.createElement('tr');
+      subTr.className = 'twoLineSubRow';
+      const subTd = document.createElement('td');
+      subTd.innerHTML = line2Html;
+      subTr.appendChild(subTd);
+    }
+
+    const wantedMainNext = prevNode ? prevNode.nextSibling : tbody.firstChild;
+    if (wantedMainNext !== mainTr) tbody.insertBefore(mainTr, wantedMainNext);
+    if (mainTr.nextSibling !== subTr) tbody.insertBefore(subTr, mainTr.nextSibling);
+    prevNode = subTr;
+  });
+
+  Object.values(existingMain).forEach(tr => {
+    const sub = tr.nextElementSibling;
+    if (sub && sub.classList.contains('twoLineSubRow')) sub.remove();
+    tr.remove();
+  });
+}
+
 function renderAllTable() {
   const sorted = [...latestList].sort((a, b) =>
     currentSort === 'volumeDesc' ? b.volume - a.volume
@@ -1253,14 +1321,12 @@ function renderAllTable() {
     : b.change_rate - a.change_rate
   );
   const allBody = document.querySelector('#all tbody');
-  patchTable(allBody, sorted, r => [
-    starHtml(r.code, r.name) + r.name,
-    fmt(r.price),
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
-    fmt(r.volume),
-    '<span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>',
-    '<span title="' + ((r.signalChecks || []).join(', ') || '조건 없음') + '">' + '🔥'.repeat(r.signalScore || 0) + (r.lowPriceWarning ? ' ⚠️' : '') + '</span>',
-  ], '데이터 없음');
+  renderTwoLineList(allBody, sorted, r =>
+    '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
+    ' · 거래량 ' + fmt(r.volume) +
+    ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
+    ' · <span title="' + ((r.signalChecks || []).join(', ') || '조건 없음') + '">' + '🔥'.repeat(r.signalScore || 0) + (r.lowPriceWarning ? ' ⚠️' : '') + '</span>',
+  '데이터 없음');
 }
 
 document.getElementById('sortByMomentum').addEventListener('click', (e) => {
@@ -1309,28 +1375,22 @@ async function load() {
     : '아직 저장된 데이터가 없습니다';
 
   const streak5Body = document.querySelector('#streak5 tbody');
-  patchTable(streak5Body, data.streak5, r => [
-    starHtml(r.code, r.name) + r.name,
-    fmt(r.price),
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
-    '<span class="delta">5연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
-  ], '5연속 상승 종목 없음');
+  renderTwoLineList(streak5Body, data.streak5, r =>
+    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
+    ' · <span class="delta">5연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
+  '5연속 상승 종목 없음');
 
   const streak3Body = document.querySelector('#streak3 tbody');
-  patchTable(streak3Body, data.streak3, r => [
-    starHtml(r.code, r.name) + r.name,
-    fmt(r.price),
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
-    '<span class="delta">3연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
-  ], '3연속 상승 종목 없음');
+  renderTwoLineList(streak3Body, data.streak3, r =>
+    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
+    ' · <span class="delta">3연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
+  '3연속 상승 종목 없음');
 
   const top5Body = document.querySelector('#top5 tbody');
-  patchTable(top5Body, data.risingTop5, r => [
-    starHtml(r.code, r.name) + r.name,
-    fmt(r.price),
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
-    '<span class="delta">▲' + r.delta.toFixed(2) + '%p</span>',
-  ], '직전 스냅샷 대비 상승 종목 없음');
+  renderTwoLineList(top5Body, data.risingTop5, r =>
+    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
+    ' · <span class="delta">▲' + r.delta.toFixed(2) + '%p</span>',
+  '직전 스냅샷 대비 상승 종목 없음');
 
   latestList = data.latest;
   const streak3Codes = new Set(data.streak3.map(r => r.code));
@@ -1340,14 +1400,12 @@ async function load() {
 
   const topPicks = computeTopPicks(latestList, streak5Codes);
   const topPicksBody = document.querySelector('#topPicks tbody');
-  patchTable(topPicksBody, topPicks, r => [
-    starHtml(r.code, r.name) + r.name,
-    fmt(r.price),
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>',
-    fmt(r.volume),
-    '<span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>',
-    '🔥'.repeat(Math.max(1, Math.min(5, Math.round(r.topScore / 10)))),
-  ], '데이터 없음');
+  renderTwoLineList(topPicksBody, topPicks, r =>
+    '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
+    ' · 거래량 ' + fmt(r.volume) +
+    ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
+    ' · ' + '🔥'.repeat(Math.max(1, Math.min(5, Math.round(r.topScore / 10)))),
+  '데이터 없음');
 
   // 클릭용 종목 정보 매핑 (streak5 + streak3 + top5 + all 합쳐서)
   byCodeMap = {};
