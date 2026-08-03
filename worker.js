@@ -293,7 +293,7 @@ async function getLatest(env) {
   ).all();
   const times = timesRes.results.map((r) => r.captured_at);
   if (times.length === 0) {
-    return { latest: [], risingTop5: [], streak3: [], streak5: [], capturedAt: null };
+    return { latest: [], risingTop5: [], streak3: [], streak5: [], pullbackCandidates: [], capturedAt: null };
   }
 
   // 아래 쿼리들은 서로 독립적이라 순차 대기 없이 한 번에 병렬 실행
@@ -343,22 +343,76 @@ async function getLatest(env) {
   }
   const withMomentum = (r) => ({ ...r, momentum: momentumMap.get(r.code) || [] });
 
+  // ---------- 추가 지표들 (전부 이미 있는 snapshots 데이터로만 계산 - 추가 키움 조회 없음) ----------
+  const todayPrefix = times[0].slice(0, 10); // YYYY-MM-DD (KST 장중은 항상 같은 UTC 날짜라 안전)
+  const threeDaysAgoIso = new Date(new Date(times[0]).getTime() - 3 * 24 * 60 * 60 * 1000).toISOString();
+  const [todayMaxRes, repeatRes] = await Promise.all([
+    // 당일 종목별 등락률 최고치 - 지금이 그 최고치를 찍고 있는 중인지(신고가 경신) 판단용
+    env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at LIKE ? GROUP BY code`)
+      .bind(todayPrefix + "%")
+      .all(),
+    // 최근 3일간 이 종목이 급등리스트(5%+)에 며칠 등장했는지 - 일회성 vs 지속 관심 구분용
+    env.DB.prepare(
+      `SELECT code, COUNT(DISTINCT substr(captured_at,1,10)) AS dayCount
+       FROM snapshots WHERE captured_at >= ? AND change_rate >= 5 GROUP BY code`
+    )
+      .bind(threeDaysAgoIso)
+      .all(),
+  ]);
+  const todayMaxMap = new Map(todayMaxRes.results.map((r) => [r.code, r.maxRate]));
+  const repeatMap = new Map(repeatRes.results.map((r) => [r.code, r.dayCount]));
+  const avgRateNow = latest.length ? latest.reduce((s, r) => s + r.change_rate, 0) / latest.length : 0;
+
+  const withExtras = (r) => {
+    const withMom = withMomentum(r);
+    const prevVolRow = snapByTime[times[1]]?.get(r.code); // 직전 틱(약 2분전) 거래량
+    const volumeSpikeRatio = prevVolRow && prevVolRow.volume > 0 ? r.volume / prevVolRow.volume : null;
+    const todayMaxRate = todayMaxMap.get(r.code) ?? r.change_rate;
+    return {
+      ...withMom,
+      volumeSpikeRatio, // 2 이상이면 직전 틱 대비 거래량 2배 이상 튄 것
+      isTodayHigh: r.change_rate >= todayMaxRate - 0.001, // 오늘 등락률 최고치를 지금 찍고 있는 중
+      todayMaxRate,
+      repeatDays: repeatMap.get(r.code) || 1, // 최근 3일간 급등리스트 등장 일수
+      relativeStrength: +(r.change_rate - avgRateNow).toFixed(2), // 지금 틱 전체 평균 대비 상대강도
+    };
+  };
+
   let risingTop5 = [];
   if (times.length > 1) {
     const prevMap = new Map(prevRes.results.map((r) => [r.code, r.change_rate]));
     risingTop5 = latest
       .filter((r) => prevMap.has(r.code))
-      .map((r) => ({ ...withMomentum(r), delta: r.change_rate - prevMap.get(r.code) }))
+      .map((r) => ({ ...withExtras(r), delta: r.change_rate - prevMap.get(r.code) }))
       .filter((r) => r.delta > 0)
       .sort((a, b) => b.delta - a.delta)
       .slice(0, 5);
   }
 
-  const streak3 = computeStreak(times, snapByTime, 3).map(withMomentum);
-  const streak5 = computeStreak(times, snapByTime, 5).map(withMomentum);
-  const latestWithMomentum = latest.map(withMomentum);
+  const streak3 = computeStreak(times, snapByTime, 3).map(withExtras);
+  const streak5 = computeStreak(times, snapByTime, 5).map(withExtras);
+  const latestWithMomentum = latest.map(withExtras);
 
-  return { latest: latestWithMomentum, risingTop5, streak3, streak5, capturedAt: times[0] };
+  // 눌림목 후보: 오늘 고점 대비 1~4%p 밀렸다가, 최근 구간(2분전) momentum이 다시 양전환된 종목
+  // (상승 후 잠깐 쉬고 재상승 시도하는 지점 - 무작정 고점 추격매수보다 나은 진입 타이밍 후보)
+  const pullbackCandidates = latestWithMomentum
+    .filter((r) => {
+      const pullback = r.todayMaxRate - r.change_rate;
+      const recentMomentum = r.momentum[0]?.delta; // 가장 최근 구간(2분전)
+      return pullback >= 1 && pullback <= 4 && recentMomentum !== undefined && recentMomentum > 0;
+    })
+    .map((r) => ({ ...r, pullbackPct: +(r.todayMaxRate - r.change_rate).toFixed(2) }))
+    .sort((a, b) => (b.momentum[0]?.delta || 0) - (a.momentum[0]?.delta || 0))
+    .slice(0, 10);
+
+  return {
+    latest: latestWithMomentum,
+    risingTop5,
+    streak3,
+    streak5,
+    pullbackCandidates,
+    capturedAt: times[0],
+  };
 }
 
 // ---------- 클라이언트 JS (/app.js로 서빙, HTML과 분리해서 diff/유지보수 쉽게) ----------
@@ -968,6 +1022,38 @@ function computeTopPicks(latest, streak5Codes) {
     .slice(0, 20);
 }
 
+// 추천 종목 TOP10: topScore(momentumScore+signalScore+연속상승)에 배지 신호(당일신고가/거래량급증/상대강도)를
+// 더 얹은 것. 매매 추천이 아니라 이미 있는 지표들을 하나로 합친 알고리즘 정렬일 뿐 - UI에도 그렇게 명시함.
+// 추천 종목 TOP10: "지금 얼마나 강해 보이나"가 아니라 "조회 시점 이후로도 이어질 가능성이 있나"를 봄.
+// - 가장 최근 구간(momentum[0], 약 2분전)의 방향/속도를 최우선으로 봄 - 조회 순간 이후를 보려면
+//   과거 누적보다 지금 이 순간의 방향이 훨씬 중요함
+// - 가속 중(최근 구간이 예전 구간보다 빠름)이면 관성이 이어질 가능성으로 가점
+// - 눌림목 재상승 패턴이면 이미 한 번 힘을 보여주고 쉬었다가 다시 도는 것이라 진입 근거가 더 명확 - 가장 크게 가점
+// - 지금 이 순간 이미 꺾이고 있거나(recentDelta<0) 상한가 임박(위쪽 여력 없음)이면 확실히 감점/제외 성격
+function computeRecommendations(latest, pullbackCodes) {
+  return [...latest]
+    .map(r => {
+      const mom = r.momentum || [];
+      const recentDelta = mom[0] ? mom[0].delta : 0; // 가장 최근 구간(2분전) - 지금 이 순간의 방향
+      const olderDelta = mom.length ? mom[mom.length - 1].delta : recentDelta; // 가장 오래된 구간(약10분전)
+      const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지
+
+      let score = 0;
+      score += recentDelta * 8; // 지금 이 순간의 방향/속도에 가장 큰 가중치
+      if (accelerating) score += 3;
+      if (pullbackCodes.has(r.code)) score += 4; // 눌림목 후 재상승 시도 - 되돌림이 이미 검증된 패턴
+      if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 거래량 동반 = 힘이 실린 움직임일 확률
+      score += (r.relativeStrength || 0) * 0.5;
+      if (r.isTodayHigh && (r.change_rate || 0) < 25) score += 1; // 고점 갱신 중(단, 상한가 근접 전이라 아직 여력 있을 때만)
+      if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
+      if ((r.price || 0) < 2000) score -= 3; // 동전주 위험
+      if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
+      return { ...r, recoScore: score, accelerating };
+    })
+    .sort((a, b) => b.recoScore - a.recoScore)
+    .slice(0, 10);
+}
+
 function computeSignalScores(latest, streak3Codes, streak5Codes) {
   if (!latest.length) return;
   const volSorted = [...latest].map(r => r.volume || 0).sort((a, b) => b - a);
@@ -1045,6 +1131,22 @@ function patchTable(tbody, items, renderCells, emptyMessage, onRowClick) {
   Object.values(existing).forEach(tr => tr.remove());
 }
 
+// 거래량급증/당일신고가/상한가임박/반복출현/상대강도 배지 - 서버가 계산해준 값 그대로 표시만 함
+function renderBadges(r) {
+  const badges = [];
+  if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) {
+    badges.push('<span class="badge badgeVolume">💥거래량 ' + r.volumeSpikeRatio.toFixed(1) + '배</span>');
+  }
+  if (r.isTodayHigh) badges.push('<span class="badge badgeHigh">🆕당일신고가</span>');
+  if ((r.change_rate || 0) >= 28) badges.push('<span class="badge badgeLimit">🔺상한가 임박</span>');
+  if (r.repeatDays > 1) badges.push('<span class="badge badgeRepeat">' + r.repeatDays + '일째 등장</span>');
+  if (typeof r.relativeStrength === 'number' && r.relativeStrength !== 0) {
+    const cls = r.relativeStrength > 0 ? 'up' : 'down';
+    badges.push('<span class="badge">RS <span class="' + cls + '">' + (r.relativeStrength >= 0 ? '+' : '') + r.relativeStrength.toFixed(2) + '</span></span>');
+  }
+  return badges.length ? '<div class="badgeRow">' + badges.join('') + '</div>' : '';
+}
+
 // 최근 5틱(약 2/4/6/8/10분전) 대비 등락률 변화를 buildLine2 다음 줄에 공용으로 표시
 function renderMomentumLine(momentum) {
   if (!momentum || !momentum.length) return '';
@@ -1074,7 +1176,7 @@ function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick) {
   let prevNode = null; // 직전 항목의 sub row (다음 항목의 main row가 이 바로 뒤에 와야 함)
   items.forEach(item => {
     const nameHtml = starHtml(item.code, item.name) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
-    const line2Html = buildLine2(item) + renderMomentumLine(item.momentum);
+    const line2Html = buildLine2(item) + renderMomentumLine(item.momentum) + renderBadges(item);
     let mainTr = existingMain[item.code];
     let subTr;
 
@@ -1129,6 +1231,7 @@ function renderAllTable() {
     : currentSort === 'cntrStr' ? (b.cntr_str || 0) - (a.cntr_str || 0)
     : currentSort === 'momentum' ? (b.momentumScore || 0) - (a.momentumScore || 0)
     : currentSort === 'signal' ? (b.signalScore || 0) - (a.signalScore || 0)
+    : currentSort === 'tradeValue' ? (b.tradeValue || 0) - (a.tradeValue || 0)
     : b.change_rate - a.change_rate
   );
   const allBody = document.querySelector('#all tbody');
@@ -1176,6 +1279,12 @@ document.getElementById('sortBySignal').addEventListener('click', (e) => {
   e.target.classList.add('active');
   renderAllTable();
 });
+document.getElementById('sortByTradeValue').addEventListener('click', (e) => {
+  currentSort = 'tradeValue';
+  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  renderAllTable();
+});
 
 async function load() {
   const res = await fetch('/api/latest');
@@ -1203,11 +1312,28 @@ async function load() {
     ' · <span class="delta">▲' + r.delta.toFixed(2) + '%p</span>',
   '직전 스냅샷 대비 상승 종목 없음');
 
+  const pullbackBody = document.querySelector('#pullback tbody');
+  renderTwoLineList(pullbackBody, data.pullbackCandidates || [], r =>
+    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
+    ' · 고점 ' + r.todayMaxRate.toFixed(2) + '%에서 <span class="down">-' + r.pullbackPct.toFixed(2) + '%p</span> 조정 후 재상승중',
+  '눌림목 후보 없음');
+
   latestList = data.latest;
   const streak3Codes = new Set(data.streak3.map(r => r.code));
   const streak5Codes = new Set(data.streak5.map(r => r.code));
   computeMomentumScores(latestList, streak3Codes, streak5Codes);
   computeSignalScores(latestList, streak3Codes, streak5Codes);
+
+  const pullbackCodes = new Set((data.pullbackCandidates || []).map(r => r.code));
+  const recommended = computeRecommendations(latestList, pullbackCodes);
+  const recommendedBody = document.querySelector('#recommended tbody');
+  renderTwoLineList(recommendedBody, recommended, r =>
+    '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
+    ' · 거래량 ' + fmt(r.volume) +
+    ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
+    (r.accelerating ? ' · <span class="delta">⚡가속중</span>' : '') +
+    (pullbackCodes.has(r.code) ? ' · <span class="delta">🌊눌림목재상승</span>' : ''),
+  '데이터 없음');
 
   const topPicks = computeTopPicks(latestList, streak5Codes);
   const topPicksBody = document.querySelector('#topPicks tbody');
@@ -1732,6 +1858,12 @@ function renderDashboard() {
   .down { color:#4d9fff; }
   .delta { color:#ffd43b; }
   .momentumLine { font-size:11px; color:#888; margin-top:2px; }
+  .badgeRow { margin-top:3px; display:flex; flex-wrap:wrap; gap:4px; }
+  .badge { font-size:10px; background:#232323; color:#aaa; padding:2px 6px; border-radius:6px; }
+  .badgeVolume { background:#2a2110; color:#ffa94d; }
+  .badgeHigh { background:#16241c; color:#69db7c; }
+  .badgeLimit { background:#2a1616; color:#ff8787; }
+  .badgeRepeat { background:#1a1c2a; color:#8ea8ff; }
   .empty { color:#666; padding:12px 0; }
   tr.clickable { cursor:pointer; }
   tr.clickable:active { background:#2a2a2a; }
@@ -1919,6 +2051,13 @@ function renderDashboard() {
   </div>
 
   <div class="board topPicksBoard">
+    <h2>🎯 추천 종목 TOP10 <span class="intervalTag">(알고리즘 종합점수 - 매매 추천 아님, 참고용)</span></h2>
+    <table id="recommended">
+      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="board topPicksBoard">
     <h2>🏆 오늘의 TOP 20</h2>
     <table id="topPicks">
       <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
@@ -1952,6 +2091,11 @@ function renderDashboard() {
   </div>
 
   <div class="board">
+    <h2>🌊 눌림목 후보 <span class="intervalTag">(고점대비 1~4%p 조정 후 재상승 시도)</span></h2>
+    <table id="pullback"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
+  </div>
+
+  <div class="board">
     <div class="boardHeadRow">
       <h2>전체 목록 (등락률 5~15%)</h2>
       <div class="sortToggle">
@@ -1961,6 +2105,7 @@ function renderDashboard() {
         <button class="sortBtn" id="sortByVolumeAsc">거래량 적은순</button>
         <button class="sortBtn" id="sortByCntrStr">체결강도순</button>
         <button class="sortBtn" id="sortBySignal">신호점수순</button>
+        <button class="sortBtn" id="sortByTradeValue">거래대금순</button>
       </div>
     </div>
     <table id="all">
