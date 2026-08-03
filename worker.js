@@ -1433,7 +1433,9 @@ function formatAddedDate(isoString) {
   const kst = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
   const mm = String(kst.getMonth() + 1).padStart(2, '0');
   const dd = String(kst.getDate()).padStart(2, '0');
-  return mm + '/' + dd + ' 추가';
+  const hh = String(kst.getHours()).padStart(2, '0');
+  const min = String(kst.getMinutes()).padStart(2, '0');
+  return mm + '/' + dd + ' ' + hh + ':' + min + ' 추가';
 }
 
 let watchlistLastKnownMap = {}; // 밴드 밖 종목의 D1 마지막 저장 시세 (load()에서 채워짐)
