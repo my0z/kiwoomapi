@@ -323,17 +323,21 @@ async function getLatest(env) {
     snapByTime[t] = new Map(snapRows[i].results.map((row) => [row.code, row]));
   });
 
-  // 최근 5틱(수집주기 2분이라 실제로는 대략 2/4/6/8/10분전) 대비 등락률 변화
+  // 최근 5틱(수집주기 2분이라 실제로는 대략 2/4/6/8/10분전) 구간별 등락률 변화
+  // - "N분전 delta"는 그 구간 자체(N분전~(N-2)분전)의 변화량. "지금까지 누적"이 아님 -
+  //   누적으로 하면 계속 오르는 종목은 기간이 긴 쪽(10분전) 숫자가 항상 더 커 보여서
+  //   실제 그래프 기울기(최근이 더 가팔랐는지)와 반대로 보이는 착시가 생김
   // - 추가 조회 없이 위에서 받아온 snapByTime 재사용, TOP20/전체목록/연속상승/TOP5 전부 공유
   const now = new Date(times[0]);
   const momentumMap = new Map();
-  for (const [code, row] of snapByTime[times[0]]) {
+  for (const [code] of snapByTime[times[0]]) {
     const momentum = [];
     for (let i = 1; i < times.length; i++) {
-      const prevRow = snapByTime[times[i]]?.get(code);
-      if (!prevRow) break; // 그 시점에 없던 종목(리스트 진입 전)이면 더 과거는 의미 없으니 중단
+      const curRow = snapByTime[times[i - 1]]?.get(code); // 이 구간의 최신쪽 끝
+      const prevRow = snapByTime[times[i]]?.get(code); // 이 구간의 과거쪽 끝
+      if (!curRow || !prevRow) break; // 그 시점에 없던 종목(리스트 진입 전)이면 더 과거는 의미 없으니 중단
       const minutesAgo = Math.round((now - new Date(times[i])) / 60000);
-      momentum.push({ minutesAgo, delta: row.change_rate - prevRow.change_rate });
+      momentum.push({ minutesAgo, delta: curRow.change_rate - prevRow.change_rate });
     }
     momentumMap.set(code, momentum);
   }
