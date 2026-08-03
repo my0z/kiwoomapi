@@ -131,12 +131,12 @@ async function checkWatchlistRiskLevels(env) {
   let checked = 0;
   for (const w of items) {
     try {
-      const [ohlc, quoteRaw] = await Promise.all([
-        kiwoomDailyOHLC(env, token, w.code),
-        kiwoomQuote(env, token, w.code),
-      ]);
+      // 두 TR을 동시에 쏘면 키움 초당1건 제한 위반 가능 - 순차로 호출
+      const ohlc = await kiwoomDailyOHLC(env, token, w.code);
+      await sleep(1100);
+      const quoteRaw = await kiwoomQuote(env, token, w.code);
       const atr = computeATR(ohlc, 14);
-      if (!atr) continue;
+      if (!atr) continue; // ATR 계산 불가 - 아래 finally에서 대기는 그대로 실행됨
       const quote = parseKiwoomQuote(quoteRaw);
       const stopLoss = Math.round(quote.price - atr * 1.5);
       const takeProfit = Math.round(quote.price + atr * 2);
@@ -156,8 +156,9 @@ async function checkWatchlistRiskLevels(env) {
       checked++;
     } catch (e) {
       // 이 종목만 이번 틱에 실패, 다음 틱에 다시 시도됨
+    } finally {
+      await sleep(1100); // 키움 TR 초당1건 제한 - continue/에러로 건너뛰지 않도록 finally에 둠
     }
-    await sleep(1100); // 키움 TR 초당1건 제한
   }
   return { checked };
 }
@@ -257,6 +258,14 @@ async function purgeOldRows(env) {
   )
     .bind(cutoff)
     .run();
+
+  // 새로 추가된 캐시/로그 테이블들도 같이 정리 (없어도 에러 없이 넘어가게 각각 try)
+  // pattern_scan_cache/latest_extras_cache는 특정 틱 하나만을 위한 임시 캐시라 하루만 지나도 무의미해서 더 짧게(2일) 지움
+  const shortCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(`DELETE FROM pattern_scan_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
+  await env.DB.prepare(`DELETE FROM latest_extras_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
+  await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
+
   return result.meta?.changes ?? 0;
 }
 
@@ -344,23 +353,46 @@ async function getLatest(env) {
   const withMomentum = (r) => ({ ...r, momentum: momentumMap.get(r.code) || [] });
 
   // ---------- 추가 지표들 (전부 이미 있는 snapshots 데이터로만 계산 - 추가 키움 조회 없음) ----------
+  // 이 계산(당일 종목별 최고치, 3일간 반복출현)은 하루치 데이터를 GROUP BY로 훑어야 해서 꽤 무거움.
+  // 화면이 10초마다 /api/latest를 다시 부르므로, 같은 틱(captured_at)에서는 재계산 없이 캐시 재사용.
   const todayPrefix = times[0].slice(0, 10); // YYYY-MM-DD (KST 장중은 항상 같은 UTC 날짜라 안전)
-  const threeDaysAgoIso = new Date(new Date(times[0]).getTime() - 3 * 24 * 60 * 60 * 1000).toISOString();
-  const [todayMaxRes, repeatRes] = await Promise.all([
-    // 당일 종목별 등락률 최고치 - 지금이 그 최고치를 찍고 있는 중인지(신고가 경신) 판단용
-    env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at LIKE ? GROUP BY code`)
-      .bind(todayPrefix + "%")
-      .all(),
-    // 최근 3일간 이 종목이 급등리스트(5%+)에 며칠 등장했는지 - 일회성 vs 지속 관심 구분용
-    env.DB.prepare(
-      `SELECT code, COUNT(DISTINCT substr(captured_at,1,10)) AS dayCount
-       FROM snapshots WHERE captured_at >= ? AND change_rate >= 5 GROUP BY code`
+  let todayMaxMap, repeatMap;
+  const extrasCached = await env.DB.prepare(`SELECT today_max_json, repeat_json FROM latest_extras_cache WHERE captured_at = ?`)
+    .bind(times[0])
+    .first()
+    .catch(() => null); // latest_extras_cache 테이블이 아직 없어도(마이그레이션 전) 매번 계산으로 자연스럽게 폴백
+  if (extrasCached) {
+    todayMaxMap = new Map(JSON.parse(extrasCached.today_max_json));
+    repeatMap = new Map(JSON.parse(extrasCached.repeat_json));
+  } else {
+    const threeDaysAgoIso = new Date(new Date(times[0]).getTime() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const [todayMaxRes, repeatRes] = await Promise.all([
+      // 당일 종목별 등락률 최고치 - 지금이 그 최고치를 찍고 있는 중인지(신고가 경신) 판단용
+      env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at LIKE ? GROUP BY code`)
+        .bind(todayPrefix + "%")
+        .all(),
+      // 최근 3일간 이 종목이 급등리스트(5%+)에 며칠 등장했는지 - 일회성 vs 지속 관심 구분용
+      env.DB.prepare(
+        `SELECT code, COUNT(DISTINCT substr(captured_at,1,10)) AS dayCount
+         FROM snapshots WHERE captured_at >= ? AND change_rate >= 5 GROUP BY code`
+      )
+        .bind(threeDaysAgoIso)
+        .all(),
+    ]);
+    todayMaxMap = new Map(todayMaxRes.results.map((r) => [r.code, r.maxRate]));
+    repeatMap = new Map(repeatRes.results.map((r) => [r.code, r.dayCount]));
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO latest_extras_cache (captured_at, today_max_json, repeat_json, created_at) VALUES (?, ?, ?, ?)`
     )
-      .bind(threeDaysAgoIso)
-      .all(),
-  ]);
-  const todayMaxMap = new Map(todayMaxRes.results.map((r) => [r.code, r.maxRate]));
-  const repeatMap = new Map(repeatRes.results.map((r) => [r.code, r.dayCount]));
+      .bind(
+        times[0],
+        JSON.stringify([...todayMaxMap]),
+        JSON.stringify([...repeatMap]),
+        new Date().toISOString()
+      )
+      .run()
+      .catch(() => {}); // 캐시 저장 실패해도(테이블 없음 등) 이번 요청 자체는 정상 진행
+  }
   const avgRateNow = latest.length ? latest.reduce((s, r) => s + r.change_rate, 0) / latest.length : 0;
 
   const withExtras = (r) => {
@@ -3131,10 +3163,9 @@ self.addEventListener('fetch', (e) => {
           const code = url.searchParams.get("code");
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
           const token = await kiwoomIssueToken(env);
-          const [ohlc, quoteRaw] = await Promise.all([
-            kiwoomDailyOHLC(env, token, code),
-            kiwoomQuote(env, token, code),
-          ]);
+          const ohlc = await kiwoomDailyOHLC(env, token, code);
+          await sleep(1100); // 키움 TR 초당1건 제한
+          const quoteRaw = await kiwoomQuote(env, token, code);
           const atr = computeATR(ohlc, 14);
           const goldenCross = computeGoldenCross(ohlc);
           const quote = parseKiwoomQuote(quoteRaw);
