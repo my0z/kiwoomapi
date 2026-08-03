@@ -119,6 +119,61 @@ function isMarketHoursKST(date) {
 // 장마감(15:30) 직후, 그 시점 화면에 떠 있던 종목들을 하나씩 정확하게 재조회해서
 // 배치 수집(2분 간격이라 정각과 살짝 어긋날 수 있음)보다 정확한 최종 종가를 남김.
 // ka10027(배치) 대신 종목별 ka10007(개별 시세)이라 초당1건 제한 때문에 종목당 1.1초 걸림.
+// 관심종목이 ATR 기반 손절/익절 라인에 도달했는지 cron이 대신 체크해서 D1에 남김.
+// 원래는 모달을 직접 열어야만 알 수 있었던 것 - watchlist_risk_status 테이블 필요(schema.sql 참고).
+// 관심종목은 보통 소수(몇 개)라 종목당 1.1초 순차조회를 매 틱마다 해도 부담 적음.
+async function checkWatchlistRiskLevels(env) {
+  const wlRes = await env.DB.prepare(`SELECT code, name FROM watchlist`).all();
+  const items = wlRes.results;
+  if (!items.length) return { checked: 0 };
+
+  const token = await kiwoomIssueToken(env);
+  let checked = 0;
+  for (const w of items) {
+    try {
+      const [ohlc, quoteRaw] = await Promise.all([
+        kiwoomDailyOHLC(env, token, w.code),
+        kiwoomQuote(env, token, w.code),
+      ]);
+      const atr = computeATR(ohlc, 14);
+      if (!atr) continue;
+      const quote = parseKiwoomQuote(quoteRaw);
+      const stopLoss = Math.round(quote.price - atr * 1.5);
+      const takeProfit = Math.round(quote.price + atr * 2);
+      let status = "safe";
+      if (quote.price <= stopLoss) status = "stop_loss_hit";
+      else if (quote.price >= takeProfit) status = "take_profit_hit";
+
+      await env.DB.prepare(
+        `INSERT INTO watchlist_risk_status (code, status, price, stop_loss, take_profit, checked_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(code) DO UPDATE SET
+           status = excluded.status, price = excluded.price,
+           stop_loss = excluded.stop_loss, take_profit = excluded.take_profit, checked_at = excluded.checked_at`
+      )
+        .bind(w.code, status, quote.price, stopLoss, takeProfit, new Date().toISOString())
+        .run();
+      checked++;
+    } catch (e) {
+      // 이 종목만 이번 틱에 실패, 다음 틱에 다시 시도됨
+    }
+    await sleep(1100); // 키움 TR 초당1건 제한
+  }
+  return { checked };
+}
+
+// 조용히 묻히던 수집 실패를 D1에 남겨서 나중에 확인 가능하게 함 (system_events 테이블 필요 - schema.sql 참고)
+// 로깅 자체가 실패해도(테이블 없음 등) 전체 흐름을 막으면 안 되니 조용히 무시
+async function logSystemEvent(env, kind, message) {
+  try {
+    await env.DB.prepare(`INSERT INTO system_events (kind, message, created_at) VALUES (?, ?, ?)`)
+      .bind(kind, String(message).slice(0, 2000), new Date().toISOString())
+      .run();
+  } catch (e) {
+    // 로깅 실패는 무시 (system_events 테이블이 아직 없을 수 있음)
+  }
+}
+
 async function collectFinalAccurateQuotes(env) {
   const capturedAt = new Date().toISOString();
   const timesRes = await env.DB.prepare(
@@ -136,15 +191,24 @@ async function collectFinalAccurateQuotes(env) {
 
   const token = await kiwoomIssueToken(env);
   const rows = [];
+  const failedCodes = [];
   for (const t of targets) {
     try {
       const raw = await kiwoomQuote(env, token, t.code);
       const q = parseKiwoomQuote(raw);
       rows.push({ code: t.code, name: t.name, price: q.price, rate: q.rate, volume: q.volume, market: t.market });
     } catch (e) {
-      // 개별 종목 조회 실패는 건너뜀 (그 종목만 최종 갱신 안 됨, 나머지는 계속 진행)
+      // 개별 종목 조회 실패는 건너뜀 (그 종목만 최종 갱신 안 됨, 나머지는 계속 진행) - 아래에서 모아서 로그만 남김
+      failedCodes.push(t.code + ":" + String(e.message || e).slice(0, 80));
     }
     await sleep(1100); // 키움 TR 초당1건 제한
+  }
+  if (failedCodes.length) {
+    await logSystemEvent(
+      env,
+      "final_quote_partial_failure",
+      `${failedCodes.length}/${targets.length}종목 최종시세 재조회 실패: ${failedCodes.slice(0, 15).join(", ")}`
+    );
   }
   if (!rows.length) return { saved: 0 };
 
@@ -293,305 +357,9 @@ async function getLatest(env) {
   return { latest: latestWithMomentum, risingTop5, streak3, streak5, capturedAt: times[0] };
 }
 
-// ---------- 대시보드 HTML ----------
-function renderDashboard() {
-  return `<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>급등주 스크리너 (5~15%)</title>
-<link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#111111">
-<meta name="apple-mobile-web-app-title" content="급등주">
-<link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
-<style>
-  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
-  h1 { font-size:18px; margin:0 0 4px; }
-  .sub { color:#888; font-size:12px; margin-bottom:16px; }
-  .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
-  .board h2 { font-size:14px; margin:0 0 8px; color:#ff6b6b; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { padding:6px 4px; text-align:right; border-bottom:1px solid #2a2a2a; }
-  th:first-child, td:first-child { text-align:left; }
-  tr.twoLineRow td { padding-bottom:2px; font-size:14px; }
-  tr.twoLineRow .rowPrice { float:right; font-weight:700; font-size:15px; color:#eee; }
-  tr.twoLineSubRow td { padding-top:0; padding-bottom:10px; border-bottom:1px solid #232323; font-size:12px; color:#999; }
-  tr.twoLineSubRow { cursor:default; }
-  .up { color:#ff6b6b; }
-  .down { color:#4d9fff; }
-  .delta { color:#ffd43b; }
-  .momentumLine { font-size:11px; color:#888; margin-top:2px; }
-  .empty { color:#666; padding:12px 0; }
-  tr.clickable { cursor:pointer; }
-  tr.clickable:active { background:#2a2a2a; }
-
-  /* 모달 */
-  #modalOverlay {
-    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
-    z-index:100; align-items:flex-end; justify-content:center;
-  }
-  #modalOverlay.open { display:flex; }
-  #modalBox {
-    background:#1c1c1c; width:100%; max-width:420px; border-radius:16px 16px 0 0;
-    padding:20px 16px 24px; animation:slideUp .15s ease-out;
-  }
-  @keyframes slideUp { from{ transform:translateY(20px); opacity:0; } to{ transform:translateY(0); opacity:1; } }
-  #modalBox h3 { margin:0; font-size:22px; font-weight:700; white-space:nowrap; }
-  .clickableName { cursor:pointer; text-decoration:underline dotted; font-size:12px; color:#999; white-space:nowrap; }
-  .clickableName:active { opacity:0.6; }
-  .modalHeadRow {
-    display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px;
-    margin-bottom:4px;
-  }
-  #modalCodeBadge { font-size:12px; color:#999; white-space:nowrap; }
-  .modalPriceRow {
-    display:flex; align-items:baseline; gap:10px;
-    margin-bottom:16px;
-  }
-  .modalPriceInline { font-size:20px; color:#eee; font-weight:700; }
-  .starBtn {
-    font-size:26px; cursor:pointer; color:#666;
-    display:inline-flex; align-items:center; justify-content:center;
-    min-width:40px; min-height:40px; padding:4px;
-  }
-  .starBtn.active { color:#ffd43b; }
-  .topPickStar {
-    font-size:20px; cursor:pointer; color:#666;
-    display:inline-flex; align-items:center; justify-content:center;
-    min-width:36px; min-height:36px; padding:6px; vertical-align:middle;
-  }
-  .topPickStar.active { color:#ffd43b; }
-  .modalPriceRow .up { color:#ff6b6b; font-size:16px; }
-  #modalDetail:empty { display:none; }
-  #modalOrderBook { margin-bottom:12px; }
-  .orderBookBar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#151515; }
-  .orderBookBuy { background:#ff6b6b; }
-  .orderBookSell { background:#4d9fff; }
-  .orderBookLabel { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-top:4px; }
-  .orderBookLabel .buyLabel { color:#ff6b6b; }
-  .orderBookLabel .sellLabel { color:#4d9fff; }
-  #modalNewsLinks { display:flex; gap:8px; margin-bottom:12px; }
-  .newsLink {
-    flex:1; text-align:center; padding:8px 6px; border-radius:8px;
-    background:#2a2a2a; color:#aaa; font-size:12px; text-decoration:none;
-  }
-  #modalNewsSummary { margin-bottom:12px; max-height:78px; overflow-y:auto; }
-  .newsItem {
-    display:block; background:#151515; border-radius:8px; padding:8px 10px;
-    margin-bottom:6px; text-decoration:none;
-  }
-  .newsItemTitle { font-size:12px; color:#eee; font-weight:600; margin-bottom:2px; }
-  .newsItemDesc { font-size:11px; color:#888; line-height:1.4; }
-  .sentimentTag { display:inline-block; font-size:10px; padding:1px 6px; border-radius:8px; font-weight:700; margin-right:2px; }
-  .sentimentTag.sentimentUp { background:#2a1616; color:#ff8787; }
-  .sentimentTag.sentimentDown { background:#16243a; color:#4d9fff; }
-  .sentimentTag.sentimentNeutral { background:#222; color:#999; }
-  #modalDartSummary { margin-bottom:12px; max-height:78px; overflow-y:auto; }
-  .dartItem { border-left:2px solid #ffd43b; }
-  .highGap { font-size:11px; color:#888; margin-top:2px; }
-  .sellWarning { font-size:12px; color:#ff8787; background:#2a1616; border-radius:8px; padding:8px 10px; margin-top:8px; }
-  .sellOk { font-size:12px; color:#69db7c; background:#16241c; border-radius:8px; padding:8px 10px; margin-top:8px; }
-  .highGap b { color:#ffa94d; }
-  #modalDetail { margin-bottom:14px; }
-  .detailLoading, .detailError { color:#888; font-size:13px; padding:8px 0; }
-  .detailError { color:#ff8787; }
-  .detailGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; background:#151515; border-radius:10px; padding:10px 12px; font-size:12px; color:#999; }
-  .detailGrid b { display:block; font-size:14px; color:#eee; margin-top:2px; }
-  .detailGrid b.up { color:#ff6b6b; }
-  .chartRange { font-size:11px; color:#888; text-align:center; margin-top:4px; }
-  .chartTimeLabels { display:flex; justify-content:space-between; font-size:10px; color:#666; padding:2px 6px 0; }
-  .liveDot { color:#69db7c; animation:blink 1.5s ease-in-out infinite; }
-  @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.2; } }
-  .chartWrap { overflow:hidden; touch-action:none; cursor:grab; border-radius:8px; background:#151515; }
-  .chartWrap:active { cursor:grabbing; }
-  .chartWrap svg { display:block; will-change:transform; }
-  .chartResetBtn { color:#4d9fff; text-decoration:underline dotted; cursor:pointer; }
-  .periodRow { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
-  .periodBtn {
-    flex:1; min-width:40px; padding:8px 4px; border-radius:8px; border:none;
-    background:#2a2a2a; color:#aaa; font-size:12px; cursor:pointer;
-  }
-  .periodBtn.active { background:#ff6b6b; color:#111; font-weight:600; }
-  .boardHeadRow { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
-  .boardHeadRow h2 { margin:0; }
-  .sortToggle { display:flex; gap:6px; }
-  .sortBtn { background:#2a2a2a; color:#aaa; border:none; border-radius:6px; padding:5px 10px; font-size:11px; cursor:pointer; }
-  .sortBtn.active { background:#ff6b6b; color:#111; font-weight:600; }
-  .tradeDelBtn { color:#666; cursor:pointer; font-size:14px; }
-  .pnlPositive { color:#ff6b6b; }
-  .pnlNegative { color:#4d9fff; }
-  .addedDate { font-size:10px; color:#666; font-weight:normal; }
-  .miniChartRow td { border-bottom:1px solid #2a2a2a; padding:0 4px 8px; }
-  .miniChartRow { background:transparent; }
-  .modalBtn {
-    display:block; width:100%; box-sizing:border-box; text-align:center;
-    padding:14px; margin-bottom:10px; border-radius:10px; border:none;
-    font-size:15px; font-weight:600; text-decoration:none; cursor:pointer;
-  }
-  .modalBtn.price { background:#2a2a2a; color:#eee; }
-  .modalBtn.risk { background:#2a2a2a; color:#ffa94d; }
-  .modalBtn.ai { background:#2a2a2a; color:#a78bfa; }
-  .actionRow { display:flex; gap:8px; margin-bottom:10px; }
-  .actionRow .modalBtn {
-    flex:1; width:auto; margin-bottom:0; padding:10px 4px;
-    font-size:12px; white-space:nowrap;
-  }
-  .aiAnalysisCard {
-    background:#17141f; border:1px solid #4c3a80; border-radius:10px;
-    padding:12px; font-size:13px; line-height:1.6; color:#ddd; margin-bottom:12px;
-    white-space:pre-wrap; max-height:340px; overflow-y:auto;
-  }
-  .aiAnalysisNote { font-size:10px; color:#666; margin-top:6px; }
-  .riskGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; background:#151515; border-radius:10px; padding:10px 12px; font-size:12px; color:#999; margin-bottom:12px; }
-  .riskGrid b { display:block; font-size:15px; margin-top:2px; }
-  .riskGrid .stopLoss b { color:#4d9fff; }
-  .riskGrid .takeProfit b { color:#ff6b6b; }
-  .riskNote { font-size:10px; color:#666; margin-top:6px; grid-column:1 / -1; }
-  .gcCard { border-radius:10px; padding:10px 12px; font-size:13px; font-weight:600; margin-bottom:12px; }
-  .gcCard.gcUp { background:#1c2a1c; color:#69db7c; }
-  .gcCard.gcDown { background:#2a1c1c; color:#ff8787; }
-  .gcDetail { font-size:11px; color:#999; font-weight:normal; margin-top:4px; }
-  .modalBtn.cancel { background:transparent; color:#888; margin-bottom:0; padding:10px; }
-  .streakBoard h2 { color:#ffd43b; }
-  .streakBoard.streak5 h2 { color:#69db7c; }
-  .topPicksBoard { border:1px solid #ffd43b; background:linear-gradient(180deg,#1c1a0f,#1c1c1c); }
-  .topPicksBoard h2 { color:#ffd43b; }
-  .topPicksBoard tr.clickable:active { background:#2a2410; }
-  .intervalTag { font-size:11px; color:#888; font-weight:normal; }
-  #goldenWindowBanner {
-    background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
-    font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
-  }
-  .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
-  #reloadBtn {
-    position:fixed; right:14px; top:calc(50% - 30px); transform:translateY(-50%);
-    width:50px; height:50px; border-radius:50%; border:none;
-    background:#ff6b6b; color:#111; font-size:22px; z-index:90;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
-  }
-  #reloadBtn.spinning { animation:spin 0.6s linear; }
-  @keyframes spin { from{ transform:translateY(-50%) rotate(0deg); } to{ transform:translateY(-50%) rotate(360deg); } }
-  #collectBtn:disabled, #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
-  #collectBtn {
-    position:fixed; right:14px; top:calc(50% + 30px); transform:translateY(-50%);
-    width:50px; height:50px; border-radius:50%; border:none;
-    background:#69db7c; color:#111; font-size:20px; z-index:90;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
-  }
-  #collectBtn.spinning { animation:spin 0.9s linear infinite; }
-  #fullReloadBtn {
-    position:fixed; right:14px; top:calc(50% + 90px); transform:translateY(-50%);
-    width:50px; height:50px; border-radius:50%; border:none;
-    background:#4d9fff; color:#111; font-size:20px; z-index:90;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
-  }
-  #fullReloadBtn.spinning { animation:spin 0.6s linear; }
-</style>
-</head>
-<body>
-  <button id="reloadBtn" title="화면 새로고침">🔄</button>
-  <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
-  <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
-  <h1>🔥 급등주 스크리너</h1>
-  <div class="sub" id="ts">불러오는 중...</div>
-  <div id="goldenWindowBanner" style="display:none;"></div>
-
-  <div class="board">
-    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
-    <table id="watchlist">
-      <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
-      <tbody><tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board topPicksBoard">
-    <h2>🏆 오늘의 TOP 20</h2>
-    <table id="topPicks">
-      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board">
-    <div class="boardHeadRow">
-      <h2>🔍 지난 1주일 패턴 유사 종목</h2>
-      <button id="patternScanBtn" class="sortBtn">스캔 시작</button>
-    </div>
-    <table id="patternScan">
-      <thead><tr><th>종목</th><th>유사한 날</th><th>유사도</th></tr></thead>
-      <tbody><tr><td class="empty">스캔 시작 버튼을 눌러주세요</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board streakBoard streak5">
-    <h2>🚀 5연속 상승 종목 <span class="intervalTag">(2분간격)</span></h2>
-    <table id="streak5"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board streakBoard">
-    <h2>⚡ 3연속 상승 종목 <span class="intervalTag">(2분간격)</span></h2>
-    <table id="streak3"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board">
-    <h2>2분 전보다 더 오른 TOP5</h2>
-    <table id="top5"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board">
-    <div class="boardHeadRow">
-      <h2>전체 목록 (등락률 5~15%)</h2>
-      <div class="sortToggle">
-        <button class="sortBtn active" id="sortByMomentum">종합점수순</button>
-        <button class="sortBtn" id="sortByRate">등락률순</button>
-        <button class="sortBtn" id="sortByVolumeDesc">거래량 많은순</button>
-        <button class="sortBtn" id="sortByVolumeAsc">거래량 적은순</button>
-        <button class="sortBtn" id="sortByCntrStr">체결강도순</button>
-        <button class="sortBtn" id="sortBySignal">신호점수순</button>
-      </div>
-    </div>
-    <table id="all">
-      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
-    </table>
-  </div>
-
-  <div id="modalOverlay">
-    <div id="modalBox">
-      <div class="modalHeadRow">
-        <span id="modalStarBtn" class="starBtn">☆</span>
-        <h3 id="modalName">-</h3>
-        <span id="modalCodeBadge">-</span>
-      </div>
-      <div class="modalPriceRow">
-        <span id="modalPrice" class="modalPriceInline">-</span>
-        <span class="up" id="modalRate">-</span>
-      </div>
-      <div id="modalOrderBook"></div>
-      <div id="modalNewsLinks"></div>
-      <div id="modalNewsSummary"></div>
-      <div id="modalDartSummary"></div>
-      <div id="modalDetail"></div>
-      <div class="periodRow" id="periodRow">
-        <button class="periodBtn" data-period="T">틱</button>
-        <button class="periodBtn active" data-period="1">1분</button>
-        <button class="periodBtn" data-period="5">5분</button>
-        <button class="periodBtn" data-period="15">15분</button>
-        <button class="periodBtn" data-period="30">30분</button>
-        <button class="periodBtn" data-period="D">일봉</button>
-        <button class="periodBtn" data-period="W">주봉</button>
-        <button class="periodBtn" data-period="M">월봉</button>
-      </div>
-      <div class="actionRow">
-        <button class="modalBtn price" id="modalPriceBtn">💰 현재가</button>
-        <button class="modalBtn risk" id="modalRiskBtn">🎯 손절/익절</button>
-        <button class="modalBtn ai" id="modalAiBtn">🤖 AI 분석</button>
-      </div>
-      <button class="modalBtn cancel" id="modalCancelBtn">닫기</button>
-    </div>
-  </div>
-
-<script>
+// ---------- 클라이언트 JS (/app.js로 서빙, HTML과 분리해서 diff/유지보수 쉽게) ----------
+function clientScript() {
+  return `
 function fmt(n){ return Number(n).toLocaleString(); }
 
 // ---------- 종목 클릭 모달 ----------
@@ -1459,6 +1227,8 @@ async function load() {
   renderAllTable();
   watchlistLastKnownMap = {};
   (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
+  watchlistRiskMap = {};
+  (data.watchlistRisk || []).forEach(r => { watchlistRiskMap[r.code] = r.status; });
   renderWatchlist(data.watchlist || []);
 }
 
@@ -1505,6 +1275,7 @@ function formatAddedDate(isoString) {
 }
 
 let watchlistLastKnownMap = {}; // 밴드 밖 종목의 D1 마지막 저장 시세 (load()에서 채워짐)
+let watchlistRiskMap = {}; // { code: 'safe'|'stop_loss_hit'|'take_profit_hit' } - cron이 미리 체크해둔 것 (load()에서 채워짐)
 
 // ---------- 관심종목 미니 캔들차트 (1분봉) ----------
 const miniCandleCache = {}; // { code: candles[] }
@@ -1670,9 +1441,15 @@ function renderWatchlist(items) {
         ? '<span class="' + (r.pnl.netPnlPct >= 0 ? 'pnlPositive' : 'pnlNegative') + '">' +
           (r.pnl.netPnlPct >= 0 ? '+' : '') + r.pnl.netPnlPct.toFixed(2) + '% (' + (r.pnl.netPnlAmount >= 0 ? '+' : '') + fmt(r.pnl.netPnlAmount) + '원)</span>'
         : (r.entryPrice === null ? '<span class="empty">진입가 확정중</span>' : '<span class="empty">시세 없음</span>');
+      const riskStatus = watchlistRiskMap[r.code];
+      const riskBadgeHtml = riskStatus === 'stop_loss_hit'
+        ? '<div class="riskBadge riskBadgeDown">⚠️ 손절선 도달</div>'
+        : riskStatus === 'take_profit_hit'
+        ? '<div class="riskBadge riskBadgeUp">🎯 익절선 도달</div>'
+        : '';
       return (
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
-          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + '</td>' +
+          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + riskBadgeHtml + '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
           '<td>' + rateHtml + '</td>' +
           '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : (r.entryPrice === null ? '<span class="empty">확정중</span>' : '-')) + '</td>' +
@@ -1918,7 +1695,311 @@ if (isStandalone && document.documentElement.requestFullscreen) {
 
 // 크롬이 자동으로 띄우는 PWA 설치 배너 억제 (설치 유도 기능 자체를 없앰)
 window.addEventListener('beforeinstallprompt', (e) => e.preventDefault());
-</script>
+`;
+}
+
+// ---------- 대시보드 HTML ----------
+function renderDashboard() {
+  return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>급등주 스크리너 (5~15%)</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#111111">
+<meta name="apple-mobile-web-app-title" content="급등주">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<style>
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:#888; font-size:12px; margin-bottom:16px; }
+  .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
+  .board h2 { font-size:14px; margin:0 0 8px; color:#ff6b6b; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:6px 4px; text-align:right; border-bottom:1px solid #2a2a2a; }
+  th:first-child, td:first-child { text-align:left; }
+  tr.twoLineRow td { padding-bottom:2px; font-size:14px; }
+  tr.twoLineRow .rowPrice { float:right; font-weight:700; font-size:15px; color:#eee; }
+  tr.twoLineSubRow td { padding-top:0; padding-bottom:10px; border-bottom:1px solid #232323; font-size:12px; color:#999; }
+  tr.twoLineSubRow { cursor:default; }
+  .up { color:#ff6b6b; }
+  .down { color:#4d9fff; }
+  .delta { color:#ffd43b; }
+  .momentumLine { font-size:11px; color:#888; margin-top:2px; }
+  .empty { color:#666; padding:12px 0; }
+  tr.clickable { cursor:pointer; }
+  tr.clickable:active { background:#2a2a2a; }
+
+  /* 모달 */
+  #modalOverlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
+    z-index:100; align-items:flex-end; justify-content:center;
+  }
+  #modalOverlay.open { display:flex; }
+  #modalBox {
+    background:#1c1c1c; width:100%; max-width:420px; border-radius:16px 16px 0 0;
+    padding:20px 16px 24px; animation:slideUp .15s ease-out;
+  }
+  @keyframes slideUp { from{ transform:translateY(20px); opacity:0; } to{ transform:translateY(0); opacity:1; } }
+  #modalBox h3 { margin:0; font-size:22px; font-weight:700; white-space:nowrap; }
+  .clickableName { cursor:pointer; text-decoration:underline dotted; font-size:12px; color:#999; white-space:nowrap; }
+  .clickableName:active { opacity:0.6; }
+  .modalHeadRow {
+    display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px;
+    margin-bottom:4px;
+  }
+  #modalCodeBadge { font-size:12px; color:#999; white-space:nowrap; }
+  .modalPriceRow {
+    display:flex; align-items:baseline; gap:10px;
+    margin-bottom:16px;
+  }
+  .modalPriceInline { font-size:20px; color:#eee; font-weight:700; }
+  .starBtn {
+    font-size:26px; cursor:pointer; color:#666;
+    display:inline-flex; align-items:center; justify-content:center;
+    min-width:40px; min-height:40px; padding:4px;
+  }
+  .starBtn.active { color:#ffd43b; }
+  .topPickStar {
+    font-size:20px; cursor:pointer; color:#666;
+    display:inline-flex; align-items:center; justify-content:center;
+    min-width:36px; min-height:36px; padding:6px; vertical-align:middle;
+  }
+  .topPickStar.active { color:#ffd43b; }
+  .modalPriceRow .up { color:#ff6b6b; font-size:16px; }
+  #modalDetail:empty { display:none; }
+  #modalOrderBook { margin-bottom:12px; }
+  .orderBookBar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#151515; }
+  .orderBookBuy { background:#ff6b6b; }
+  .orderBookSell { background:#4d9fff; }
+  .orderBookLabel { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-top:4px; }
+  .orderBookLabel .buyLabel { color:#ff6b6b; }
+  .orderBookLabel .sellLabel { color:#4d9fff; }
+  #modalNewsLinks { display:flex; gap:8px; margin-bottom:12px; }
+  .newsLink {
+    flex:1; text-align:center; padding:8px 6px; border-radius:8px;
+    background:#2a2a2a; color:#aaa; font-size:12px; text-decoration:none;
+  }
+  #modalNewsSummary { margin-bottom:12px; max-height:78px; overflow-y:auto; }
+  .newsItem {
+    display:block; background:#151515; border-radius:8px; padding:8px 10px;
+    margin-bottom:6px; text-decoration:none;
+  }
+  .newsItemTitle { font-size:12px; color:#eee; font-weight:600; margin-bottom:2px; }
+  .newsItemDesc { font-size:11px; color:#888; line-height:1.4; }
+  .sentimentTag { display:inline-block; font-size:10px; padding:1px 6px; border-radius:8px; font-weight:700; margin-right:2px; }
+  .sentimentTag.sentimentUp { background:#2a1616; color:#ff8787; }
+  .sentimentTag.sentimentDown { background:#16243a; color:#4d9fff; }
+  .sentimentTag.sentimentNeutral { background:#222; color:#999; }
+  #modalDartSummary { margin-bottom:12px; max-height:78px; overflow-y:auto; }
+  .dartItem { border-left:2px solid #ffd43b; }
+  .highGap { font-size:11px; color:#888; margin-top:2px; }
+  .sellWarning { font-size:12px; color:#ff8787; background:#2a1616; border-radius:8px; padding:8px 10px; margin-top:8px; }
+  .sellOk { font-size:12px; color:#69db7c; background:#16241c; border-radius:8px; padding:8px 10px; margin-top:8px; }
+  .highGap b { color:#ffa94d; }
+  #modalDetail { margin-bottom:14px; }
+  .detailLoading, .detailError { color:#888; font-size:13px; padding:8px 0; }
+  .detailError { color:#ff8787; }
+  .detailGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; background:#151515; border-radius:10px; padding:10px 12px; font-size:12px; color:#999; }
+  .detailGrid b { display:block; font-size:14px; color:#eee; margin-top:2px; }
+  .detailGrid b.up { color:#ff6b6b; }
+  .chartRange { font-size:11px; color:#888; text-align:center; margin-top:4px; }
+  .chartTimeLabels { display:flex; justify-content:space-between; font-size:10px; color:#666; padding:2px 6px 0; }
+  .liveDot { color:#69db7c; animation:blink 1.5s ease-in-out infinite; }
+  @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.2; } }
+  .chartWrap { overflow:hidden; touch-action:none; cursor:grab; border-radius:8px; background:#151515; }
+  .chartWrap:active { cursor:grabbing; }
+  .chartWrap svg { display:block; will-change:transform; }
+  .chartResetBtn { color:#4d9fff; text-decoration:underline dotted; cursor:pointer; }
+  .periodRow { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+  .periodBtn {
+    flex:1; min-width:40px; padding:8px 4px; border-radius:8px; border:none;
+    background:#2a2a2a; color:#aaa; font-size:12px; cursor:pointer;
+  }
+  .periodBtn.active { background:#ff6b6b; color:#111; font-weight:600; }
+  .boardHeadRow { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  .boardHeadRow h2 { margin:0; }
+  .sortToggle { display:flex; gap:6px; }
+  .sortBtn { background:#2a2a2a; color:#aaa; border:none; border-radius:6px; padding:5px 10px; font-size:11px; cursor:pointer; }
+  .sortBtn.active { background:#ff6b6b; color:#111; font-weight:600; }
+  .tradeDelBtn { color:#666; cursor:pointer; font-size:14px; }
+  .pnlPositive { color:#ff6b6b; }
+  .pnlNegative { color:#4d9fff; }
+  .addedDate { font-size:10px; color:#666; font-weight:normal; }
+  .riskBadge { font-size:10px; font-weight:700; margin-top:2px; }
+  .riskBadgeDown { color:#4d9fff; }
+  .riskBadgeUp { color:#ff6b6b; }
+  .miniChartRow td { border-bottom:1px solid #2a2a2a; padding:0 4px 8px; }
+  .miniChartRow { background:transparent; }
+  .modalBtn {
+    display:block; width:100%; box-sizing:border-box; text-align:center;
+    padding:14px; margin-bottom:10px; border-radius:10px; border:none;
+    font-size:15px; font-weight:600; text-decoration:none; cursor:pointer;
+  }
+  .modalBtn.price { background:#2a2a2a; color:#eee; }
+  .modalBtn.risk { background:#2a2a2a; color:#ffa94d; }
+  .modalBtn.ai { background:#2a2a2a; color:#a78bfa; }
+  .actionRow { display:flex; gap:8px; margin-bottom:10px; }
+  .actionRow .modalBtn {
+    flex:1; width:auto; margin-bottom:0; padding:10px 4px;
+    font-size:12px; white-space:nowrap;
+  }
+  .aiAnalysisCard {
+    background:#17141f; border:1px solid #4c3a80; border-radius:10px;
+    padding:12px; font-size:13px; line-height:1.6; color:#ddd; margin-bottom:12px;
+    white-space:pre-wrap; max-height:340px; overflow-y:auto;
+  }
+  .aiAnalysisNote { font-size:10px; color:#666; margin-top:6px; }
+  .riskGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; background:#151515; border-radius:10px; padding:10px 12px; font-size:12px; color:#999; margin-bottom:12px; }
+  .riskGrid b { display:block; font-size:15px; margin-top:2px; }
+  .riskGrid .stopLoss b { color:#4d9fff; }
+  .riskGrid .takeProfit b { color:#ff6b6b; }
+  .riskNote { font-size:10px; color:#666; margin-top:6px; grid-column:1 / -1; }
+  .gcCard { border-radius:10px; padding:10px 12px; font-size:13px; font-weight:600; margin-bottom:12px; }
+  .gcCard.gcUp { background:#1c2a1c; color:#69db7c; }
+  .gcCard.gcDown { background:#2a1c1c; color:#ff8787; }
+  .gcDetail { font-size:11px; color:#999; font-weight:normal; margin-top:4px; }
+  .modalBtn.cancel { background:transparent; color:#888; margin-bottom:0; padding:10px; }
+  .streakBoard h2 { color:#ffd43b; }
+  .streakBoard.streak5 h2 { color:#69db7c; }
+  .topPicksBoard { border:1px solid #ffd43b; background:linear-gradient(180deg,#1c1a0f,#1c1c1c); }
+  .topPicksBoard h2 { color:#ffd43b; }
+  .topPicksBoard tr.clickable:active { background:#2a2410; }
+  .intervalTag { font-size:11px; color:#888; font-weight:normal; }
+  #goldenWindowBanner {
+    background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
+    font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
+  }
+  .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
+  #reloadBtn {
+    position:fixed; right:14px; top:calc(50% - 30px); transform:translateY(-50%);
+    width:50px; height:50px; border-radius:50%; border:none;
+    background:#ff6b6b; color:#111; font-size:22px; z-index:90;
+    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
+  }
+  #reloadBtn.spinning { animation:spin 0.6s linear; }
+  @keyframes spin { from{ transform:translateY(-50%) rotate(0deg); } to{ transform:translateY(-50%) rotate(360deg); } }
+  #collectBtn:disabled, #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
+  #collectBtn {
+    position:fixed; right:14px; top:calc(50% + 30px); transform:translateY(-50%);
+    width:50px; height:50px; border-radius:50%; border:none;
+    background:#69db7c; color:#111; font-size:20px; z-index:90;
+    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
+  }
+  #collectBtn.spinning { animation:spin 0.9s linear infinite; }
+  #fullReloadBtn {
+    position:fixed; right:14px; top:calc(50% + 90px); transform:translateY(-50%);
+    width:50px; height:50px; border-radius:50%; border:none;
+    background:#4d9fff; color:#111; font-size:20px; z-index:90;
+    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
+  }
+  #fullReloadBtn.spinning { animation:spin 0.6s linear; }
+</style>
+</head>
+<body>
+  <button id="reloadBtn" title="화면 새로고침">🔄</button>
+  <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
+  <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
+  <h1>🔥 급등주 스크리너</h1>
+  <div class="sub" id="ts">불러오는 중...</div>
+  <div id="goldenWindowBanner" style="display:none;"></div>
+
+  <div class="board">
+    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
+    <table id="watchlist">
+      <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
+      <tbody><tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="board topPicksBoard">
+    <h2>🏆 오늘의 TOP 20</h2>
+    <table id="topPicks">
+      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="board">
+    <div class="boardHeadRow">
+      <h2>🔍 지난 1주일 패턴 유사 종목</h2>
+      <button id="patternScanBtn" class="sortBtn">스캔 시작</button>
+    </div>
+    <table id="patternScan">
+      <thead><tr><th>종목</th><th>유사한 날</th><th>유사도</th></tr></thead>
+      <tbody><tr><td class="empty">스캔 시작 버튼을 눌러주세요</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="board streakBoard streak5">
+    <h2>🚀 5연속 상승 종목 <span class="intervalTag">(2분간격)</span></h2>
+    <table id="streak5"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
+  </div>
+
+  <div class="board streakBoard">
+    <h2>⚡ 3연속 상승 종목 <span class="intervalTag">(2분간격)</span></h2>
+    <table id="streak3"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
+  </div>
+
+  <div class="board">
+    <h2>2분 전보다 더 오른 TOP5</h2>
+    <table id="top5"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
+  </div>
+
+  <div class="board">
+    <div class="boardHeadRow">
+      <h2>전체 목록 (등락률 5~15%)</h2>
+      <div class="sortToggle">
+        <button class="sortBtn active" id="sortByMomentum">종합점수순</button>
+        <button class="sortBtn" id="sortByRate">등락률순</button>
+        <button class="sortBtn" id="sortByVolumeDesc">거래량 많은순</button>
+        <button class="sortBtn" id="sortByVolumeAsc">거래량 적은순</button>
+        <button class="sortBtn" id="sortByCntrStr">체결강도순</button>
+        <button class="sortBtn" id="sortBySignal">신호점수순</button>
+      </div>
+    </div>
+    <table id="all">
+      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
+    </table>
+  </div>
+
+  <div id="modalOverlay">
+    <div id="modalBox">
+      <div class="modalHeadRow">
+        <span id="modalStarBtn" class="starBtn">☆</span>
+        <h3 id="modalName">-</h3>
+        <span id="modalCodeBadge">-</span>
+      </div>
+      <div class="modalPriceRow">
+        <span id="modalPrice" class="modalPriceInline">-</span>
+        <span class="up" id="modalRate">-</span>
+      </div>
+      <div id="modalOrderBook"></div>
+      <div id="modalNewsLinks"></div>
+      <div id="modalNewsSummary"></div>
+      <div id="modalDartSummary"></div>
+      <div id="modalDetail"></div>
+      <div class="periodRow" id="periodRow">
+        <button class="periodBtn" data-period="T">틱</button>
+        <button class="periodBtn active" data-period="1">1분</button>
+        <button class="periodBtn" data-period="5">5분</button>
+        <button class="periodBtn" data-period="15">15분</button>
+        <button class="periodBtn" data-period="30">30분</button>
+        <button class="periodBtn" data-period="D">일봉</button>
+        <button class="periodBtn" data-period="W">주봉</button>
+        <button class="periodBtn" data-period="M">월봉</button>
+      </div>
+      <div class="actionRow">
+        <button class="modalBtn price" id="modalPriceBtn">💰 현재가</button>
+        <button class="modalBtn risk" id="modalRiskBtn">🎯 손절/익절</button>
+        <button class="modalBtn ai" id="modalAiBtn">🤖 AI 분석</button>
+      </div>
+      <button class="modalBtn cancel" id="modalCancelBtn">닫기</button>
+    </div>
+  </div>
+
+<script src="/app.js"></script>
 </body>
 </html>`;
 }
@@ -2240,18 +2321,21 @@ function isTokenInvalidError(data) {
   return data && (data.return_code === 3 || /토큰|Token/i.test(JSON.stringify(data.return_msg || "")));
 }
 
-async function kiwoomQuote(env, token, code) {
+// kiwoomQuote/kiwoomChart가 거의 똑같이 반복하던 부분(relay 호출 -> JSON파싱 -> 실패시 토큰 재발급 후 1회 재시도)
+// 을 한 곳으로 모음. path/apiId/body만 다르고 나머지 흐름은 동일해서 여기 고치면 둘 다 적용됨.
+async function kiwoomApiCall(env, token, path, apiId, body, extraHeaders) {
   const call = async (tok) => {
-    const res = await kiwoomRelayFetch(env, "/api/dostk/mrkcond", {
+    const res = await kiwoomRelayFetch(env, path, {
       method: "POST",
       headers: {
         "Content-Type": "application/json;charset=UTF-8",
         authorization: `Bearer ${tok}`,
         "cont-yn": "N",
         "next-key": "",
-        "api-id": "ka10007", // 시세표성정보요청
+        "api-id": apiId,
+        ...extraHeaders,
       },
-      body: JSON.stringify({ stk_cd: code }),
+      body: JSON.stringify(body),
     });
     const rawText = await res.text();
     let data;
@@ -2259,12 +2343,12 @@ async function kiwoomQuote(env, token, code) {
       data = JSON.parse(rawText);
     } catch (parseErr) {
       // 키움이 JSON 대신 HTML(세션 만료 등)을 준 경우 - 토큰 무효와 동일하게 재시도 대상으로 처리
-      const err = new Error(`ka10007 응답이 JSON이 아님(code=${code}): ${rawText.slice(0, 200)}`);
+      const err = new Error(`${apiId} 응답이 JSON이 아님: ${rawText.slice(0, 200)}`);
       err.kiwoomData = { return_code: 3, return_msg: "JSON 파싱 실패(비정상 응답)" };
       throw err;
     }
     if (!res.ok || data.return_code !== 0) {
-      const err = new Error(`ka10007 실패(code=${code}): ${JSON.stringify(data)}`);
+      const err = new Error(`${apiId} 실패: ${JSON.stringify(data)}`);
       err.kiwoomData = data;
       throw err;
     }
@@ -2279,6 +2363,10 @@ async function kiwoomQuote(env, token, code) {
     }
     throw e;
   }
+}
+
+async function kiwoomQuote(env, token, code) {
+  return kiwoomApiCall(env, token, "/api/dostk/mrkcond", "ka10007", { stk_cd: code });
 }
 
 function abs(v) {
@@ -2325,46 +2413,7 @@ async function kiwoomChart(env, token, code, period) {
     apiId = "ka10080"; // 주식분봉차트조회요청
     body = { stk_cd: code, tic_scope: period, upd_stkpc_tp: "1" };
   }
-
-  const call = async (tok) => {
-    const res = await kiwoomRelayFetch(env, "/api/dostk/chart", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json;charset=UTF-8",
-        authorization: `Bearer ${tok}`,
-        "cont-yn": "N",
-        "next-key": "",
-        "api-id": apiId,
-      },
-      body: JSON.stringify(body),
-    });
-    const rawText = await res.text();
-    let data;
-    try {
-      data = JSON.parse(rawText);
-    } catch (parseErr) {
-      // 키움이 JSON 대신 HTML(세션 만료 등)을 준 경우 - 토큰 무효와 동일하게 재시도 대상으로 처리
-      const err = new Error(`${apiId} 응답이 JSON이 아님(code=${code}): ${rawText.slice(0, 200)}`);
-      err.kiwoomData = { return_code: 3, return_msg: "JSON 파싱 실패(비정상 응답)" };
-      throw err;
-    }
-    if (!res.ok || data.return_code !== 0) {
-      const err = new Error(`${apiId} 실패(code=${code}): ${JSON.stringify(data)}`);
-      err.kiwoomData = data;
-      throw err;
-    }
-    return data;
-  };
-
-  try {
-    return await call(token);
-  } catch (e) {
-    if (isTokenInvalidError(e.kiwoomData)) {
-      const freshToken = await kiwoomIssueToken(env, true); // 캐시된 토큰이 무효화됐으므로 강제 재발급 후 한 번 더 시도
-      return await call(freshToken);
-    }
-    throw e;
-  }
+  return kiwoomApiCall(env, token, "/api/dostk/chart", apiId, body);
 }
 
 // ---------- 손절/익절 라인 계산 (ATR 기반) ----------
@@ -2601,6 +2650,13 @@ function checkAdminKey(request, url, env) {
   return headerKey === env.ADMIN_KEY || queryKey === env.ADMIN_KEY;
 }
 
+// 실거래 주문(매수/매도) 전용 - 쿼리스트링은 서버 로그/브라우저 히스토리에 그대로 남을 수 있어서
+// 헤더(X-Admin-Key)로만 인증 허용. 위 checkAdminKey보다 엄격한 버전.
+function checkAdminKeyHeaderOnly(request, env) {
+  if (!env.ADMIN_KEY) return false;
+  return request.headers.get("X-Admin-Key") === env.ADMIN_KEY;
+}
+
 // ---------- 엔트리포인트 ----------
 export default {
   async fetch(request, env) {
@@ -2643,6 +2699,13 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(fetch(e.request).catch(() => new Response('오프라인 상태입니다', { status: 503 })));
 });`;
         return new Response(sw, { headers: { "content-type": "application/javascript" } });
+      }
+
+      if (url.pathname === "/app.js") {
+        // 클라이언트 스크립트를 HTML에서 분리해서 서빙 (diff/유지보수 편하게)
+        return new Response(clientScript(), {
+          headers: { "content-type": "application/javascript; charset=UTF-8" },
+        });
       }
 
       if (url.pathname === "/api/watchlist" && request.method === "GET") {
@@ -2733,12 +2796,24 @@ self.addEventListener('fetch', (e) => {
           data.watchlistLastKnown = [];
         }
 
+        // cron이 미리 체크해둔 손절/익절 도달 상태 (모달 안 열어도 바로 보이게)
+        if (data.watchlist.length) {
+          try {
+            const riskRes = await env.DB.prepare(`SELECT code, status FROM watchlist_risk_status`).all();
+            data.watchlistRisk = riskRes.results;
+          } catch (e) {
+            data.watchlistRisk = []; // watchlist_risk_status 테이블이 아직 없을 수 있음
+          }
+        } else {
+          data.watchlistRisk = [];
+        }
+
         return Response.json(data);
       }
 
       if (url.pathname === "/api/buy" && request.method === "POST") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
         }
         try {
           const { code } = await request.json();
@@ -2751,8 +2826,8 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/sell" && request.method === "POST") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
         }
         try {
           const { code } = await request.json();
@@ -3020,6 +3095,17 @@ self.addEventListener('fetch', (e) => {
           if (times.length === 0) {
             return Response.json({ ok: false, error: "오늘 수집된 데이터가 없습니다" });
           }
+
+          // 같은 스냅샷 시각(2분 틱)에 대해 이미 스캔한 적 있으면 15종목×1.1초 재스캔 없이 캐시 반환
+          const cached = await env.DB.prepare(
+            `SELECT result_json FROM pattern_scan_cache WHERE captured_at = ?`
+          )
+            .bind(times[0])
+            .first();
+          if (cached) {
+            return Response.json({ ok: true, cached: true, ...JSON.parse(cached.result_json) });
+          }
+
           const candRes = await env.DB.prepare(
             `SELECT code, name, volume FROM snapshots WHERE captured_at = ? ORDER BY volume DESC LIMIT 15`
           )
@@ -3027,13 +3113,126 @@ self.addEventListener('fetch', (e) => {
             .all();
           const candidates = candRes.results;
           const { results, debugInfo } = await scanPatternMatches(env, candidates);
+          const payload = { scanned: candidates.length, latestSnapshotAt: times[0], results, debugInfo };
+
+          await env.DB.prepare(
+            `INSERT OR REPLACE INTO pattern_scan_cache (captured_at, result_json, created_at) VALUES (?, ?, ?)`
+          )
+            .bind(times[0], JSON.stringify(payload), new Date().toISOString())
+            .run();
+
+          return Response.json({ ok: true, cached: false, ...payload });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/admin/backtest-momentum") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        // "직전 틱 대비 상승 중인 종목이 그 다음 틱에도 계속 오르는가?" 검증
+        // (momentumScore/risingTop5가 근거로 쓰는 가정 자체가 맞는지 실제 데이터로 확인)
+        try {
+          const tickLimit = Math.min(parseInt(url.searchParams.get("ticks") || "300", 10) || 300, 1000);
+          const timesRes = await env.DB.prepare(
+            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
+          )
+            .bind(tickLimit)
+            .all();
+          const times = timesRes.results.map((r) => r.captured_at).reverse(); // 과거 -> 최신
+          if (times.length < 3) {
+            return Response.json({ ok: false, error: "분석할 틱이 부족합니다 (최소 3틱 필요)" });
+          }
+
+          const placeholders = times.map(() => "?").join(",");
+          const rowsRes = await env.DB.prepare(
+            `SELECT code, change_rate, captured_at FROM snapshots WHERE captured_at IN (${placeholders})`
+          )
+            .bind(...times)
+            .all();
+
+          // code별로 시간순 change_rate 배열 구성
+          const byCode = new Map();
+          for (const r of rowsRes.results) {
+            if (!byCode.has(r.code)) byCode.set(r.code, new Map());
+            byCode.get(r.code).set(r.captured_at, r.change_rate);
+          }
+
+          let posCount = 0, posForwardSum = 0;
+          let negCount = 0, negForwardSum = 0;
+          for (const rateByTime of byCode.values()) {
+            for (let i = 1; i < times.length - 1; i++) {
+              const prev = rateByTime.get(times[i - 1]);
+              const cur = rateByTime.get(times[i]);
+              const next = rateByTime.get(times[i + 1]);
+              if (prev === undefined || cur === undefined || next === undefined) continue; // 그 구간에 리스트 밖이었던 종목
+              const momentumDelta = cur - prev; // 지금 이 틱까지의 momentum
+              const forwardDelta = next - cur; // 그 다음 틱에서 실제로 어떻게 됐는지
+              if (momentumDelta > 0) {
+                posCount++;
+                posForwardSum += forwardDelta;
+              } else if (momentumDelta < 0) {
+                negCount++;
+                negForwardSum += forwardDelta;
+              }
+            }
+          }
+
           return Response.json({
             ok: true,
-            scanned: candidates.length,
-            latestSnapshotAt: times[0],
-            results,
-            debugInfo,
+            ticksAnalyzed: times.length,
+            momentumPositive: {
+              sampleSize: posCount,
+              avgForwardDeltaPct: posCount ? +(posForwardSum / posCount).toFixed(4) : null,
+            },
+            momentumNegative: {
+              sampleSize: negCount,
+              avgForwardDeltaPct: negCount ? +(negForwardSum / negCount).toFixed(4) : null,
+            },
+            interpretation:
+              "momentumPositive.avgForwardDeltaPct가 momentumNegative보다 뚜렷하게 크면(양수 우세) " +
+              "momentumScore/risingTop5 가정(상승 중이면 계속 상승)이 어느 정도 근거 있는 것. " +
+              "차이가 거의 없거나 반대면 가중치 재검토 필요.",
           });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/relay-health") {
+        // relay VM이 살아있는지 즉시 확인용 (오늘처럼 방화벽/relay 죽어서 몇 시간 헤매는 것 방지)
+        // 시크릿 포함해서 실제로 응답이 오는지만 봄 - relay가 응답하면(어떤 상태코드든) 최소한 살아있는 것
+        const startedAt = Date.now();
+        try {
+          if (!env.RELAY_URL || !env.RELAY_SECRET) {
+            return Response.json({ ok: false, error: "RELAY_URL / RELAY_SECRET 시크릿 미설정" }, { status: 500 });
+          }
+          const res = await fetch(env.RELAY_URL + "/", {
+            headers: { "X-Relay-Secret": env.RELAY_SECRET },
+          });
+          const elapsedMs = Date.now() - startedAt;
+          return Response.json({ ok: true, relayReachable: true, httpStatus: res.status, elapsedMs });
+        } catch (e) {
+          return Response.json(
+            { ok: true, relayReachable: false, error: String(e.message || e), elapsedMs: Date.now() - startedAt },
+            { status: 200 } // relay 다운은 이 API 자체의 실패가 아니라 정상적인 진단 결과이므로 200
+          );
+        }
+      }
+
+      if (url.pathname === "/api/admin/system-events") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        try {
+          const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
+          const res = await env.DB.prepare(
+            `SELECT kind, message, created_at FROM system_events ORDER BY created_at DESC LIMIT ?`
+          )
+            .bind(limit)
+            .all();
+          return Response.json({ ok: true, events: res.results });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
@@ -3066,8 +3265,18 @@ self.addEventListener('fetch', (e) => {
     const isFinalCloseTick = minutes === 15 * 60 + 36;
 
     ctx.waitUntil(
-      (isFinalCloseTick ? collectFinalAccurateQuotes(env) : collectAndStore(env)).catch((e) => {
+      (async () => {
+        if (isFinalCloseTick) {
+          await collectFinalAccurateQuotes(env);
+        } else {
+          await collectAndStore(env);
+          await checkWatchlistRiskLevels(env).catch((e) => {
+            console.error("관심종목 리스크체크 실패:", e.message || e);
+          });
+        }
+      })().catch((e) => {
         console.error("scheduled 수집 실패:", e.message || e);
+        return logSystemEvent(env, "cron_failure", `${isFinalCloseTick ? "최종재조회" : "배치수집"} 실패: ${e.message || e}`);
       })
     );
   },
