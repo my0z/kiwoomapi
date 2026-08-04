@@ -163,6 +163,77 @@ async function checkWatchlistRiskLevels(env) {
   return { checked };
 }
 
+// 관심종목 성과 추적: 담은 시점 이후 30분/60분/장마감에 실제로 어떻게 됐는지 자동 기록.
+// - 목적: source_board/added_state(어느 보드에서, 어떤 신호였는지)와 결과를 묶어서
+//   "어떤 신호가 실제로 돈이 됐는지"를 감이 아니라 본인 데이터로 알 수 있게 하는 것
+// - 추가 키움 조회 없음: 이미 수집된 snapshots에서 해당 시점 가격을 찾아 씀
+//   (밴드 밖으로 나간 종목은 스냅샷이 없을 수 있어 null로 남고, 다음 틱에 다시 시도됨)
+async function trackWatchlistPerformance(env) {
+  const wlRes = await env.DB.prepare(
+    `SELECT code, name, added_at, entry_price, source_board, added_state FROM watchlist WHERE entry_price > 0`
+  ).all();
+  const items = wlRes.results;
+  if (!items.length) return { tracked: 0 };
+
+  const now = Date.now();
+  let tracked = 0;
+  for (const w of items) {
+    const addedMs = new Date(w.added_at).getTime();
+    const elapsedMin = (now - addedMs) / 60000;
+
+    for (const horizon of [30, 60]) {
+      if (elapsedMin < horizon) continue; // 아직 그 시점에 도달 안 함
+      const already = await env.DB.prepare(
+        `SELECT 1 FROM watchlist_performance WHERE code = ? AND added_at = ? AND horizon_min = ?`
+      )
+        .bind(w.code, w.added_at, horizon)
+        .first()
+        .catch(() => null);
+      if (already) continue; // 이미 기록됨
+
+      // 담은 시점 + horizon분 근처의 스냅샷 가격을 찾음 (그 이후 첫 스냅샷)
+      const targetIso = new Date(addedMs + horizon * 60000).toISOString();
+      const row = await env.DB.prepare(
+        `SELECT price, change_rate, captured_at FROM snapshots
+         WHERE code = ? AND captured_at >= ? ORDER BY captured_at ASC LIMIT 1`
+      )
+        .bind(w.code, targetIso)
+        .first()
+        .catch(() => null);
+      if (!row) continue; // 그 시점 데이터 아직 없음(또는 밴드 밖) - 다음 틱에 다시 시도
+
+      const pnlPct = ((row.price - w.entry_price) / w.entry_price) * 100;
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO watchlist_performance
+         (code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          w.code, w.name, w.added_at, horizon, w.entry_price, row.price,
+          +pnlPct.toFixed(3), w.source_board || "", w.added_state || "", new Date().toISOString()
+        )
+        .run()
+        .catch(() => {});
+      tracked++;
+    }
+  }
+  return { tracked };
+}
+
+// 코스피/코스닥 지수 조회 (ka20001 업종현재가요청)
+// - 시장 전체가 빠지는 날엔 급등주 신호 자체가 잘 안 먹히므로, 그 맥락을 화면 상단에 같이 보여주기 위함
+// inds_cd: "001"=종합(KOSPI), "101"=종합(KOSDAQ)
+async function kiwoomMarketIndex(env, token, mrktTp, indsCd) {
+  const data = await kiwoomApiCall(env, token, "/api/dostk/sect", "ka20001", {
+    mrkt_tp: mrktTp,
+    inds_cd: indsCd,
+  });
+  return {
+    price: parseFloat(String(data.cur_prc ?? "0").replace(/[^\d.-]/g, "")) || 0,
+    rate: parseFloat(data.flu_rt ?? "0") || 0,
+  };
+}
+
 // 조용히 묻히던 수집 실패를 D1에 남겨서 나중에 확인 가능하게 함 (system_events 테이블 필요 - schema.sql 참고)
 // 로깅 자체가 실패해도(테이블 없음 등) 전체 흐름을 막으면 안 되니 조용히 무시
 async function logSystemEvent(env, kind, message) {
@@ -264,6 +335,7 @@ async function purgeOldRows(env) {
   const shortCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(`DELETE FROM pattern_scan_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM latest_extras_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
+  await env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
 
   return result.meta?.changes ?? 0;
@@ -1086,7 +1158,16 @@ function computeTopPicks(latest, streak5Codes) {
 // - 가속 중(최근 구간이 예전 구간보다 빠름)이면 관성이 이어질 가능성으로 가점
 // - 눌림목 재상승 패턴이면 이미 한 번 힘을 보여주고 쉬었다가 다시 도는 것이라 진입 근거가 더 명확 - 가장 크게 가점
 // - 지금 이 순간 이미 꺾이고 있거나(recentDelta<0) 상한가 임박(위쪽 여력 없음)이면 확실히 감점/제외 성격
+// 코스피/코스닥 둘 다 마이너스면 true - loadMarketIndex()가 채우고 추천점수 감점에 사용
+// (computeRecommendations보다 먼저 선언되어야 TDZ 에러가 안 남)
+let weakMarket = false;
+
 function computeRecommendations(latest, pullbackCodes) {
+  // 14:30 이후는 마감까지 시간이 짧아 물렸을 때 회복 기회가 부족 - 신규 진입 후보 점수를 전반적으로 낮춤
+  const kstNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const kstMinutes = kstNow.getHours() * 60 + kstNow.getMinutes();
+  const isLateSession = kstMinutes >= 14 * 60 + 30;
+
   return [...latest]
     .map(r => {
       const mom = r.momentum || [];
@@ -1106,7 +1187,11 @@ function computeRecommendations(latest, pullbackCodes) {
       if (r.isTodayHigh && (r.change_rate || 0) < 25) score += 1; // 고점 갱신 중(단, 상한가 근접 전이라 아직 여력 있을 때만)
       if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
       if ((r.price || 0) < 2000) score -= 3; // 동전주 위험
+      // 거래대금 10억 미만은 슬리피지로 수익이 깎일 위험 - 진입 자체를 신중히
+      if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) score -= 2;
       if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
+      if (isLateSession) score -= 2; // 오후 늦은 시각 - 마감까지 회복 시간이 부족
+      if (weakMarket) score -= 1.5; // 코스피/코스닥 동반 약세 - 급등주 신호 신뢰도 하락
       return { ...r, recoScore: score, accelerating };
     })
     .sort((a, b) => b.recoScore - a.recoScore)
@@ -1203,6 +1288,10 @@ function renderBadges(r) {
   if (r.cntrStrRising) badges.push('<span class="badge badgeCntr">💪체결강도개선</span>');
   if (r.buyReqSpike) badges.push('<span class="badge badgeBid">📥매수잔량급증</span>');
   if (r.freshEntry) badges.push('<span class="badge badgeFresh">✨신규진입</span>');
+  // 거래대금이 너무 작으면 사고팔 때 슬리피지로 수익이 깎임 (동전주 필터와 별개 문제)
+  if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) {
+    badges.push('<span class="badge badgeLimit">💧거래대금 ' + Math.round(r.tradeValue / 100000000) + '억</span>');
+  }
   if (typeof r.relativeStrength === 'number' && r.relativeStrength !== 0) {
     const cls = r.relativeStrength > 0 ? 'up' : 'down';
     badges.push('<span class="badge">RS <span class="' + cls + '">' + (r.relativeStrength >= 0 ? '+' : '') + r.relativeStrength.toFixed(2) + '</span></span>');
@@ -1450,6 +1539,8 @@ async function load() {
   (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
   watchlistRiskMap = {};
   (data.watchlistRisk || []).forEach(r => { watchlistRiskMap[r.code] = r.status; });
+  watchlistExitMap = {};
+  (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
   renderWatchlist(data.watchlist || []);
 }
 
@@ -1499,6 +1590,7 @@ function formatAddedDate(isoString) {
 
 let watchlistLastKnownMap = {}; // 밴드 밖 종목의 D1 마지막 저장 시세 (load()에서 채워짐)
 let watchlistRiskMap = {}; // { code: 'safe'|'stop_loss_hit'|'take_profit_hit' } - cron이 미리 체크해둔 것 (load()에서 채워짐)
+let watchlistExitMap = {}; // { code: [이탈신호 사유들] } - 손절선 전 미리 나타나는 약세 징후 (load()에서 채워짐)
 
 // ---------- 관심종목 미니 캔들차트 (1분봉) ----------
 const miniCandleCache = {}; // { code: candles[] }
@@ -1709,6 +1801,10 @@ function renderWatchlist(items) {
         : riskStatus === 'take_profit_hit'
         ? '<div class="riskBadge riskBadgeUp">🎯 익절선 도달</div>'
         : '';
+      const exitReasons = watchlistExitMap[r.code];
+      const exitBadgeHtml = exitReasons && exitReasons.length
+        ? '<div class="riskBadge riskBadgeExit">🔻이탈신호: ' + exitReasons.join(' · ') + '</div>'
+        : '';
       const addedContextHtml = (r.sourceBoard || r.addedState)
         ? '<div class="addedContext">' +
           (r.sourceBoard || '') +
@@ -1718,7 +1814,7 @@ function renderWatchlist(items) {
         : '';
       return (
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
-          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskBadgeHtml + '</td>' +
+          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskBadgeHtml + exitBadgeHtml + '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
           '<td>' + rateHtml + '</td>' +
           '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : (r.entryPrice === null ? '<span class="empty">확정중</span>' : '-')) + '</td>' +
@@ -1916,14 +2012,42 @@ document.getElementById('collectBtn').addEventListener('click', (e) => {
     });
 });
 
-// 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
+// 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
+function loadMarketIndex() {
+  fetch('/api/market-index')
+    .then(res => res.json())
+    .then(data => {
+      if (!data.ok) return;
+      const bar = document.getElementById('marketIndexBar');
+      const fmtIdx = (label, d) => {
+        const cls = d.rate >= 0 ? 'up' : 'down';
+        return '<span>' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
+          '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
+      };
+      weakMarket = data.kospi.rate < 0 && data.kosdaq.rate < 0;
+      bar.innerHTML = fmtIdx('KOSPI', data.kospi) + fmtIdx('KOSDAQ', data.kosdaq) +
+        (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
+      bar.style.display = 'flex';
+    })
+    .catch(() => {});
+}
+loadMarketIndex();
+setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 120000); // 2분마다 (서버에서 틱 단위 캐싱됨)
+
+
+// 반대로 14:30 이후는 장 마감까지 시간이 얼마 없어서, 물렸을 때 회복할 기회 자체가 부족함
 function updateGoldenWindowBanner() {
   const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
   const minutes = kst.getHours() * 60 + kst.getMinutes();
   const banner = document.getElementById('goldenWindowBanner');
   if (minutes >= 9 * 60 && minutes <= 9 * 60 + 30) {
     banner.style.display = 'block';
+    banner.className = '';
     banner.textContent = '⏰ 09:00~09:30 활발 시간대';
+  } else if (minutes >= 14 * 60 + 30 && minutes <= 15 * 60 + 30) {
+    banner.style.display = 'block';
+    banner.className = 'lateWarning';
+    banner.textContent = '⚠️ 14:30 이후 - 마감까지 시간이 짧아 신규 진입 시 회복 기회가 적습니다';
   } else {
     banner.style.display = 'none';
   }
@@ -2114,6 +2238,7 @@ function renderDashboard() {
   .riskBadge { font-size:10px; font-weight:700; margin-top:2px; }
   .riskBadgeDown { color:#4d9fff; }
   .riskBadgeUp { color:#ff6b6b; }
+  .riskBadgeExit { color:#ffa94d; }
   .miniChartRow td { border-bottom:1px solid #2a2a2a; padding:0 4px 8px; }
   .miniChartRow { background:transparent; }
   .modalBtn {
@@ -2155,6 +2280,12 @@ function renderDashboard() {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
   }
+  #goldenWindowBanner.lateWarning { background:linear-gradient(90deg,#4d5b6b,#8a939c); color:#fff; }
+  #marketIndexBar {
+    display:flex; gap:14px; font-size:12px; color:#aaa;
+    background:#1c1c1c; border-radius:10px; padding:8px 12px; margin-bottom:14px;
+  }
+  #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
   #reloadBtn {
     position:fixed; right:14px; top:calc(50% - 30px); transform:translateY(-50%);
@@ -2187,6 +2318,7 @@ function renderDashboard() {
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
   <h1>🔥 급등주 스크리너</h1>
   <div class="sub" id="ts">불러오는 중...</div>
+  <div id="marketIndexBar" style="display:none;"></div>
   <div id="goldenWindowBanner" style="display:none;"></div>
 
   <div class="board">
@@ -3106,6 +3238,75 @@ self.addEventListener('fetch', (e) => {
           data.watchlistRisk = [];
         }
 
+        // 관심종목 이탈신호(매도 고려): 손절선에 닿기 전에 미리 나타나는 약세 징후들.
+        // 이미 D1에 있는 최근 스냅샷만 사용 - 추가 키움 조회 0건.
+        data.watchlistExitSignals = [];
+        if (data.watchlist.length) {
+          try {
+            const wlCodes = data.watchlist.map((w) => w.code);
+            const ph = wlCodes.map(() => "?").join(",");
+            const recentTimesRes = await env.DB.prepare(
+              `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 4`
+            ).all();
+            const recentTimes = recentTimesRes.results.map((r) => r.captured_at);
+            if (recentTimes.length >= 2) {
+              const tph = recentTimes.map(() => "?").join(",");
+              const histRes = await env.DB.prepare(
+                `SELECT code, change_rate, cntr_str, buy_req, sel_req, captured_at
+                 FROM snapshots WHERE code IN (${ph}) AND captured_at IN (${tph})`
+              )
+                .bind(...wlCodes, ...recentTimes)
+                .all();
+              // 당일 고점(등락률 기준) - 고점 대비 얼마나 밀렸는지 판단용
+              const todayPrefix2 = recentTimes[0].slice(0, 10);
+              const maxRes = await env.DB.prepare(
+                `SELECT code, MAX(change_rate) AS maxRate FROM snapshots
+                 WHERE code IN (${ph}) AND captured_at LIKE ? GROUP BY code`
+              )
+                .bind(...wlCodes, todayPrefix2 + "%")
+                .all();
+              const maxMap = new Map(maxRes.results.map((r) => [r.code, r.maxRate]));
+
+              const byCode = new Map();
+              for (const r of histRes.results) {
+                if (!byCode.has(r.code)) byCode.set(r.code, new Map());
+                byCode.get(r.code).set(r.captured_at, r);
+              }
+
+              for (const code of wlCodes) {
+                const m = byCode.get(code);
+                if (!m) continue;
+                const cur = m.get(recentTimes[0]);
+                const prev = m.get(recentTimes[1]);
+                if (!cur || !prev) continue;
+                const reasons = [];
+
+                // 1) 체결강도가 매수우위(105+)에서 꺾여 내려옴
+                if ((prev.cntr_str || 0) >= 105 && (cur.cntr_str || 0) < 100) reasons.push("체결강도 꺾임");
+                // 2) 매수잔량 우위 -> 매도잔량 우위로 역전 ("매수전환"의 정반대)
+                if ((prev.buy_req || 0) > (prev.sel_req || 0) && (cur.buy_req || 0) <= (cur.sel_req || 0)) {
+                  reasons.push("매도잔량 역전");
+                }
+                // 3) 오늘 고점 대비 3%p 이상 밀림
+                const maxRate = maxMap.get(code);
+                if (maxRate !== undefined && maxRate - cur.change_rate >= 3) {
+                  reasons.push("고점대비 -" + (maxRate - cur.change_rate).toFixed(2) + "%p");
+                }
+                // 4) 최근 3틱 연속 하락 (recentTimes[0]이 최신이라 0<1<2 순서로 비교)
+                const t2 = m.get(recentTimes[2]);
+                const t3 = m.get(recentTimes[3]);
+                if (t2 && t3 && cur.change_rate < prev.change_rate && prev.change_rate < t2.change_rate && t2.change_rate < t3.change_rate) {
+                  reasons.push("3틱 연속 하락");
+                }
+
+                if (reasons.length) data.watchlistExitSignals.push({ code, reasons });
+              }
+            }
+          } catch (e) {
+            data.watchlistExitSignals = []; // 계산 실패해도 화면 전체는 정상 표시
+          }
+        }
+
         return Response.json(data);
       }
 
@@ -3424,6 +3625,102 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      if (url.pathname === "/api/market-index") {
+        // 지수는 자주 안 변하고 화면은 10초마다 갱신되므로, 최근 스냅샷 시각 기준으로 D1에 캐싱해서
+        // 키움 TR 호출을 2분에 1회로 제한 (초당1건 제한 부담 최소화)
+        try {
+          const timesRes = await env.DB.prepare(
+            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`
+          ).all();
+          const tickKey = timesRes.results.length ? timesRes.results[0].captured_at : "no-tick";
+
+          const cached = await env.DB.prepare(`SELECT result_json FROM market_index_cache WHERE captured_at = ?`)
+            .bind(tickKey)
+            .first()
+            .catch(() => null);
+          if (cached) {
+            return Response.json({ ok: true, cached: true, ...JSON.parse(cached.result_json) });
+          }
+
+          const token = await kiwoomIssueToken(env);
+          const kospi = await kiwoomMarketIndex(env, token, "0", "001");
+          await sleep(1100); // 키움 TR 초당1건 제한
+          const kosdaq = await kiwoomMarketIndex(env, token, "10", "101");
+          const payload = { kospi, kosdaq };
+
+          await env.DB.prepare(
+            `INSERT OR REPLACE INTO market_index_cache (captured_at, result_json, created_at) VALUES (?, ?, ?)`
+          )
+            .bind(tickKey, JSON.stringify(payload), new Date().toISOString())
+            .run()
+            .catch(() => {});
+
+          return Response.json({ ok: true, cached: false, ...payload });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/admin/performance-report") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        // 실제로 담았던 관심종목들의 결과를 보드별/신호별로 집계.
+        // 백테스트(가상)와 달리 이건 "실제로 내가 담은 것"들의 성적표라 가중치 조정의 가장 강한 근거임.
+        try {
+          const horizon = parseInt(url.searchParams.get("horizon") || "30", 10) || 30;
+          const res = await env.DB.prepare(
+            `SELECT source_board, added_state, pnl_pct FROM watchlist_performance WHERE horizon_min = ?`
+          )
+            .bind(horizon)
+            .all();
+          const rows = res.results;
+          if (!rows.length) {
+            return Response.json({ ok: true, horizon, sampleSize: 0, note: "아직 기록된 성과 데이터가 없습니다. 관심종목을 담고 30분 이상 지나야 쌓입니다." });
+          }
+
+          const agg = (keyFn) => {
+            const map = new Map();
+            rows.forEach((r) => {
+              for (const k of keyFn(r)) {
+                if (!k) continue;
+                if (!map.has(k)) map.set(k, { count: 0, sum: 0, wins: 0 });
+                const s = map.get(k);
+                s.count++;
+                s.sum += r.pnl_pct;
+                if (r.pnl_pct > 0) s.wins++;
+              }
+            });
+            const out = {};
+            for (const [k, s] of map) {
+              out[k] = {
+                sampleSize: s.count,
+                avgPnlPct: +(s.sum / s.count).toFixed(3),
+                winRatePct: +((s.wins / s.count) * 100).toFixed(1),
+              };
+            }
+            return out;
+          };
+
+          const overallAvg = +(rows.reduce((s, r) => s + r.pnl_pct, 0) / rows.length).toFixed(3);
+          const overallWinRate = +((rows.filter((r) => r.pnl_pct > 0).length / rows.length) * 100).toFixed(1);
+
+          return Response.json({
+            ok: true,
+            horizon,
+            sampleSize: rows.length,
+            overall: { avgPnlPct: overallAvg, winRatePct: overallWinRate },
+            byBoard: agg((r) => [r.source_board]),
+            bySignal: agg((r) => (r.added_state || "").split(",").filter(Boolean)),
+            interpretation:
+              "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
+              "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것.",
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/admin/backtest-signals") {
         if (!checkAdminKey(request, url, env)) {
           return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
@@ -3678,6 +3975,9 @@ self.addEventListener('fetch', (e) => {
           await collectAndStore(env);
           await checkWatchlistRiskLevels(env).catch((e) => {
             console.error("관심종목 리스크체크 실패:", e.message || e);
+          });
+          await trackWatchlistPerformance(env).catch((e) => {
+            console.error("관심종목 성과추적 실패:", e.message || e);
           });
         }
       })().catch((e) => {
