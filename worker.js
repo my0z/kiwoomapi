@@ -397,9 +397,19 @@ async function getLatest(env) {
 
   const withExtras = (r) => {
     const withMom = withMomentum(r);
-    const prevVolRow = snapByTime[times[1]]?.get(r.code); // 직전 틱(약 2분전) 거래량
-    const volumeSpikeRatio = prevVolRow && prevVolRow.volume > 0 ? r.volume / prevVolRow.volume : null;
+    const prevRow = snapByTime[times[1]]?.get(r.code); // 직전 틱(약 2분전) - 거래량/체결강도/호가잔량 비교용
+    const volumeSpikeRatio = prevRow && prevRow.volume > 0 ? r.volume / prevRow.volume : null;
     const todayMaxRate = todayMaxMap.get(r.code) ?? r.change_rate;
+
+    // 매수전환: 직전엔 매도잔량이 더 많았는데 지금 막 매수잔량 우위로 뒤집힌 것 - 초반 반전 신호
+    const bidTurnedPositive = !!(
+      prevRow &&
+      (r.buy_req || 0) > (r.sel_req || 0) &&
+      (prevRow.buy_req || 0) <= (prevRow.sel_req || 0)
+    );
+    // 체결강도개선: 직전 틱보다 지금 체결강도가 더 세짐 - 매수 압력이 커지는 중이라는 신호
+    const cntrStrRising = !!(prevRow && (r.cntr_str || 0) > (prevRow.cntr_str || 0));
+
     return {
       ...withMom,
       volumeSpikeRatio, // 2 이상이면 직전 틱 대비 거래량 2배 이상 튄 것
@@ -407,6 +417,8 @@ async function getLatest(env) {
       todayMaxRate,
       repeatDays: repeatMap.get(r.code) || 1, // 최근 3일간 급등리스트 등장 일수
       relativeStrength: +(r.change_rate - avgRateNow).toFixed(2), // 지금 틱 전체 평균 대비 상대강도
+      bidTurnedPositive,
+      cntrStrRising,
     };
   };
 
@@ -1074,6 +1086,8 @@ function computeRecommendations(latest, pullbackCodes) {
       score += recentDelta * 8; // 지금 이 순간의 방향/속도에 가장 큰 가중치
       if (accelerating) score += 3;
       if (pullbackCodes.has(r.code)) score += 4; // 눌림목 후 재상승 시도 - 되돌림이 이미 검증된 패턴
+      if (r.bidTurnedPositive) score += 3; // 매도 우위에서 방금 매수 우위로 뒤집힘 - 초반 반전 신호
+      if (r.cntrStrRising) score += 1.5; // 체결강도가 직전보다 세지는 중 - 매수 압력 커지는 중
       if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 거래량 동반 = 힘이 실린 움직임일 확률
       score += (r.relativeStrength || 0) * 0.5;
       if (r.isTodayHigh && (r.change_rate || 0) < 25) score += 1; // 고점 갱신 중(단, 상한가 근접 전이라 아직 여력 있을 때만)
@@ -1172,6 +1186,8 @@ function renderBadges(r) {
   if (r.isTodayHigh) badges.push('<span class="badge badgeHigh">🆕당일신고가</span>');
   if ((r.change_rate || 0) >= 28) badges.push('<span class="badge badgeLimit">🔺상한가 임박</span>');
   if (r.repeatDays > 1) badges.push('<span class="badge badgeRepeat">' + r.repeatDays + '일째 등장</span>');
+  if (r.bidTurnedPositive) badges.push('<span class="badge badgeBid">🔄매수전환</span>');
+  if (r.cntrStrRising) badges.push('<span class="badge badgeCntr">💪체결강도개선</span>');
   if (typeof r.relativeStrength === 'number' && r.relativeStrength !== 0) {
     const cls = r.relativeStrength > 0 ? 'up' : 'down';
     badges.push('<span class="badge">RS <span class="' + cls + '">' + (r.relativeStrength >= 0 ? '+' : '') + r.relativeStrength.toFixed(2) + '</span></span>');
@@ -1941,6 +1957,8 @@ function renderDashboard() {
   .badgeHigh { background:#16241c; color:#69db7c; }
   .badgeLimit { background:#2a1616; color:#ff8787; }
   .badgeRepeat { background:#1a1c2a; color:#8ea8ff; }
+  .badgeBid { background:#1c1a2a; color:#c48eff; }
+  .badgeCntr { background:#2a1a24; color:#ff8ec4; }
   .empty { color:#666; padding:12px 0; }
   tr.clickable { cursor:pointer; }
   tr.clickable:active { background:#2a2a2a; }
