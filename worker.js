@@ -494,6 +494,8 @@ const modalAiBtn = document.getElementById('modalAiBtn');
 const modalCancelBtn = document.getElementById('modalCancelBtn');
 let currentModalCode = null;
 let currentModalName = null;
+let currentModalSourceBoard = ''; // 모달을 어느 보드에서 열었는지 - 관심종목 추가 시 기록용
+let currentModalAddedState = ''; // 모달 열 때의 배지 상태 - 관심종목 추가 시 기록용
 let currentModalPeriod = '5';
 let currentModalView = 'chart'; // 'chart' | 'quote' - 자동갱신이 어느 화면을 새로고침할지
 let chartRefreshTimer = null;
@@ -1055,9 +1057,13 @@ function computeMomentumScores(latest, streak3Codes, streak5Codes) {
 // 1) 체결강도 105 이상  2) 매수잔량>매도잔량  3) 거래량 상위 30% 이내  4) 3연속 이상 상승중
 // 지금까지 만든 지표(신호점수/종합점수/연속상승) + 저가 동전주 감점(작전주 위험, 나무위키 단타매매 기법)
 // TOP20에서 쓰던 것과 똑같은 별표 마크업을 모든 리스트에서 공용으로 사용
-function starHtml(code, name) {
-  const active = watchlistCodes.has(code);
-  return '<span class="topPickStar noRowClick ' + (active ? 'active' : '') + '" data-code="' + code + '" data-name="' + (name || '').replace(/"/g, '&quot;') + '">' +
+function starHtml(item, boardLabel) {
+  const active = watchlistCodes.has(item.code);
+  const badgesText = activeBadgeLabels(item).join(',');
+  return '<span class="topPickStar noRowClick ' + (active ? 'active' : '') +
+    '" data-code="' + item.code + '" data-name="' + (item.name || '').replace(/"/g, '&quot;') +
+    '" data-board="' + (boardLabel || '').replace(/"/g, '&quot;') +
+    '" data-badges="' + badgesText.replace(/"/g, '&quot;') + '">' +
     (active ? '★' : '☆') + '</span> ';
 }
 
@@ -1204,6 +1210,22 @@ function renderBadges(r) {
   return badges.length ? '<div class="badgeRow">' + badges.join('') + '</div>' : '';
 }
 
+// renderBadges와 동일한 조건들을 HTML 없이 순수 텍스트 라벨 배열로 반환
+// - 관심종목에 추가하는 "그 순간"의 신호 상태를 기록해서 나중에 왜 담았는지 되돌아볼 때 씀
+function activeBadgeLabels(r) {
+  const labels = [];
+  if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) labels.push('거래량' + r.volumeSpikeRatio.toFixed(1) + '배');
+  if (r.isTodayHigh) labels.push('당일신고가');
+  if ((r.change_rate || 0) >= 28) labels.push('상한가임박');
+  if (r.repeatDays > 1) labels.push(r.repeatDays + '일째등장');
+  if (r.bidTurnedPositive) labels.push('매수전환');
+  if (r.cntrStrRising) labels.push('체결강도개선');
+  if (r.buyReqSpike) labels.push('매수잔량급증');
+  if (r.freshEntry) labels.push('신규진입');
+  if (r.accelerating) labels.push('가속중'); // 추천종목 보드에서만 존재하는 필드
+  return labels;
+}
+
 // 최근 5틱(약 2/4/6/8/10분전) 대비 등락률 변화를 buildLine2 다음 줄에 공용으로 표시
 function renderMomentumLine(momentum) {
   if (!momentum || !momentum.length) return '';
@@ -1216,8 +1238,15 @@ function renderMomentumLine(momentum) {
 }
 
 // 1줄: 별표+종목명+현재가, 2줄: 나머지 정보 — 모든 리스트(TOP20/연속상승/전체목록)가 공용으로 사용
-function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick) {
-  onRowClick = onRowClick || (item => { const mapped = byCodeMap[item.code]; if (mapped) openStockModal(mapped); });
+function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick, boardLabel) {
+  onRowClick = onRowClick || (item => {
+    const mapped = byCodeMap[item.code];
+    if (mapped) {
+      currentModalSourceBoard = boardLabel || ''; // 모달 안 별표를 눌렀을 때도 어디서 열었는지 알 수 있게
+      currentModalAddedState = activeBadgeLabels(item).join(',');
+      openStockModal(mapped);
+    }
+  });
   if (!items.length) {
     if (tbody.children.length !== 1 || !tbody.querySelector('.empty')) {
       tbody.innerHTML = '<tr><td class="empty">' + emptyMessage + '</td></tr>';
@@ -1232,7 +1261,7 @@ function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick) {
 
   let prevNode = null; // 직전 항목의 sub row (다음 항목의 main row가 이 바로 뒤에 와야 함)
   items.forEach(item => {
-    const nameHtml = starHtml(item.code, item.name) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
+    const nameHtml = starHtml(item, boardLabel) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
     const line2Html = buildLine2(item) + renderMomentumLine(item.momentum) + renderBadges(item);
     let mainTr = existingMain[item.code];
     let subTr;
@@ -1297,7 +1326,7 @@ function renderAllTable() {
     ' · 거래량 ' + fmt(r.volume) +
     ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
     ' · <span title="' + ((r.signalChecks || []).join(', ') || '조건 없음') + '">' + '🔥'.repeat(r.signalScore || 0) + (r.lowPriceWarning ? ' ⚠️' : '') + '</span>',
-  '데이터 없음');
+  '데이터 없음', undefined, '전체목록');
 }
 
 document.getElementById('sortByMomentum').addEventListener('click', (e) => {
@@ -1355,25 +1384,25 @@ async function load() {
   renderTwoLineList(streak5Body, data.streak5, r =>
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
     ' · <span class="delta">5연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
-  '5연속 상승 종목 없음');
+  '5연속 상승 종목 없음', undefined, '5연속상승');
 
   const streak3Body = document.querySelector('#streak3 tbody');
   renderTwoLineList(streak3Body, data.streak3, r =>
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
     ' · <span class="delta">3연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
-  '3연속 상승 종목 없음');
+  '3연속 상승 종목 없음', undefined, '3연속상승');
 
   const top5Body = document.querySelector('#top5 tbody');
   renderTwoLineList(top5Body, data.risingTop5, r =>
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
     ' · <span class="delta">▲' + r.delta.toFixed(2) + '%p</span>',
-  '직전 스냅샷 대비 상승 종목 없음');
+  '직전 스냅샷 대비 상승 종목 없음', undefined, '2분전보다TOP5');
 
   const pullbackBody = document.querySelector('#pullback tbody');
   renderTwoLineList(pullbackBody, data.pullbackCandidates || [], r =>
     '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
     ' · 고점 ' + r.todayMaxRate.toFixed(2) + '%에서 <span class="down">-' + r.pullbackPct.toFixed(2) + '%p</span> 조정 후 재상승중',
-  '눌림목 후보 없음');
+  '눌림목 후보 없음', undefined, '눌림목후보');
 
   latestList = data.latest;
   const streak3Codes = new Set(data.streak3.map(r => r.code));
@@ -1395,7 +1424,7 @@ async function load() {
         (pullbackCodes.has(r.code) ? '<span class="delta">🌊눌림목재상승</span>' : '') +
         '</div>'
       : ''),
-  '데이터 없음');
+  '데이터 없음', undefined, '추천종목TOP10');
 
   const topPicks = computeTopPicks(latestList, streak5Codes);
   const topPicksBody = document.querySelector('#topPicks tbody');
@@ -1404,7 +1433,7 @@ async function load() {
     ' · 거래량 ' + fmt(r.volume) +
     ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
     ' · ' + '🔥'.repeat(Math.max(1, Math.min(5, Math.round(r.topScore / 10)))),
-  '데이터 없음');
+  '데이터 없음', undefined, '오늘의TOP20');
 
   // 클릭용 종목 정보 매핑 (streak5 + streak3 + top5 + all 합쳐서)
   byCodeMap = {};
@@ -1659,6 +1688,7 @@ function renderWatchlist(items) {
       code: w.code, name: w.name,
       price: currentPrice, rate: currentRate, volume: live ? live.volume : (lastKnown ? lastKnown.volume : null),
       entryPrice, pnl, addedAt: w.added_at,
+      sourceBoard: w.source_board, addedState: w.added_state,
     };
   });
 
@@ -1679,9 +1709,16 @@ function renderWatchlist(items) {
         : riskStatus === 'take_profit_hit'
         ? '<div class="riskBadge riskBadgeUp">🎯 익절선 도달</div>'
         : '';
+      const addedContextHtml = (r.sourceBoard || r.addedState)
+        ? '<div class="addedContext">' +
+          (r.sourceBoard || '') +
+          (r.sourceBoard && r.addedState ? ' · ' : '') +
+          (r.addedState ? r.addedState.split(',').filter(Boolean).join(', ') : '') +
+          '</div>'
+        : '';
       return (
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
-          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + riskBadgeHtml + '</td>' +
+          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskBadgeHtml + '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
           '<td>' + rateHtml + '</td>' +
           '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : (r.entryPrice === null ? '<span class="empty">확정중</span>' : '-')) + '</td>' +
@@ -1746,13 +1783,15 @@ function updateStarButton(code, name, price) {
       fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
     } else {
       // entry_price는 아직 미확정(null) — 화면엔 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
-      watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString() }, ...watchlistItems];
+      const sourceBoard = currentModalSourceBoard;
+      const addedState = currentModalAddedState;
+      watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString(), source_board: sourceBoard, added_state: addedState }, ...watchlistItems];
       renderWatchlist(watchlistItems);
       updateStarButton(code, name, price);
       fetch('/api/watchlist', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, name }),
+        body: JSON.stringify({ code, name, sourceBoard, addedState }),
       })
         .then(res => res.json())
         .then(data => {
@@ -1774,6 +1813,8 @@ document.body.addEventListener('click', (e) => {
   if (!star) return;
   e.stopPropagation();
   const code = star.dataset.code, name = star.dataset.name;
+  const sourceBoard = star.dataset.board || '';
+  const addedState = star.dataset.badges || '';
 
   if (watchlistCodes.has(code)) {
     watchlistItems = watchlistItems.filter(w => w.code !== code);
@@ -1783,14 +1824,14 @@ document.body.addEventListener('click', (e) => {
     fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
   } else {
     // entry_price는 아직 미확정(null) — 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
-    watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString() }, ...watchlistItems];
+    watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString(), source_board: sourceBoard, added_state: addedState }, ...watchlistItems];
     star.classList.add('active');
     star.textContent = '★';
     renderWatchlist(watchlistItems);
     fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, name }),
+      body: JSON.stringify({ code, name, sourceBoard, addedState }),
     })
       .then(res => res.json())
       .then(data => {
@@ -2069,6 +2110,7 @@ function renderDashboard() {
   .pnlPositive { color:#ff6b6b; }
   .pnlNegative { color:#4d9fff; }
   .addedDate { font-size:10px; color:#666; font-weight:normal; }
+  .addedContext { font-size:10px; color:#8ea8ff; font-weight:normal; margin-top:1px; }
   .riskBadge { font-size:10px; font-weight:700; margin-top:2px; }
   .riskBadgeDown { color:#4d9fff; }
   .riskBadgeUp { color:#ff6b6b; }
@@ -2973,7 +3015,7 @@ self.addEventListener('fetch', (e) => {
 
       if (url.pathname === "/api/watchlist" && request.method === "POST") {
         try {
-          const { code, name } = await request.json();
+          const { code, name, sourceBoard, addedState } = await request.json();
           if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
 
           let entryPrice = 0;
@@ -3001,8 +3043,10 @@ self.addEventListener('fetch', (e) => {
               // 이번 시도 실패, 다음 루프에서 재시도 (마지막 시도까지 실패하면 0으로 저장, 프론트에서 재시도 유도)
             }
           }
-          await env.DB.prepare(`INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price) VALUES (?, ?, ?, ?)`)
-            .bind(code, name, new Date().toISOString(), entryPrice)
+          await env.DB.prepare(
+            `INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price, source_board, added_state) VALUES (?, ?, ?, ?, ?, ?)`
+          )
+            .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
             .run();
           return Response.json({ ok: true, entryPrice });
         } catch (e) {
