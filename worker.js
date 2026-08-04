@@ -409,6 +409,10 @@ async function getLatest(env) {
     );
     // 체결강도개선: 직전 틱보다 지금 체결강도가 더 세짐 - 매수 압력이 커지는 중이라는 신호
     const cntrStrRising = !!(prevRow && (r.cntr_str || 0) > (prevRow.cntr_str || 0));
+    // 매수잔량급증: 직전 틱 대비 매수잔량이 1.5배 이상 - 매수 대기 물량이 갑자기 쌓이는 중
+    const buyReqSpike = !!(prevRow && prevRow.buy_req > 0 && (r.buy_req || 0) / prevRow.buy_req >= 1.5);
+    // 신규진입: 직전 틱엔 이 종목이 5~15% 밴드에 없었음 - 방금 막 새로 터진 종목
+    const freshEntry = withMom.momentum.length === 0;
 
     return {
       ...withMom,
@@ -419,6 +423,8 @@ async function getLatest(env) {
       relativeStrength: +(r.change_rate - avgRateNow).toFixed(2), // 지금 틱 전체 평균 대비 상대강도
       bidTurnedPositive,
       cntrStrRising,
+      buyReqSpike,
+      freshEntry,
     };
   };
 
@@ -1088,6 +1094,7 @@ function computeRecommendations(latest, pullbackCodes) {
       if (pullbackCodes.has(r.code)) score += 4; // 눌림목 후 재상승 시도 - 되돌림이 이미 검증된 패턴
       if (r.bidTurnedPositive) score += 3; // 매도 우위에서 방금 매수 우위로 뒤집힘 - 초반 반전 신호
       if (r.cntrStrRising) score += 1.5; // 체결강도가 직전보다 세지는 중 - 매수 압력 커지는 중
+      if (r.buyReqSpike) score += 1.5; // 매수 대기 물량이 갑자기 쌓이는 중
       if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 거래량 동반 = 힘이 실린 움직임일 확률
       score += (r.relativeStrength || 0) * 0.5;
       if (r.isTodayHigh && (r.change_rate || 0) < 25) score += 1; // 고점 갱신 중(단, 상한가 근접 전이라 아직 여력 있을 때만)
@@ -1188,6 +1195,8 @@ function renderBadges(r) {
   if (r.repeatDays > 1) badges.push('<span class="badge badgeRepeat">' + r.repeatDays + '일째 등장</span>');
   if (r.bidTurnedPositive) badges.push('<span class="badge badgeBid">🔄매수전환</span>');
   if (r.cntrStrRising) badges.push('<span class="badge badgeCntr">💪체결강도개선</span>');
+  if (r.buyReqSpike) badges.push('<span class="badge badgeBid">📥매수잔량급증</span>');
+  if (r.freshEntry) badges.push('<span class="badge badgeFresh">✨신규진입</span>');
   if (typeof r.relativeStrength === 'number' && r.relativeStrength !== 0) {
     const cls = r.relativeStrength > 0 ? 'up' : 'down';
     badges.push('<span class="badge">RS <span class="' + cls + '">' + (r.relativeStrength >= 0 ? '+' : '') + r.relativeStrength.toFixed(2) + '</span></span>');
@@ -1959,6 +1968,7 @@ function renderDashboard() {
   .badgeRepeat { background:#1a1c2a; color:#8ea8ff; }
   .badgeBid { background:#1c1a2a; color:#c48eff; }
   .badgeCntr { background:#2a1a24; color:#ff8ec4; }
+  .badgeFresh { background:#132a1a; color:#5ce0a0; }
   .empty { color:#666; padding:12px 0; }
   tr.clickable { cursor:pointer; }
   tr.clickable:active { background:#2a2a2a; }
@@ -3365,6 +3375,115 @@ self.addEventListener('fetch', (e) => {
             .run();
 
           return Response.json({ ok: true, cached: false, ...payload });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/admin/backtest-signals") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        // computeRecommendations가 쓰는 신호들(가속중/매수전환/체결강도개선/매수잔량급증/눌림목/거래량급증/당일신고가)
+        // 각각이 "신호가 있었던 시점 다음 틱에 실제로 더 올랐는지"를 실측. 지금 가중치는 전부 직관으로 붙인 거라
+        // 이 결과를 보고 효과 없는 건 빼고, 효과 큰 건 가중치를 올리는 식으로 재조정해야 함.
+        try {
+          const tickLimit = Math.min(parseInt(url.searchParams.get("ticks") || "300", 10) || 300, 1000);
+          const timesRes = await env.DB.prepare(
+            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
+          )
+            .bind(tickLimit)
+            .all();
+          const times = timesRes.results.map((r) => r.captured_at).reverse(); // 과거 -> 최신
+          if (times.length < 4) {
+            return Response.json({ ok: false, error: "분석할 틱이 부족합니다 (최소 4틱 필요)" });
+          }
+
+          const placeholders = times.map(() => "?").join(",");
+          const rowsRes = await env.DB.prepare(
+            `SELECT code, change_rate, volume, cntr_str, buy_req, sel_req, captured_at
+             FROM snapshots WHERE captured_at IN (${placeholders})`
+          )
+            .bind(...times)
+            .all();
+
+          // code별로 시간순 정렬된 배열 구성
+          const byCode = new Map();
+          for (const r of rowsRes.results) {
+            if (!byCode.has(r.code)) byCode.set(r.code, new Map());
+            byCode.get(r.code).set(r.captured_at, r);
+          }
+
+          const signalNames = [
+            "accelerating", "bidTurnedPositive", "cntrStrRising",
+            "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
+          ];
+          const stats = {};
+          signalNames.forEach((name) => {
+            stats[name] = { trueCount: 0, trueForwardSum: 0, falseCount: 0, falseForwardSum: 0 };
+          });
+          let baselineCount = 0, baselineForwardSum = 0;
+
+          for (const [code, rowByTime] of byCode) {
+            // 이 종목의 당일 등락률 최고치를 순차적으로 갱신하며(그 시점까지 알 수 있던 값만 사용 - 미래 데이터 안 씀)
+            let runningMaxRate = -Infinity;
+            for (let i = 2; i < times.length - 1; i++) {
+              const older = rowByTime.get(times[i - 2]);
+              const prev = rowByTime.get(times[i - 1]);
+              const cur = rowByTime.get(times[i]);
+              const next = rowByTime.get(times[i + 1]);
+              if (!older || !prev || !cur) continue; // 아직 등장 전이던 구간은 스킵 (runningMax는 실제 등장 시점부터 계산)
+              if (cur.change_rate > runningMaxRate) runningMaxRate = cur.change_rate;
+              if (!next) continue; // forwardDelta 계산 불가 - 결과 집계만 스킵 (runningMax 갱신은 위에서 이미 함)
+
+              const forwardDelta = next.change_rate - cur.change_rate;
+              baselineCount++;
+              baselineForwardSum += forwardDelta;
+
+              const recentDelta = cur.change_rate - prev.change_rate;
+              const olderDelta = prev.change_rate - older.change_rate;
+              const signals = {
+                accelerating: recentDelta > olderDelta,
+                bidTurnedPositive: (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0),
+                cntrStrRising: (cur.cntr_str || 0) > (prev.cntr_str || 0),
+                buyReqSpike: prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5,
+                volumeSpike: prev.volume > 0 && (cur.volume || 0) / prev.volume >= 2,
+                isTodayHigh: cur.change_rate >= runningMaxRate - 0.001,
+                pullbackLike: runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0,
+              };
+
+              signalNames.forEach((name) => {
+                const bucket = signals[name] ? "true" : "false";
+                stats[name][bucket + "Count"]++;
+                stats[name][bucket + "ForwardSum"] += forwardDelta;
+              });
+            }
+          }
+
+          const baselineAvg = baselineCount ? +(baselineForwardSum / baselineCount).toFixed(4) : null;
+          const results = {};
+          signalNames.forEach((name) => {
+            const s = stats[name];
+            const trueAvg = s.trueCount ? +(s.trueForwardSum / s.trueCount).toFixed(4) : null;
+            const falseAvg = s.falseCount ? +(s.falseForwardSum / s.falseCount).toFixed(4) : null;
+            results[name] = {
+              sampleSize: s.trueCount,
+              avgForwardDeltaWhenTrue: trueAvg,
+              avgForwardDeltaWhenFalse: falseAvg,
+              edgeVsBaseline: trueAvg !== null && baselineAvg !== null ? +(trueAvg - baselineAvg).toFixed(4) : null,
+            };
+          });
+
+          return Response.json({
+            ok: true,
+            ticksAnalyzed: times.length,
+            baselineAvgForwardDeltaPct: baselineAvg,
+            signals: results,
+            interpretation:
+              "edgeVsBaseline이 뚜렷한 양수면 그 신호가 실제로 다음 틱 상승폭을 키우는 효과가 있다는 뜻(가중치 유지/상향 근거). " +
+              "0에 가깝거나 음수면 그 신호는 추천점수에서 가중치를 낮추거나 빼는 걸 검토. " +
+              "sampleSize가 너무 작으면(대략 30 미만) 우연일 수 있으니 ticks 파라미터를 늘려서 다시 확인.",
+          });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
