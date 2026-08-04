@@ -335,7 +335,9 @@ async function purgeOldRows(env) {
   const shortCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(`DELETE FROM pattern_scan_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM latest_extras_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
-  await env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
+  // market_index_cache는 30초마다 행이 생기므로 더 짧게(6시간) 정리
+  const indexCutoff = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`).bind(indexCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
 
   return result.meta?.changes ?? 0;
@@ -2032,7 +2034,7 @@ function loadMarketIndex() {
     .catch(() => {});
 }
 loadMarketIndex();
-setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 120000); // 2분마다 (서버에서 틱 단위 캐싱됨)
+setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 30000); // 30초마다 (서버에서 30초 버킷으로 캐싱됨)
 
 
 // 반대로 14:30 이후는 장 마감까지 시간이 얼마 없어서, 물렸을 때 회복할 기회 자체가 부족함
@@ -3626,13 +3628,10 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/market-index") {
-        // 지수는 자주 안 변하고 화면은 10초마다 갱신되므로, 최근 스냅샷 시각 기준으로 D1에 캐싱해서
-        // 키움 TR 호출을 2분에 1회로 제한 (초당1건 제한 부담 최소화)
+        // 지수는 TR 2건만 쓰므로 30초 주기까지 올려도 초당1건 제한에 여유가 있음.
+        // 캐시 키를 30초 버킷으로 잡아서, 여러 탭/기기에서 동시에 봐도 30초에 1회만 실제 호출됨.
         try {
-          const timesRes = await env.DB.prepare(
-            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`
-          ).all();
-          const tickKey = timesRes.results.length ? timesRes.results[0].captured_at : "no-tick";
+          const tickKey = new Date(Math.floor(Date.now() / 30000) * 30000).toISOString();
 
           const cached = await env.DB.prepare(`SELECT result_json FROM market_index_cache WHERE captured_at = ?`)
             .bind(tickKey)
