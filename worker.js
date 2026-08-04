@@ -1363,8 +1363,13 @@ async function load() {
     '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
     ' · 거래량 ' + fmt(r.volume) +
     ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
-    (r.accelerating ? ' · <span class="delta">⚡가속중</span>' : '') +
-    (pullbackCodes.has(r.code) ? ' · <span class="delta">🌊눌림목재상승</span>' : ''),
+    ((r.accelerating || pullbackCodes.has(r.code))
+      ? '<div class="momentumLine">' +
+        (r.accelerating ? '<span class="delta">⚡가속중</span>' : '') +
+        (r.accelerating && pullbackCodes.has(r.code) ? ' · ' : '') +
+        (pullbackCodes.has(r.code) ? '<span class="delta">🌊눌림목재상승</span>' : '') +
+        '</div>'
+      : ''),
   '데이터 없음');
 
   const topPicks = computeTopPicks(latestList, streak5Codes);
@@ -1467,7 +1472,8 @@ function queueMiniCandleFetches(codes) {
 
 function updateMiniChartCell(code) {
   const row = document.querySelector('#watchlist tr.miniChartRow[data-code="' + code + '"] td');
-  if (row) row.innerHTML = renderMiniCandles(miniCandleCache[code]);
+  const w = watchlistItems.find(x => x.code === code);
+  if (row) row.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
 }
 
 // 관심종목 실시간 시세 재조회 (D1 마지막 시세는 밴드를 벗어나면 갱신이 안 되는 문제가 있어서,
@@ -1542,7 +1548,23 @@ function updateWatchlistPriceCells(code) {
     : '<span class="empty">시세 없음</span>';
 }
 
-function renderMiniCandles(candles) {
+// watchlist.added_at(UTC ISO) -> 키움 차트 시간 포맷(KST YYYYMMDDHHMMSS)으로 변환
+// (candle.time이 이 포맷이라 위치 비교하려면 같은 포맷으로 맞춰야 함)
+function isoToKstYYYYMMDDHHMMSS(iso) {
+  const d = new Date(iso);
+  const kst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    kst.getUTCFullYear() +
+    pad(kst.getUTCMonth() + 1) +
+    pad(kst.getUTCDate()) +
+    pad(kst.getUTCHours()) +
+    pad(kst.getUTCMinutes()) +
+    pad(kst.getUTCSeconds())
+  );
+}
+
+function renderMiniCandles(candles, addedAt) {
   if (!candles || candles.length < 2) return '<span class="empty">차트 로딩중(오늘 09:00~)</span>';
   const w = 220, h = 70, pad = 2;
   const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
@@ -1563,11 +1585,32 @@ function renderMiniCandles(candles) {
     return '<line x1="' + cx + '" y1="' + yHigh.toFixed(1) + '" x2="' + cx + '" y2="' + yLow.toFixed(1) + '" stroke="' + color + '" stroke-width="1"/>' +
       '<rect x="' + x.toFixed(1) + '" y="' + bodyTop.toFixed(1) + '" width="' + (candleW * 0.7).toFixed(1) + '" height="' + bodyH.toFixed(1) + '" fill="' + color + '"/>';
   }).join('');
+
+  // 즐겨찾기에 추가된 순간을 세로 점선으로 표시 (그 시각과 가장 가까운 캔들 위치를 찾아서)
+  let addedMarkerHtml = '';
+  if (addedAt) {
+    const addedKst = isoToKstYYYYMMDDHHMMSS(addedAt);
+    let nearestIdx = -1, nearestDiff = Infinity;
+    candles.forEach((c, i) => {
+      const diff = Math.abs(Number(c.time) - Number(addedKst));
+      if (diff < nearestDiff) { nearestDiff = diff; nearestIdx = i; }
+    });
+    // 추가 시점이 이 차트가 보여주는 시간 범위 안에 있을 때만 표시 (범위 밖이면 마커가 엉뚱한 끝에 붙어 오해를 줌)
+    const firstTime = Number(candles[0].time), lastTime = Number(candles[candles.length - 1].time);
+    const addedNum = Number(addedKst);
+    if (nearestIdx >= 0 && addedNum >= firstTime && addedNum <= lastTime) {
+      const markerX = pad + nearestIdx * candleW + candleW / 2;
+      addedMarkerHtml =
+        '<line x1="' + markerX.toFixed(1) + '" y1="0" x2="' + markerX.toFixed(1) + '" y2="' + h + '" stroke="#ffd43b" stroke-width="1" stroke-dasharray="3,2"/>' +
+        '<text x="' + markerX.toFixed(1) + '" y="9" fill="#ffd43b" font-size="8" text-anchor="middle">★</text>';
+    }
+  }
+
   const labelIdxs = pickLabelIndices(candles.length);
   const timeLabelsHtml = '<div class="chartTimeLabels">' +
     labelIdxs.map(idx => '<span>' + formatChartTime(candles[idx].time, '1') + '</span>').join('') +
     '</div>';
-  return '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + bars + '</svg>' + timeLabelsHtml;
+  return '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + bars + addedMarkerHtml + '</svg>' + timeLabelsHtml;
 }
 
 function renderWatchlist(items) {
@@ -1620,7 +1663,7 @@ function renderWatchlist(items) {
           '<td>' + pnlHtml + '</td>' +
           '<td><span class="tradeDelBtn noRowClick" data-code="' + r.code + '">🗑️</span></td>' +
         '</tr>' +
-        '<tr class="miniChartRow" data-code="' + r.code + '"><td colspan="6">' + renderMiniCandles(miniCandleCache[r.code]) + '</td></tr>'
+        '<tr class="miniChartRow" data-code="' + r.code + '"><td colspan="6">' + renderMiniCandles(miniCandleCache[r.code], r.addedAt) + '</td></tr>'
       );
     }).join('');
 
