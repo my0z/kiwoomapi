@@ -1824,7 +1824,9 @@ function renderWatchlist(items) {
         : '';
       return (
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
-          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskBadgeHtml + exitBadgeHtml + '</td>' +
+          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskBadgeHtml + exitBadgeHtml +
+          '<div class="riskBadge riskBadgeExit realtimeExitBadge" data-code="' + r.code + '" style="display:none;"></div>' +
+          '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
           '<td>' + rateHtml + '</td>' +
           '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : (r.entryPrice === null ? '<span class="empty">확정중</span>' : '-')) + '</td>' +
@@ -2054,7 +2056,7 @@ function loadRealtimeCondition() {
         return;
       }
 
-      // 한 줄 표시: 별표 · 종목명 · 등락률 · 포착시각
+      // 한 줄 표시: 별표 · 종목명(+신호아이콘) · 등락률 · 포착시각
       tbody.innerHTML = history.slice(0, 25).map(h => {
         const live = liveQuoteCache[h.code];
         const rate = live ? live.rate : h.rate;
@@ -2062,9 +2064,17 @@ function loadRealtimeCondition() {
         const rateHtml = (rate !== null && rate !== undefined)
           ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + Number(rate).toFixed(2) + '%</span>'
           : '<span class="empty">-</span>';
+        // 다음 2분 cron이 이 종목을 한 번이라도 스캔해서 byCodeMap에 들어왔으면, 그 신호들을 압축 아이콘으로 붙임
+        // (한 줄 레이아웃이라 전체 배지는 못 넣고, 강한 신호 몇 개만 아이콘 하나씩)
+        const info = byCodeMap[h.code];
+        let icons = '';
+        if (info) {
+          if (info.cntrStr >= 105) icons += '💪';
+          if (info.buyReq > info.selReq) icons += '🔄';
+        }
         return '<tr class="clickable dockRow' + (h.stillIn ? '' : ' dockRowOut') + '" data-code="' + h.code + '">' +
           '<td class="dockStar">' + starHtml({ code: h.code, name: name }, '실시간포착') + '</td>' +
-          '<td class="dockName">' + name + '</td>' +
+          '<td class="dockName">' + name + (icons ? ' <span class="dockIcons">' + icons + '</span>' : '') + '</td>' +
           '<td class="dockRate">' + rateHtml + '</td>' +
           '<td class="dockTime">' + (h.initial ? '<span class="empty">충족중</span>' : '⚡' + fmtHHMM(h.time)) + '</td>' +
           '</tr>';
@@ -2167,10 +2177,41 @@ function refreshRealtimeWatchlist() {
         liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
         updateWatchlistPriceCells(code);
         updateListRowRealtime(code, s);
+        updateRealtimeExitSignal(code, s);
         if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
       }
     })
     .catch(() => {});
+}
+
+// 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
+// cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
+// "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
+const prevCntrStrMap = {}; // 직전 체결강도 - 급락 감지에 씀
+function updateRealtimeExitSignal(code, s) {
+  const badge = document.querySelector('.realtimeExitBadge[data-code="' + code + '"]');
+  if (!badge) return; // 관심종목이 아니면(리스트 종목이면) 해당 없음
+
+  const w = watchlistItems.find(x => x.code === code);
+  const reasons = [];
+
+  if (w && w.entry_price > 0 && s.price) {
+    const pnlPct = ((s.price - w.entry_price) / w.entry_price) * 100;
+    if (pnlPct <= -2) reasons.push('진입가대비 ' + pnlPct.toFixed(2) + '%');
+  }
+
+  const prevCntr = prevCntrStrMap[code];
+  if (prevCntr !== undefined && prevCntr >= 105 && (s.cntrStr || 0) < 100) {
+    reasons.push('체결강도 급락(' + prevCntr.toFixed(0) + '→' + (s.cntrStr || 0).toFixed(0) + ')');
+  }
+  if (typeof s.cntrStr === 'number') prevCntrStrMap[code] = s.cntrStr;
+
+  if (reasons.length) {
+    badge.style.display = '';
+    badge.innerHTML = '⚡실시간: ' + reasons.join(' · ');
+  } else {
+    badge.style.display = 'none';
+  }
 }
 
 // 리스트(전체목록/추천/TOP20 등)에 이미 그려진 행의 가격·등락률만 실시간 값으로 갈아끼움.
@@ -2443,6 +2484,7 @@ function renderDashboard() {
   .dockName { text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:0; }
   .dockRate { text-align:right; white-space:nowrap; width:72px; }
   .dockTime { text-align:right; white-space:nowrap; width:64px; font-size:11px; color:#888; }
+  .dockIcons { font-size:11px; }
   #goldenWindowBanner {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
@@ -3264,6 +3306,34 @@ function checkAdminKeyHeaderOnly(request, env) {
 }
 
 // ---------- 엔트리포인트 ----------
+// relay/웹소켓이 죽어있으면 조용히 묻히지 않게 system_events에 기록.
+// 매 틱마다 기록하면 로그가 도배되니, 상태가 "바뀐 순간"에만 남김 (정상->비정상, 비정상->정상).
+let lastKnownRelayHealthy = null; // 모듈 스코프 - Worker 인스턴스가 재사용되는 동안은 상태 기억, 재시작되면 초기화(그럼 다음 틱에 한번 더 기록될 뿐 무해)
+async function checkRelayHealthForCron(env) {
+  let healthy = false;
+  let detail = "";
+  try {
+    const res = await kiwoomRelayFetch(env, "/realtime/status", { method: "GET" });
+    const data = await res.json();
+    healthy = !!(data.wsConnected && data.wsLoggedIn);
+    detail = `wsConnected=${data.wsConnected} wsLoggedIn=${data.wsLoggedIn} lastMessageAt=${data.lastMessageAt}`;
+  } catch (e) {
+    detail = "relay 접속 실패: " + (e.message || e);
+  }
+
+  if (lastKnownRelayHealthy === null) {
+    lastKnownRelayHealthy = healthy; // 최초 1회는 상태만 기억, 로그는 비정상일 때만
+    if (!healthy) await logSystemEvent(env, "relay_unhealthy", detail);
+    return;
+  }
+  if (lastKnownRelayHealthy && !healthy) {
+    await logSystemEvent(env, "relay_unhealthy", "웹소켓이 끊긴 것으로 보임: " + detail);
+  } else if (!lastKnownRelayHealthy && healthy) {
+    await logSystemEvent(env, "relay_recovered", "웹소켓 복구됨: " + detail);
+  }
+  lastKnownRelayHealthy = healthy;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -4226,6 +4296,7 @@ self.addEventListener('fetch', (e) => {
           await trackWatchlistPerformance(env).catch((e) => {
             console.error("관심종목 성과추적 실패:", e.message || e);
           });
+          await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
         }
       })().catch((e) => {
         console.error("scheduled 수집 실패:", e.message || e);
