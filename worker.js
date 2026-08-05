@@ -560,6 +560,9 @@ async function getLatest(env) {
     const cntrStrRising = !!(prevRow && (r.cntr_str || 0) > (prevRow.cntr_str || 0));
     // 매수잔량급증: 직전 틱 대비 매수잔량이 1.5배 이상 - 매수 대기 물량이 갑자기 쌓이는 중
     const buyReqSpike = !!(prevRow && prevRow.buy_req > 0 && (r.buy_req || 0) / prevRow.buy_req >= 1.5);
+    // 매도잔량급감: 직전 틱 대비 매도잔량이 절반 이하로 줄어듦 - 매도 대기 물량이 빠지는 중.
+    // 매수전환/매수잔량급증과 같은 "새로 유입되는 수급 변화" 계열 신호(백테스트에서 이 계열만 효과 확인됨) - 아직 자체 백테스트는 안 함
+    const sellReqThinning = !!(prevRow && prevRow.sel_req > 0 && (r.sel_req || 0) / prevRow.sel_req <= 0.5);
     // 신규진입: 직전 틱엔 이 종목이 5~15% 밴드에 없었음 - 방금 막 새로 터진 종목
     const freshEntry = withMom.momentum.length === 0;
 
@@ -573,6 +576,7 @@ async function getLatest(env) {
       bidTurnedPositive,
       cntrStrRising,
       buyReqSpike,
+      sellReqThinning,
       freshEntry,
     };
   };
@@ -1264,6 +1268,7 @@ function computeRecommendations(latest, pullbackCodes) {
       score += recentDelta * 8; // 지금 이 순간의 방향/속도에 가장 큰 가중치 (이번 백테스트 대상 아님, 유지)
       if (r.bidTurnedPositive) score += 4; // 실측 근거 있음 - 기존 3에서 상향
       if (r.buyReqSpike) score += 2.5; // 실측 근거 있음 - 기존 1.5에서 상향
+      if (r.sellReqThinning) score += 1.5; // 매수잔량급증과 같은 계열(수급유입) 신호지만 이건 아직 자체 백테스트 전 - 신중하게 작게
       if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 표본 부족으로 판단 보류, 기존 유지
       score += (r.relativeStrength || 0) * 0.5;
       if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
@@ -1368,6 +1373,7 @@ function renderBadges(r) {
   if (r.bidTurnedPositive) badges.push('<span class="badge badgeBid">🔄매수전환</span>');
   if (r.cntrStrRising) badges.push('<span class="badge badgeCntr">💪체결강도개선</span>');
   if (r.buyReqSpike) badges.push('<span class="badge badgeBid">📥매수잔량급증</span>');
+  if (r.sellReqThinning) badges.push('<span class="badge badgeBid">📤매도잔량급감</span>');
   if (r.freshEntry) badges.push('<span class="badge badgeFresh">✨신규진입</span>');
   // 거래대금이 너무 작으면 사고팔 때 슬리피지로 수익이 깎임 (동전주 필터와 별개 문제)
   if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) {
@@ -1391,6 +1397,7 @@ function activeBadgeLabels(r) {
   if (r.bidTurnedPositive) labels.push('매수전환');
   if (r.cntrStrRising) labels.push('체결강도개선');
   if (r.buyReqSpike) labels.push('매수잔량급증');
+  if (r.sellReqThinning) labels.push('매도잔량급감');
   if (r.freshEntry) labels.push('신규진입');
   if (r.accelerating) labels.push('가속중'); // 추천종목 보드에서만 존재하는 필드
   return labels;
@@ -3461,6 +3468,7 @@ async function computeSignalBacktest(env, tickLimit) {
   const signalNames = [
     "accelerating", "bidTurnedPositive", "cntrStrRising",
     "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
+    "sellReqThinning", "realPullback",
   ];
   const stats = {};
   signalNames.forEach((name) => {
@@ -3485,14 +3493,22 @@ async function computeSignalBacktest(env, tickLimit) {
 
       const recentDelta = cur.change_rate - prev.change_rate;
       const olderDelta = prev.change_rate - older.change_rate;
+      const bidTurnedPositive = (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0);
+      const buyReqSpike = prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5;
+      const sellReqThinning = prev.sel_req > 0 && (cur.sel_req || 0) / prev.sel_req <= 0.5;
+      const pullbackLike = runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0;
       const signals = {
         accelerating: recentDelta > olderDelta,
-        bidTurnedPositive: (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0),
+        bidTurnedPositive,
         cntrStrRising: (cur.cntr_str || 0) > (prev.cntr_str || 0),
-        buyReqSpike: prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5,
+        buyReqSpike,
         volumeSpike: prev.volume > 0 && (cur.volume || 0) / prev.volume >= 2,
         isTodayHigh: cur.change_rate >= runningMaxRate - 0.001,
-        pullbackLike: runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0,
+        pullbackLike,
+        sellReqThinning,
+        // 개선된 눌림목: 단순 되돌림+재상승이 아니라, 수급 유입 신호(매수전환/매수잔량급증/매도잔량급감) 중
+        // 하나라도 동반됐을 때만 인정 - pullbackLike가 역효과였던 것을 이걸로 보완할 수 있는지 검증용
+        realPullback: pullbackLike && (bidTurnedPositive || buyReqSpike || sellReqThinning),
       };
 
       signalNames.forEach((name) => {
