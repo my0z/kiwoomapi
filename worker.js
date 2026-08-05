@@ -1449,6 +1449,8 @@ document.getElementById('sortByTradeValue').addEventListener('click', (e) => {
   renderAllTable();
 });
 
+let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화면에 렌더된 종목들로 채워짐
+
 async function load() {
   const res = await fetch('/api/latest');
   const data = await res.json();
@@ -1523,6 +1525,22 @@ async function load() {
   });
 
   renderAllTable();
+
+  // 실시간 구독 대상: 실제로 자주 보는 리스트 우선 (그룹당 200종목 제한이라 우선순위 필요)
+  // 추천TOP10 -> 눌림목 -> 5연속 -> 3연속 -> 2분전TOP5 -> TOP20 -> 전체목록 순
+  const priorityCodes = [];
+  const pushCodes = (arr) => (arr || []).forEach(r => {
+    if (r && r.code && !priorityCodes.includes(r.code)) priorityCodes.push(r.code);
+  });
+  pushCodes(recommended);
+  pushCodes(data.pullbackCandidates);
+  pushCodes(data.streak5);
+  pushCodes(data.streak3);
+  pushCodes(data.risingTop5);
+  pushCodes(topPicks);
+  pushCodes(latestList);
+  realtimeListCodes = priorityCodes.slice(0, 200);
+
   watchlistLastKnownMap = {};
   (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
   watchlistRiskMap = {};
@@ -2049,33 +2067,48 @@ let mainRefreshTimer = setInterval(() => {
   load();
 }, 10000); // 10초마다 화면 갱신 (D1만 읽어오는 거라 키움 제한과 무관, 저장 자체는 cron이 2분마다)
 
-// 관심종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 그대로 읽어옴.
-// 기존엔 종목당 키움 TR을 1.1초 간격으로 폴링했지만(20초 주기), 이제 TR 호출 0건이라 3초마다 가능.
+// 관심종목 + 화면 리스트 종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 읽어옴.
+// 키움 TR 호출 0건이라 3초마다 갱신 가능. 리스트 종목은 지금 화면에 떠 있는 것만 보냄(그룹당 200 제한).
 function refreshRealtimeWatchlist() {
-  if (!watchlistItems.length) return;
-  fetch('/api/realtime-watchlist')
+  const listParam = realtimeListCodes.slice(0, 200).join(',');
+  fetch('/api/realtime-watchlist?list=' + encodeURIComponent(listParam))
     .then(res => res.json())
     .then(data => {
       if (!data.ok || !data.stocks) return;
-      let updated = false;
       for (const code of Object.keys(data.stocks)) {
         const s = data.stocks[code];
         if (!s || !s.price) continue;
         liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
         updateWatchlistPriceCells(code);
+        updateListRowRealtime(code, s);
         if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
-        updated = true;
       }
-      return updated;
     })
     .catch(() => {});
+}
+
+// 리스트(전체목록/추천/TOP20 등)에 이미 그려진 행의 가격·등락률만 실시간 값으로 갈아끼움.
+// 행 전체를 다시 그리지 않아서 스크롤/깜빡임 없음.
+function updateListRowRealtime(code, s) {
+  const rows = document.querySelectorAll('tr.twoLineRow[data-code="' + code + '"]');
+  rows.forEach(tr => {
+    const priceEl = tr.querySelector('.rowPrice');
+    if (priceEl) priceEl.textContent = fmt(s.price) + '원';
+    const sub = tr.nextElementSibling;
+    if (!sub || !sub.classList.contains('twoLineSubRow')) return;
+    const rateEl = sub.querySelector('td > span:first-child');
+    if (rateEl && typeof s.rate === 'number') {
+      rateEl.textContent = (s.rate >= 0 ? '+' : '') + s.rate.toFixed(2) + '%';
+      rateEl.className = s.rate >= 0 ? 'up' : 'down';
+    }
+  });
 }
 
 setInterval(() => {
   if (document.hidden) return;
   refreshRealtimeWatchlist();
   // 미니 캔들차트는 한 번 로딩되면 다시 그리지 않음 (miniCandleCache 안 비움)
-}, 3000); // 관심종목 실시간 시세 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
+}, 3000); // 실시간 시세 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) load(); // 화면 복귀 시 즉시 최신화
@@ -3920,17 +3953,20 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/realtime-watchlist") {
-        // 관심종목을 relay 웹소켓으로 구독시키고, 실시간 체결값을 그대로 반환.
-        // 기존 20초 폴링(종목당 1.1초 소요)을 대체 - 키움 TR 호출 0건이라 훨씬 빠르고 가벼움.
+        // 관심종목 + 화면 리스트 종목을 relay 웹소켓으로 구독시키고, 실시간 체결값을 반환.
+        // 키움 TR 호출 0건. 리스트 종목은 클라이언트가 지금 보고 있는 종목만 보내줌(그룹당 200 제한).
         try {
           const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
           const codes = wlRes.results.map((r) => r.code);
 
-          // 구독 목록 동기화 (relay 쪽에서 실제 변경이 있을 때만 재등록함)
+          // 클라이언트가 ?list=코드,코드,... 로 화면에 뜬 종목을 알려줌
+          const listParam = url.searchParams.get("list") || "";
+          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 200);
+
           await kiwoomRelayFetch(env, "/realtime/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ codes }),
+            body: JSON.stringify({ codes, listCodes }),
           }).catch(() => {});
 
           const res = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
