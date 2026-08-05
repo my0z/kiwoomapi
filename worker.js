@@ -1162,18 +1162,21 @@ function computeRecommendations(latest, pullbackCodes) {
       const mom = r.momentum || [];
       const recentDelta = mom[0] ? mom[0].delta : 0; // 가장 최근 구간(2분전) - 지금 이 순간의 방향
       const olderDelta = mom.length ? mom[mom.length - 1].delta : recentDelta; // 가장 오래된 구간(약10분전)
-      const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지
+      const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지 (배지 표시용으로만 씀, 아래 참고)
 
+      // ---- 2026-08-05 backtest-signals(ticks=300) 실측 기준 가중치 ----
+      // (edgeVsBaseline: 그 신호가 있었을 때 다음 틱 평균 등락이 전체 평균보다 얼마나 높았는지)
+      //   bidTurnedPositive +0.036(표본4630) / buyReqSpike +0.024(표본6409) -> 실제 효과 있음, 가중치 유지·상향
+      //   accelerating -0.016(표본30207) / cntrStrRising -0.011(표본29817)
+      //   isTodayHigh -0.064(표본9322) / pullbackLike -0.040(표본9235) -> 오히려 역효과라 가중치 제거
+      //   volumeSpike는 표본 17개뿐이라(30 미만) 판단 보류, 기존 가중치 유지
+      // 하루치 데이터라 확정은 아님 - ticks 늘려서 며칠 더 쌓인 뒤 재검증 필요.
       let score = 0;
-      score += recentDelta * 8; // 지금 이 순간의 방향/속도에 가장 큰 가중치
-      if (accelerating) score += 3;
-      if (pullbackCodes.has(r.code)) score += 4; // 눌림목 후 재상승 시도 - 되돌림이 이미 검증된 패턴
-      if (r.bidTurnedPositive) score += 3; // 매도 우위에서 방금 매수 우위로 뒤집힘 - 초반 반전 신호
-      if (r.cntrStrRising) score += 1.5; // 체결강도가 직전보다 세지는 중 - 매수 압력 커지는 중
-      if (r.buyReqSpike) score += 1.5; // 매수 대기 물량이 갑자기 쌓이는 중
-      if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 거래량 동반 = 힘이 실린 움직임일 확률
+      score += recentDelta * 8; // 지금 이 순간의 방향/속도에 가장 큰 가중치 (이번 백테스트 대상 아님, 유지)
+      if (r.bidTurnedPositive) score += 4; // 실측 근거 있음 - 기존 3에서 상향
+      if (r.buyReqSpike) score += 2.5; // 실측 근거 있음 - 기존 1.5에서 상향
+      if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 표본 부족으로 판단 보류, 기존 유지
       score += (r.relativeStrength || 0) * 0.5;
-      if (r.isTodayHigh && (r.change_rate || 0) < 25) score += 1; // 고점 갱신 중(단, 상한가 근접 전이라 아직 여력 있을 때만)
       if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
       if ((r.price || 0) < 2000) score -= 3; // 동전주 위험
       // 거래대금 10억 미만은 슬리피지로 수익이 깎일 위험 - 진입 자체를 신중히
