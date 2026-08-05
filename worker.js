@@ -1246,7 +1246,7 @@ function computeTopPicks(latest, streak5Codes) {
 // - 가속 중(최근 구간이 예전 구간보다 빠름)이면 관성이 이어질 가능성으로 가점
 // - 눌림목 재상승 패턴이면 이미 한 번 힘을 보여주고 쉬었다가 다시 도는 것이라 진입 근거가 더 명확 - 가장 크게 가점
 // - 지금 이 순간 이미 꺾이고 있거나(recentDelta<0) 상한가 임박(위쪽 여력 없음)이면 확실히 감점/제외 성격
-// 코스피/코스닥 둘 다 마이너스면 true - loadMarketIndex()가 채우고 추천점수 감점에 사용
+// 코스피/코스닥 둘 다 마이너스면 true - renderMarketIndexBar()가 채우고 추천점수 감점에 사용
 // (computeRecommendations보다 먼저 선언되어야 TDZ 에러가 안 남)
 let weakMarket = false;
 
@@ -1579,7 +1579,7 @@ document.getElementById('sortByTradeValue').addEventListener('click', (e) => {
 });
 
 let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화면에 렌더된 종목들로 채워짐
-let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - loadRealtimeCondition()에서 채워짐
+let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
   const res = await fetch('/api/latest');
@@ -2160,79 +2160,123 @@ function fmtHHMM(t) {
   return s.length >= 4 ? s.slice(0, 2) + ':' + s.slice(2, 4) : s;
 }
 
-function loadRealtimeCondition() {
-  fetch('/api/realtime-condition')
+function renderConditionDock(cond) {
+  const board = document.getElementById('conditionDock');
+  if (!cond || !cond.seq) { board.style.display = 'none'; return; }
+  board.style.display = 'block';
+
+  const tbody = document.querySelector('#conditionList tbody');
+  const codes = cond.codes || [];
+  conditionCodes = codes.slice(0, 50); // 실시간 시세 구독 우선순위에 쓰임
+  conditionCodes.forEach(c => {
+    if (!realtimeListCodes.includes(c)) realtimeListCodes.unshift(c);
+  });
+  if (realtimeListCodes.length > 180) realtimeListCodes.length = 180;
+
+  // 편입 이력 기준으로 표시 - 조건에서 금방 빠져나간 종목도 사라지지 않고 남음
+  const history = cond.history || [];
+  const countEl = document.getElementById('conditionDockCount');
+  if (countEl) countEl.textContent = history.length ? '(' + history.length + '건 · 현재 조건 ' + (cond.count || 0) + ')' : '';
+  if (!history.length) {
+    tbody.innerHTML = '<tr><td class="empty">아직 포착된 종목 없음 (감시 중)</td></tr>';
+    return;
+  }
+
+  // 한 줄 표시: 별표 · 종목명(+신호아이콘) · 등락률 · 포착시각
+  tbody.innerHTML = history.slice(0, 25).map(h => {
+    const live = liveQuoteCache[h.code];
+    const rate = live ? live.rate : h.rate;
+    const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
+    const rateHtml = (rate !== null && rate !== undefined)
+      ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + Number(rate).toFixed(2) + '%</span>'
+      : '<span class="empty">-</span>';
+    // 다음 2분 cron이 이 종목을 한 번이라도 스캔해서 byCodeMap에 들어왔으면, 그 신호들을 압축 아이콘으로 붙임
+    // (한 줄 레이아웃이라 전체 배지는 못 넣고, 강한 신호 몇 개만 아이콘 하나씩)
+    const info = byCodeMap[h.code];
+    let icons = '';
+    if (info) {
+      if (info.cntrStr >= 105) icons += '💪';
+      if (info.buyReq > info.selReq) icons += '🔄';
+    }
+    const verdictHtml = info ? '<span class="verdictIcon">' + computeVerdict(info).emoji + '</span>' : '';
+    return '<tr class="clickable dockRow' + (h.stillIn ? '' : ' dockRowOut') + '" data-code="' + h.code + '">' +
+      '<td class="dockStar">' + starHtml({ code: h.code, name: name }, '실시간포착') + '</td>' +
+      '<td class="dockName">' + verdictHtml + name + (icons ? ' <span class="dockIcons">' + icons + '</span>' : '') + '</td>' +
+      '<td class="dockRate">' + rateHtml + '</td>' +
+      '<td class="dockTime">' + (h.initial ? '<span class="empty">충족중</span>' : '⚡' + fmtHHMM(h.time)) + '</td>' +
+      '</tr>';
+  }).join('');
+
+  tbody.querySelectorAll('tr.dockRow').forEach(tr => {
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('.noRowClick')) return;
+      const code = tr.dataset.code;
+      const h = history.find(x => x.code === code);
+      const live = liveQuoteCache[code];
+      const item = byCodeMap[code] || {
+        code: code,
+        name: (h && h.name) || code,
+        price: live ? live.price : (h ? h.price : 0),
+        rate: live ? live.rate : (h ? h.rate : 0),
+        buyReq: 0, selReq: 0, cntrStr: 0, signalChecks: [], volume: 0,
+      };
+      currentModalSourceBoard = '실시간포착';
+      currentModalAddedState = '';
+      openStockModal(item);
+    });
+  });
+}
+
+function renderMarketIndexBar(index) {
+  if (!index || !index.kospi || !index.kosdaq) return;
+  const bar = document.getElementById('marketIndexBar');
+  const fmtIdx = (label, d) => {
+    const cls = d.rate >= 0 ? 'up' : 'down';
+    return '<span>' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
+      '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
+  };
+  weakMarket = index.kospi.rate < 0 && index.kosdaq.rate < 0;
+  bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
+    (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
+  bar.style.display = 'flex';
+}
+
+function applyRealtimeStocks(stocks) {
+  if (!stocks) return;
+  for (const code of Object.keys(stocks)) {
+    const s = stocks[code];
+    if (!s || !s.price) continue;
+    liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
+    updateWatchlistPriceCells(code);
+    updateListRowRealtime(code, s);
+    updateRealtimeExitSignal(code, s);
+    if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
+  }
+}
+
+// 지수/실시간포착/관심종목시세 - 예전엔 API 3개를 따로(2~3초 간격씩) 폴링했는데, 전부 relay 메모리에서
+// 읽는 거라 나눌 이유가 없어서 하나로 합침 (Cloudflare Worker 호출 3회 -> 1회, relay 왕복도 3회 -> 1회)
+function pollRealtimeAll() {
+  const listParam = realtimeListCodes.slice(0, 180).join(',');
+  fetch('/api/realtime-all?list=' + encodeURIComponent(listParam))
     .then(res => res.json())
     .then(data => {
-      const board = document.getElementById('conditionDock');
-      if (!data.ok || !data.seq) { board.style.display = 'none'; return; }
-      board.style.display = 'block';
-
-      const tbody = document.querySelector('#conditionList tbody');
-      const codes = data.codes || [];
-      conditionCodes = codes.slice(0, 50); // 실시간 시세 구독 우선순위에 쓰임
-      conditionCodes.forEach(c => {
-        if (!realtimeListCodes.includes(c)) realtimeListCodes.unshift(c);
-      });
-      if (realtimeListCodes.length > 180) realtimeListCodes.length = 180;
-
-      // 편입 이력 기준으로 표시 - 조건에서 금방 빠져나간 종목도 사라지지 않고 남음
-      const history = data.history || [];
-      const countEl = document.getElementById('conditionDockCount');
-      if (countEl) countEl.textContent = history.length ? '(' + history.length + '건 · 현재 조건 ' + (data.count || 0) + ')' : '';
-      if (!history.length) {
-        tbody.innerHTML = '<tr><td class="empty">아직 포착된 종목 없음 (감시 중)</td></tr>';
-        return;
-      }
-
-      // 한 줄 표시: 별표 · 종목명(+신호아이콘) · 등락률 · 포착시각
-      tbody.innerHTML = history.slice(0, 25).map(h => {
-        const live = liveQuoteCache[h.code];
-        const rate = live ? live.rate : h.rate;
-        const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
-        const rateHtml = (rate !== null && rate !== undefined)
-          ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + Number(rate).toFixed(2) + '%</span>'
-          : '<span class="empty">-</span>';
-        // 다음 2분 cron이 이 종목을 한 번이라도 스캔해서 byCodeMap에 들어왔으면, 그 신호들을 압축 아이콘으로 붙임
-        // (한 줄 레이아웃이라 전체 배지는 못 넣고, 강한 신호 몇 개만 아이콘 하나씩)
-        const info = byCodeMap[h.code];
-        let icons = '';
-        if (info) {
-          if (info.cntrStr >= 105) icons += '💪';
-          if (info.buyReq > info.selReq) icons += '🔄';
-        }
-        const verdictHtml = info ? '<span class="verdictIcon">' + computeVerdict(info).emoji + '</span>' : '';
-        return '<tr class="clickable dockRow' + (h.stillIn ? '' : ' dockRowOut') + '" data-code="' + h.code + '">' +
-          '<td class="dockStar">' + starHtml({ code: h.code, name: name }, '실시간포착') + '</td>' +
-          '<td class="dockName">' + verdictHtml + name + (icons ? ' <span class="dockIcons">' + icons + '</span>' : '') + '</td>' +
-          '<td class="dockRate">' + rateHtml + '</td>' +
-          '<td class="dockTime">' + (h.initial ? '<span class="empty">충족중</span>' : '⚡' + fmtHHMM(h.time)) + '</td>' +
-          '</tr>';
-      }).join('');
-
-      tbody.querySelectorAll('tr.dockRow').forEach(tr => {
-        tr.addEventListener('click', (e) => {
-          if (e.target.closest('.noRowClick')) return;
-          const code = tr.dataset.code;
-          const h = history.find(x => x.code === code);
-          const live = liveQuoteCache[code];
-          const item = byCodeMap[code] || {
-            code: code,
-            name: (h && h.name) || code,
-            price: live ? live.price : (h ? h.price : 0),
-            rate: live ? live.rate : (h ? h.rate : 0),
-            buyReq: 0, selReq: 0, cntrStr: 0, signalChecks: [], volume: 0,
-          };
-          currentModalSourceBoard = '실시간포착';
-          currentModalAddedState = '';
-          openStockModal(item);
-        });
-      });
+      if (!data.ok) return;
+      renderMarketIndexBar(data.index);
+      renderConditionDock(data.condition);
+      applyRealtimeStocks(data.stocks);
     })
     .catch(() => {});
 }
-loadRealtimeCondition();
-setInterval(() => { if (!document.hidden) loadRealtimeCondition(); }, 3000); // 5초->3초 (relay 메모리 읽기라 부담 없음)
+pollRealtimeAll();
+setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000); // 통합 폴링 2초 (relay 메모리 읽기라 부담 없음, 실제 수신 간격이 약 2초)
+
+// 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
+// cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
+// "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
+const prevCntrStrMap = {}; // 직전 체결강도 - 급락 감지에 씀
+// 브라우저 알림 - 탭을 안 보고 있어도 강한 신호(관심종목 이탈신호, 손절/익절 도달)를 놓치지 않게 함.
+// 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
 
 // 하단 실시간 포착 패널 접기/펼치기 (화면 좁을 때 방해되지 않게)
 document.getElementById('conditionDockHead').addEventListener('click', () => {
@@ -2245,26 +2289,7 @@ document.getElementById('conditionDockHead').addEventListener('click', () => {
 });
 
 // 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
-function loadMarketIndex() {
-  fetch('/api/market-index')
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) return;
-      const bar = document.getElementById('marketIndexBar');
-      const fmtIdx = (label, d) => {
-        const cls = d.rate >= 0 ? 'up' : 'down';
-        return '<span>' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
-          '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
-      };
-      weakMarket = data.kospi.rate < 0 && data.kosdaq.rate < 0;
-      bar.innerHTML = fmtIdx('KOSPI', data.kospi) + fmtIdx('KOSDAQ', data.kosdaq) +
-        (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
-      bar.style.display = 'flex';
-    })
-    .catch(() => {});
-}
-loadMarketIndex();
-setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 2000); // 5초->2초 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음, 실제 수신 간격이 약 2초라 이보다 빨라도 의미 없음)
+// (렌더링은 renderMarketIndexBar가 담당, 폴링은 아래 통합 pollRealtimeAll이 담당)
 
 
 // 지난 24시간 안에 확인할 이상상황(relay 끊김/cron실패/메모리경고 등)이 있으면 상단에 배너로 알려줌.
@@ -2308,29 +2333,18 @@ let mainRefreshTimer = setInterval(() => {
 
 // 관심종목 + 화면 리스트 종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 읽어옴.
 // 키움 TR 호출 0건이라 3초마다 갱신 가능. 리스트 종목은 지금 화면에 떠 있는 것만 보냄(그룹당 200 제한).
+// 관심종목 추가 직후 즉시 1회 조회용 (그 뒤 주기적 갱신은 pollRealtimeAll이 담당)
 function refreshRealtimeWatchlist() {
   const listParam = realtimeListCodes.slice(0, 180).join(',');
   fetch('/api/realtime-watchlist?list=' + encodeURIComponent(listParam))
     .then(res => res.json())
-    .then(data => {
-      if (!data.ok || !data.stocks) return;
-      for (const code of Object.keys(data.stocks)) {
-        const s = data.stocks[code];
-        if (!s || !s.price) continue;
-        liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
-        updateWatchlistPriceCells(code);
-        updateListRowRealtime(code, s);
-        updateRealtimeExitSignal(code, s);
-        if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
-      }
-    })
+    .then(data => { if (data.ok) applyRealtimeStocks(data.stocks); })
     .catch(() => {});
 }
 
 // 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
 // cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
 // "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
-const prevCntrStrMap = {}; // 직전 체결강도 - 급락 감지에 씀
 // 브라우저 알림 - 탭을 안 보고 있어도 강한 신호(관심종목 이탈신호, 손절/익절 도달)를 놓치지 않게 함.
 // 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
 let notifyEnabled = false;
@@ -2403,12 +2417,6 @@ function updateListRowRealtime(code, s) {
     }
   });
 }
-
-setInterval(() => {
-  if (document.hidden) return;
-  refreshRealtimeWatchlist();
-  // 미니 캔들차트는 한 번 로딩되면 다시 그리지 않음 (miniCandleCache 안 비움)
-}, 2000); // 3초->2초 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음, 실제 수신 간격이 약 2초)
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) load(); // 화면 복귀 시 즉시 최신화
@@ -3903,13 +3911,11 @@ self.addEventListener('fetch', (e) => {
                   reasons.push("3틱 연속 하락");
                 }
                 // 5) 진입가 대비 2% 이상 하락 - 실제 내 손실이 커지는 중이라는 가장 직접적인 신호
+                // (cur는 위에서 이미 byCode 맵으로 구해둔 값이라 재사용 - 예전엔 histRes.results 전체를 매번 find()로 훑었음)
                 const entryPrice = entryMap.get(code);
-                if (entryPrice > 0) {
-                  const curRow = histRes.results.find((r) => r.code === code && r.captured_at === recentTimes[0]);
-                  if (curRow && curRow.price > 0) {
-                    const pnlPct = ((curRow.price - entryPrice) / entryPrice) * 100;
-                    if (pnlPct <= -2) reasons.push("진입가대비 " + pnlPct.toFixed(2) + "%");
-                  }
+                if (entryPrice > 0 && cur.price > 0) {
+                  const pnlPct = ((cur.price - entryPrice) / entryPrice) * 100;
+                  if (pnlPct <= -2) reasons.push("진입가대비 " + pnlPct.toFixed(2) + "%");
                 }
 
                 if (reasons.length) data.watchlistExitSignals.push({ code, reasons });
@@ -4454,6 +4460,36 @@ self.addEventListener('fetch', (e) => {
             lastEventAt: data.lastEventAt,
             history: data.history || [],
             events: data.events || [],
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/realtime-all") {
+        // 관심종목시세 + 리스트시세 + 지수 + 실시간포착을 한 번에 반환.
+        // 전부 relay 메모리에서 읽는 거라 나눌 이유가 없어서 통합 - 클라이언트 폴링이 3개 API -> 1개로 줄어듦.
+        try {
+          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+          const codes = wlRes.results.map((r) => r.code);
+          const listParam = url.searchParams.get("list") || "";
+          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
+
+          await kiwoomRelayFetch(env, "/realtime/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ codes, listCodes }),
+          }).catch(() => {});
+
+          const res = await kiwoomRelayFetch(env, "/realtime/all", { method: "GET" });
+          const data = await res.json();
+          return Response.json({
+            ok: true,
+            wsConnected: data.wsConnected,
+            wsLoggedIn: data.wsLoggedIn,
+            index: data.index || { kospi: null, kosdaq: null },
+            stocks: data.stocks || {},
+            condition: data.condition || { seq: null, codes: [], count: 0, history: [] },
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
