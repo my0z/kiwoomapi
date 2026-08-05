@@ -3880,10 +3880,15 @@ self.addEventListener('fetch', (e) => {
                 if (!cur || !prev) continue;
                 const reasons = [];
 
+                // 15:36 마감 정밀조회는 체결강도/매수잔량/매도잔량을 항상 0으로 저장함 - 그 틱이 cur로 잡히면
+                // "체결강도 꺾임"/"매도잔량 역전"이 전 종목에 오판되어 뜸(실제값->0을 급락/역전으로 착각) - 걸러냄
+                const isPlaceholderRow = (row) => row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0;
+                const hasOrderFlowData = !isPlaceholderRow(cur) && !isPlaceholderRow(prev);
+
                 // 1) 체결강도가 매수우위(105+)에서 꺾여 내려옴
-                if ((prev.cntr_str || 0) >= 105 && (cur.cntr_str || 0) < 100) reasons.push("체결강도 꺾임");
+                if (hasOrderFlowData && (prev.cntr_str || 0) >= 105 && (cur.cntr_str || 0) < 100) reasons.push("체결강도 꺾임");
                 // 2) 매수잔량 우위 -> 매도잔량 우위로 역전 ("매수전환"의 정반대)
-                if ((prev.buy_req || 0) > (prev.sel_req || 0) && (cur.buy_req || 0) <= (cur.sel_req || 0)) {
+                if (hasOrderFlowData && (prev.buy_req || 0) > (prev.sel_req || 0) && (cur.buy_req || 0) <= (cur.sel_req || 0)) {
                   reasons.push("매도잔량 역전");
                 }
                 // 3) 담은 뒤 고점 대비 3%p 이상 밀림 (내가 담은 이후 기준)
