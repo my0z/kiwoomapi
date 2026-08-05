@@ -2101,7 +2101,7 @@ document.getElementById('conditionDockHead').addEventListener('click', () => {
   document.getElementById('conditionDockToggle').textContent =
     dock.classList.contains('collapsed') ? '▲' : '▼';
   // 접으면 본문 여백도 줄여서 화면을 넓게 씀
-  document.body.style.paddingBottom = dock.classList.contains('collapsed') ? '54px' : '185px';
+  document.body.style.paddingBottom = dock.classList.contains('collapsed') ? '80px' : '195px';
 });
 
 // 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
@@ -2238,7 +2238,7 @@ function renderDashboard() {
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <style>
-  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 185px; }
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
@@ -2424,13 +2424,18 @@ function renderDashboard() {
   #conditionDockCount { color:#888; font-weight:normal; font-size:11px; margin-left:4px; }
   #conditionDockToggle { color:#888; font-size:11px; }
   #conditionDockBody {
-    max-height:150px; /* 한 줄 표시 기준 약 6종목만 보이고 나머지는 스크롤 */
+    max-height:161px; /* 한 줄 표시 기준 약 7종목, 나머지는 스크롤 */
     overflow-y:auto; -webkit-overflow-scrolling:touch;
     padding:0 12px 8px;
+    transition:max-height .15s ease;
   }
-  #conditionDock.collapsed #conditionDockBody { display:none; }
+  #conditionDock.collapsed #conditionDockBody {
+    max-height:24px; /* 접으면 1종목만 보이게 (완전히 숨기지 않음) */
+    overflow:hidden;
+    padding-bottom:2px;
+  }
   #conditionDockBody table { width:100%; border-collapse:collapse; font-size:13px; }
-  #conditionDockBody td { padding:1px 4px; line-height:1.25; border-bottom:1px solid #232323; }
+  #conditionDockBody td { padding:0px 4px; line-height:1.2; border-bottom:1px solid #232323; }
   #conditionDockBody tr.dockRow { cursor:pointer; }
   #conditionDockBody tr.dockRow:active { background:#2a2a2a; }
   #conditionDockBody tr.dockRowOut { opacity:0.45; } /* 조건에서 이탈한 종목은 흐리게 */
