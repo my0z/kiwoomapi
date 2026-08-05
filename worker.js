@@ -3994,12 +3994,13 @@ self.addEventListener('fetch', (e) => {
             return Response.json({ ok: false, error: "분석할 틱이 부족합니다 (최소 4틱 필요)" });
           }
 
-          const placeholders = times.map(() => "?").join(",");
+          // times는 같은 테이블에서 뽑은 연속된 captured_at 값들이라, IN절 대신 범위(BETWEEN)로 조회해도
+          // 결과가 동일함 - 파라미터를 300개씩 바인딩하면 D1 변수 개수 제한에 걸려서 이렇게 바꿈
           const rowsRes = await env.DB.prepare(
             `SELECT code, change_rate, volume, cntr_str, buy_req, sel_req, captured_at
-             FROM snapshots WHERE captured_at IN (${placeholders})`
+             FROM snapshots WHERE captured_at >= ? AND captured_at <= ?`
           )
-            .bind(...times)
+            .bind(times[0], times[times.length - 1])
             .all();
 
           // code별로 시간순 정렬된 배열 구성
@@ -4102,11 +4103,10 @@ self.addEventListener('fetch', (e) => {
             return Response.json({ ok: false, error: "분석할 틱이 부족합니다 (최소 3틱 필요)" });
           }
 
-          const placeholders = times.map(() => "?").join(",");
           const rowsRes = await env.DB.prepare(
-            `SELECT code, change_rate, captured_at FROM snapshots WHERE captured_at IN (${placeholders})`
+            `SELECT code, change_rate, captured_at FROM snapshots WHERE captured_at >= ? AND captured_at <= ?`
           )
-            .bind(...times)
+            .bind(times[0], times[times.length - 1])
             .all();
 
           // code별로 시간순 change_rate 배열 구성
