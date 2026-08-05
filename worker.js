@@ -131,9 +131,8 @@ async function checkWatchlistRiskLevels(env) {
   let checked = 0;
   for (const w of items) {
     try {
-      // 두 TR을 동시에 쏘면 키움 초당1건 제한 위반 가능 - 순차로 호출
-      const ohlc = await kiwoomDailyOHLC(env, token, w.code);
-      await sleep(1100);
+      // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
+      const ohlc = await getCachedDailyOHLC(env, token, w.code);
       const quoteRaw = await kiwoomQuote(env, token, w.code);
       const atr = computeATR(ohlc, 14);
       if (!atr) continue; // ATR 계산 불가 - 아래 finally에서 대기는 그대로 실행됨
@@ -412,6 +411,8 @@ async function purgeOldRows(env) {
   // signal_backtest_history는 하루 1행이라 부담 적지만, 60일 넘은 건 정리
   const historyCutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   await env.DB.prepare(`DELETE FROM signal_backtest_history WHERE date < ?`).bind(historyCutoff).run().catch(() => {});
+  // daily_ohlc_cache도 하루 지나면 무의미 (다음날은 또 새 일봉이라 어차피 재조회됨)
+  await env.DB.prepare(`DELETE FROM daily_ohlc_cache WHERE updated_at < ?`).bind(shortCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
 
   return result.meta?.changes ?? 0;
@@ -1723,55 +1724,8 @@ function updateMiniChartCell(code) {
   if (row) row.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
 }
 
-// 관심종목 실시간 시세 재조회 (D1 마지막 시세는 밴드를 벗어나면 갱신이 안 되는 문제가 있어서,
-// 관심종목만 20초 주기로 키움 현재가(ka10007)를 직접 조회해서 정확도 보완)
+// 관심종목 실시간 시세 캐시 - refreshRealtimeWatchlist()가 relay 웹소켓 값으로 채움
 const liveQuoteCache = {}; // { code: { price, rate, fetchedAt } }
-let liveQuoteQueueRunning = false;
-
-function queueLiveQuoteFetches(codes) {
-  const toFetch = codes.filter(c => !liveQuoteCache[c]);
-  if (liveQuoteQueueRunning || !toFetch.length) return;
-  liveQuoteQueueRunning = true;
-  let i = 0;
-  function next() {
-    if (i >= toFetch.length) { liveQuoteQueueRunning = false; return; }
-    const code = toFetch[i++];
-    fetch('/api/quote?code=' + code)
-      .then(res => res.json())
-      .then(data => {
-        if (data.ok) {
-          liveQuoteCache[code] = { price: data.price, rate: data.rate, fetchedAt: Date.now() };
-          updateWatchlistPriceCells(code); // 이 종목 가격/수익률 셀만 갱신
-        }
-      })
-      .catch(() => {})
-      .finally(() => setTimeout(next, 1100)); // 키움 TR 초당1건 제한 준수
-  }
-  next();
-}
-
-// 주기적 갱신용: 캐시를 미리 비우지 않고, 새 값이 도착하는 즉시 그 자리에서 덮어씀
-// (미리 비우면 그 순간 화면이 잠깐 옛날 배치 데이터로 돌아갔다 다시 바뀌는 깜빡임이 생김)
-function refreshLiveQuotes(codes) {
-  if (liveQuoteQueueRunning || !codes.length) return;
-  liveQuoteQueueRunning = true;
-  let i = 0;
-  function next() {
-    if (i >= codes.length) { liveQuoteQueueRunning = false; return; }
-    const code = codes[i++];
-    fetch('/api/quote?code=' + code)
-      .then(res => res.json())
-      .then(data => {
-        if (data.ok) {
-          liveQuoteCache[code] = { price: data.price, rate: data.rate, fetchedAt: Date.now() };
-          updateWatchlistPriceCells(code);
-        }
-      })
-      .catch(() => {})
-      .finally(() => setTimeout(next, 1100));
-  }
-  next();
-}
 
 function updateWatchlistPriceCells(code) {
   const tr = document.querySelector('#watchlist tr.watchlistRow[data-code="' + code + '"]');
@@ -3190,6 +3144,29 @@ async function kiwoomDailyOHLC(env, token, code) {
     .reverse(); // 과거 -> 최신
 }
 
+// 일봉은 당일 캔들 빼고는 하루 종일 안 바뀌므로, 2분마다 매번 새로 받을 필요 없음.
+// 10분 캐싱으로 호출 횟수를 5분의 1로 줄임 (ATR 14일 평균값 특성상 10분 정도 지연은 실질적 영향 없음).
+const DAILY_OHLC_CACHE_MS = 10 * 60 * 1000;
+async function getCachedDailyOHLC(env, token, code) {
+  const cached = await env.DB.prepare(`SELECT ohlc_json, updated_at FROM daily_ohlc_cache WHERE code = ?`)
+    .bind(code)
+    .first()
+    .catch(() => null);
+  if (cached && Date.now() - new Date(cached.updated_at).getTime() < DAILY_OHLC_CACHE_MS) {
+    return JSON.parse(cached.ohlc_json);
+  }
+  const ohlc = await kiwoomDailyOHLC(env, token, code);
+  await sleep(1100); // 키움 TR 초당1건 제한 - 방금 실제로 호출했을 때만 대기 (캐시 히트면 이 함수 자체가 여기까지 안 옴)
+  await env.DB.prepare(
+    `INSERT INTO daily_ohlc_cache (code, ohlc_json, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(code) DO UPDATE SET ohlc_json = excluded.ohlc_json, updated_at = excluded.updated_at`
+  )
+    .bind(code, JSON.stringify(ohlc), new Date().toISOString())
+    .run()
+    .catch(() => {}); // 캐시 저장 실패해도 방금 받아온 ohlc는 그대로 반환하면 됨
+  return ohlc;
+}
+
 function computeATR(ohlc, period) {
   if (ohlc.length < 2) return null;
   const trs = [];
@@ -3734,17 +3711,19 @@ self.addEventListener('fetch', (e) => {
               // 고점 기준을 "담은 시점 이후"로 잡음.
               // 오늘 전체 고점으로 잡으면, 이미 고점 찍고 내려온 종목을 담는 순간 바로 이탈신호가 떠서 무의미함.
               // 실제로 알고 싶은 건 "내가 담은 뒤로 어떻게 됐는지"이므로 added_at 이후만 집계.
-              const maxRows = [];
-              for (const w of data.watchlist) {
-                const row = await env.DB.prepare(
-                  `SELECT MAX(change_rate) AS maxRate FROM snapshots WHERE code = ? AND captured_at >= ?`
-                )
-                  .bind(w.code, w.added_at)
-                  .first()
-                  .catch(() => null);
-                if (row && row.maxRate !== null) maxRows.push({ code: w.code, maxRate: row.maxRate });
-              }
-              const maxMap = new Map(maxRows.map((r) => [r.code, r.maxRate]));
+              // (종목마다 담은 시점이 달라서 correlated subquery로 한 번에 처리 - 예전엔 종목 수만큼 D1 왕복이 순차로 돌았음)
+              const wph = data.watchlist.map(() => "?").join(",");
+              const maxRes = await env.DB.prepare(
+                `SELECT w.code AS code,
+                        (SELECT MAX(s.change_rate) FROM snapshots s WHERE s.code = w.code AND s.captured_at >= w.added_at) AS maxRate
+                 FROM watchlist w WHERE w.code IN (${wph})`
+              )
+                .bind(...data.watchlist.map((w) => w.code))
+                .all()
+                .catch(() => ({ results: [] }));
+              const maxMap = new Map(
+                maxRes.results.filter((r) => r.maxRate !== null).map((r) => [r.code, r.maxRate])
+              );
               const entryMap = new Map(data.watchlist.map((w) => [w.code, w.entry_price]));
 
               const byCode = new Map();
@@ -3970,8 +3949,7 @@ self.addEventListener('fetch', (e) => {
           const code = url.searchParams.get("code");
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
           const token = await kiwoomIssueToken(env);
-          const ohlc = await kiwoomDailyOHLC(env, token, code);
-          await sleep(1100); // 키움 TR 초당1건 제한
+          const ohlc = await getCachedDailyOHLC(env, token, code);
           const quoteRaw = await kiwoomQuote(env, token, code);
           const atr = computeATR(ohlc, 14);
           const goldenCross = computeGoldenCross(ohlc);
