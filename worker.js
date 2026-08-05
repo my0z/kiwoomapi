@@ -220,20 +220,6 @@ async function trackWatchlistPerformance(env) {
   return { tracked };
 }
 
-// 코스피/코스닥 지수 조회 (ka20001 업종현재가요청)
-// - 시장 전체가 빠지는 날엔 급등주 신호 자체가 잘 안 먹히므로, 그 맥락을 화면 상단에 같이 보여주기 위함
-// inds_cd: "001"=종합(KOSPI), "101"=종합(KOSDAQ)
-async function kiwoomMarketIndex(env, token, mrktTp, indsCd) {
-  const data = await kiwoomApiCall(env, token, "/api/dostk/sect", "ka20001", {
-    mrkt_tp: mrktTp,
-    inds_cd: indsCd,
-  });
-  return {
-    price: parseFloat(String(data.cur_prc ?? "0").replace(/[^\d.-]/g, "")) || 0,
-    rate: parseFloat(data.flu_rt ?? "0") || 0,
-  };
-}
-
 // 조용히 묻히던 수집 실패를 D1에 남겨서 나중에 확인 가능하게 함 (system_events 테이블 필요 - schema.sql 참고)
 // 로깅 자체가 실패해도(테이블 없음 등) 전체 흐름을 막으면 안 되니 조용히 무시
 async function logSystemEvent(env, kind, message) {
@@ -2034,7 +2020,7 @@ function loadMarketIndex() {
     .catch(() => {});
 }
 loadMarketIndex();
-setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 30000); // 30초마다 (서버에서 30초 버킷으로 캐싱됨)
+setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 5000); // 5초마다 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
 
 
 // 반대로 14:30 이후는 장 마감까지 시간이 얼마 없어서, 물렸을 때 회복할 기회 자체가 부족함
@@ -3628,33 +3614,27 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/market-index") {
-        // 지수는 TR 2건만 쓰므로 30초 주기까지 올려도 초당1건 제한에 여유가 있음.
-        // 캐시 키를 30초 버킷으로 잡아서, 여러 탭/기기에서 동시에 봐도 30초에 1회만 실제 호출됨.
+        // relay가 웹소켓으로 상시 물고 있는 실시간 지수를 그대로 읽어옴.
+        // 키움 TR 호출 0건이라 초당1건 제한과 무관하고, D1 캐싱도 필요 없음(항상 최신).
         try {
-          const tickKey = new Date(Math.floor(Date.now() / 30000) * 30000).toISOString();
-
-          const cached = await env.DB.prepare(`SELECT result_json FROM market_index_cache WHERE captured_at = ?`)
-            .bind(tickKey)
-            .first()
-            .catch(() => null);
-          if (cached) {
-            return Response.json({ ok: true, cached: true, ...JSON.parse(cached.result_json) });
+          const res = await kiwoomRelayFetch(env, "/realtime/index", { method: "GET" });
+          const data = await res.json();
+          if (!data.ok || !data.kospi || !data.kosdaq) {
+            // 웹소켓이 아직 연결 전이거나 장 시작 전이라 데이터가 없는 경우
+            return Response.json({
+              ok: false,
+              error: "실시간 지수 데이터 대기 중",
+              wsConnected: data.wsConnected,
+              wsLoggedIn: data.wsLoggedIn,
+            });
           }
-
-          const token = await kiwoomIssueToken(env);
-          const kospi = await kiwoomMarketIndex(env, token, "0", "001");
-          await sleep(1100); // 키움 TR 초당1건 제한
-          const kosdaq = await kiwoomMarketIndex(env, token, "10", "101");
-          const payload = { kospi, kosdaq };
-
-          await env.DB.prepare(
-            `INSERT OR REPLACE INTO market_index_cache (captured_at, result_json, created_at) VALUES (?, ?, ?)`
-          )
-            .bind(tickKey, JSON.stringify(payload), new Date().toISOString())
-            .run()
-            .catch(() => {});
-
-          return Response.json({ ok: true, cached: false, ...payload });
+          return Response.json({
+            ok: true,
+            realtime: true,
+            kospi: { price: data.kospi.price, rate: data.kospi.rate },
+            kosdaq: { price: data.kosdaq.price, rate: data.kosdaq.rate },
+            updatedAt: data.kospi.updatedAt,
+          });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
@@ -3903,18 +3883,30 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/relay-health") {
-        // relay VM이 살아있는지 즉시 확인용 (오늘처럼 방화벽/relay 죽어서 몇 시간 헤매는 것 방지)
-        // 시크릿 포함해서 실제로 응답이 오는지만 봄 - relay가 응답하면(어떤 상태코드든) 최소한 살아있는 것
+        // relay VM이 살아있는지 + 웹소켓이 실제로 연결/로그인 상태인지 한 번에 확인
+        // (relay 프로세스는 살아있는데 웹소켓만 조용히 끊긴 경우를 잡기 위함)
         const startedAt = Date.now();
         try {
           if (!env.RELAY_URL || !env.RELAY_SECRET) {
             return Response.json({ ok: false, error: "RELAY_URL / RELAY_SECRET 시크릿 미설정" }, { status: 500 });
           }
-          const res = await fetch(env.RELAY_URL + "/", {
-            headers: { "X-Relay-Secret": env.RELAY_SECRET },
-          });
+          const res = await kiwoomRelayFetch(env, "/realtime/status", { method: "GET" });
           const elapsedMs = Date.now() - startedAt;
-          return Response.json({ ok: true, relayReachable: true, httpStatus: res.status, elapsedMs });
+          let wsStatus = null;
+          try {
+            wsStatus = await res.json();
+          } catch (e) {
+            // 구버전 relay(웹소켓 없는 버전)면 이 엔드포인트가 없어서 JSON이 아닐 수 있음
+          }
+          return Response.json({
+            ok: true,
+            relayReachable: true,
+            httpStatus: res.status,
+            elapsedMs,
+            wsConnected: wsStatus ? wsStatus.wsConnected : null,
+            wsLoggedIn: wsStatus ? wsStatus.wsLoggedIn : null,
+            wsLastMessageAt: wsStatus ? wsStatus.lastMessageAt : null,
+          });
         } catch (e) {
           return Response.json(
             { ok: true, relayReachable: false, error: String(e.message || e), elapsedMs: Date.now() - startedAt },
