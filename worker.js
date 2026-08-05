@@ -2065,7 +2065,9 @@ function loadRealtimeCondition() {
           '<td>' + starHtml({ code: h.code, name: name }, '실시간포착') + name +
           (price ? '<span class="rowPrice">' + fmt(price) + '원</span>' : '') + '</td></tr>' +
           '<tr class="twoLineSubRow"><td>' + rateHtml +
-          ' · <span class="delta">⚡' + fmtHHMM(h.time) + ' 포착</span>' +
+          (h.initial
+            ? ' · <span class="empty">조건 충족 중</span>'
+            : ' · <span class="delta">⚡' + fmtHHMM(h.time) + ' 신규포착</span>') +
           (h.stillIn ? '' : ' · <span class="empty">조건이탈</span>') +
           '</td></tr>';
       }).join('');
