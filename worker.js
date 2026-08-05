@@ -1450,6 +1450,7 @@ document.getElementById('sortByTradeValue').addEventListener('click', (e) => {
 });
 
 let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화면에 렌더된 종목들로 채워짐
+let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - loadRealtimeCondition()에서 채워짐
 
 async function load() {
   const res = await fetch('/api/latest');
@@ -1532,6 +1533,8 @@ async function load() {
   const pushCodes = (arr) => (arr || []).forEach(r => {
     if (r && r.code && !priorityCodes.includes(r.code)) priorityCodes.push(r.code);
   });
+  // 조건검색으로 방금 포착된 종목이 최우선 (아직 cron 스냅샷에 없을 수 있어서 시세가 꼭 필요)
+  conditionCodes.forEach(c => { if (!priorityCodes.includes(c)) priorityCodes.push(c); });
   pushCodes(recommended);
   pushCodes(data.pullbackCandidates);
   pushCodes(data.streak5);
@@ -2018,6 +2021,71 @@ document.getElementById('collectBtn').addEventListener('click', (e) => {
     });
 });
 
+// 조건검색 실시간 포착 - 조건에 편입되는 순간 즉시 화면에 뜸 (2분 cron 대기 없음)
+// 키움 실시간 시각은 "125003"(HHMMSS) 형태로 옴
+function fmtHHMM(t) {
+  const s = String(t || '');
+  return s.length >= 4 ? s.slice(0, 2) + ':' + s.slice(2, 4) : s;
+}
+
+function loadRealtimeCondition() {
+  fetch('/api/realtime-condition')
+    .then(res => res.json())
+    .then(data => {
+      const board = document.getElementById('conditionBoard');
+      if (!data.ok || !data.seq) { board.style.display = 'none'; return; }
+      board.style.display = 'block';
+
+      const tbody = document.querySelector('#conditionList tbody');
+      const codes = data.codes || [];
+      conditionCodes = codes.slice(0, 50); // 실시간 시세 구독 우선순위에 쓰임
+      // 아직 구독 목록에 없는 포착 종목은 즉시 추가 (다음 load()를 기다리지 않고 바로 시세 받기)
+      conditionCodes.forEach(c => {
+        if (!realtimeListCodes.includes(c)) realtimeListCodes.unshift(c);
+      });
+      if (realtimeListCodes.length > 200) realtimeListCodes.length = 200;
+
+      if (!codes.length) {
+        tbody.innerHTML = '<tr><td class="empty">조건 만족 종목 없음 (감시 중)</td></tr>';
+        return;
+      }
+
+      // 최근 편입 이벤트를 시간순으로 위에 보여줌 (방금 들어온 게 제일 중요)
+      const recentIn = (data.events || []).filter(e => e.action === '편입').slice(0, 10);
+      const recentCodes = recentIn.map(e => e.code);
+      const ordered = [...recentCodes, ...codes.filter(c => !recentCodes.includes(c))];
+
+      tbody.innerHTML = ordered.slice(0, 30).map(code => {
+        const live = liveQuoteCache[code] || byCodeMap[code];
+        const name = (byCodeMap[code] && byCodeMap[code].name) || code;
+        const price = live ? (live.price || 0) : 0;
+        const rate = live ? (live.rate !== undefined ? live.rate : 0) : null;
+        const ev = recentIn.find(e => e.code === code);
+        const rateHtml = rate !== null
+          ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + rate.toFixed(2) + '%</span>'
+          : '<span class="empty">-</span>';
+        return '<tr class="clickable twoLineRow" data-code="' + code + '">' +
+          '<td>' + starHtml({ code: code, name: name }, '실시간포착') + name +
+          (price ? '<span class="rowPrice">' + fmt(price) + '원</span>' : '') + '</td></tr>' +
+          '<tr class="twoLineSubRow"><td>' + rateHtml +
+          (ev ? ' · <span class="delta">⚡방금 편입 ' + fmtHHMM(ev.time) + '</span>' : '') +
+          '</td></tr>';
+      }).join('');
+
+      tbody.querySelectorAll('tr.twoLineRow').forEach(tr => {
+        tr.addEventListener('click', (e) => {
+          if (e.target.closest('.noRowClick')) return;
+          const code = tr.dataset.code;
+          const item = byCodeMap[code];
+          if (item) { currentModalSourceBoard = '실시간포착'; openStockModal(item); }
+        });
+      });
+    })
+    .catch(() => {});
+}
+loadRealtimeCondition();
+setInterval(() => { if (!document.hidden) loadRealtimeCondition(); }, 3000);
+
 // 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
 function loadMarketIndex() {
   fetch('/api/market-index')
@@ -2363,6 +2431,11 @@ function renderDashboard() {
   <div class="sub" id="ts">불러오는 중...</div>
   <div id="marketIndexBar" style="display:none;"></div>
   <div id="goldenWindowBanner" style="display:none;"></div>
+
+  <div class="board" id="conditionBoard" style="display:none;">
+    <h2>⚡ 실시간 포착 <span class="intervalTag">(조건검색 - 편입 즉시)</span></h2>
+    <table id="conditionList"><tbody><tr><td class="empty">감시 중...</td></tr></tbody></table>
+  </div>
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
@@ -3946,6 +4019,26 @@ self.addEventListener('fetch', (e) => {
               "momentumPositive.avgForwardDeltaPct가 momentumNegative보다 뚜렷하게 크면(양수 우세) " +
               "momentumScore/risingTop5 가정(상승 중이면 계속 상승)이 어느 정도 근거 있는 것. " +
               "차이가 거의 없거나 반대면 가중치 재검토 필요.",
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/realtime-condition") {
+        // relay가 조건검색 웹소켓으로 실시간 감시 중인 결과를 그대로 반환.
+        // 2분 cron 폴링과 달리, 조건에 편입되는 순간 즉시 목록에 나타남.
+        try {
+          const res = await kiwoomRelayFetch(env, "/realtime/condition", { method: "GET" });
+          const data = await res.json();
+          return Response.json({
+            ok: true,
+            wsConnected: data.wsConnected,
+            seq: data.seq,
+            codes: data.codes || [],
+            count: data.count || 0,
+            lastEventAt: data.lastEventAt,
+            events: data.events || [],
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
