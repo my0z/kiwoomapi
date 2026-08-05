@@ -2032,43 +2032,41 @@ function loadRealtimeCondition() {
   fetch('/api/realtime-condition')
     .then(res => res.json())
     .then(data => {
-      const board = document.getElementById('conditionBoard');
+      const board = document.getElementById('conditionDock');
       if (!data.ok || !data.seq) { board.style.display = 'none'; return; }
       board.style.display = 'block';
 
       const tbody = document.querySelector('#conditionList tbody');
       const codes = data.codes || [];
       conditionCodes = codes.slice(0, 50); // 실시간 시세 구독 우선순위에 쓰임
-      // 아직 구독 목록에 없는 포착 종목은 즉시 추가 (다음 load()를 기다리지 않고 바로 시세 받기)
       conditionCodes.forEach(c => {
         if (!realtimeListCodes.includes(c)) realtimeListCodes.unshift(c);
       });
       if (realtimeListCodes.length > 180) realtimeListCodes.length = 180;
 
-      if (!codes.length) {
-        tbody.innerHTML = '<tr><td class="empty">조건 만족 종목 없음 (감시 중)</td></tr>';
+      // 편입 이력 기준으로 표시 - 조건에서 금방 빠져나간 종목도 사라지지 않고 남음
+      const history = data.history || [];
+      const countEl = document.getElementById('conditionDockCount');
+      if (countEl) countEl.textContent = history.length ? '(' + history.length + '건 · 현재 조건 ' + (data.count || 0) + ')' : '';
+      if (!history.length) {
+        tbody.innerHTML = '<tr><td class="empty">아직 포착된 종목 없음 (감시 중)</td></tr>';
         return;
       }
 
-      // 최근 편입 이벤트를 시간순으로 위에 보여줌 (방금 들어온 게 제일 중요)
-      const recentIn = (data.events || []).filter(e => e.action === '편입').slice(0, 10);
-      const recentCodes = recentIn.map(e => e.code);
-      const ordered = [...recentCodes, ...codes.filter(c => !recentCodes.includes(c))];
-
-      tbody.innerHTML = ordered.slice(0, 30).map(code => {
-        const live = liveQuoteCache[code] || byCodeMap[code];
-        const name = (byCodeMap[code] && byCodeMap[code].name) || code;
-        const price = live ? (live.price || 0) : 0;
-        const rate = live ? (live.rate !== undefined ? live.rate : 0) : null;
-        const ev = recentIn.find(e => e.code === code);
-        const rateHtml = rate !== null
-          ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + rate.toFixed(2) + '%</span>'
+      tbody.innerHTML = history.slice(0, 25).map(h => {
+        const live = liveQuoteCache[h.code];
+        const price = live ? live.price : h.price;
+        const rate = live ? live.rate : h.rate;
+        const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
+        const rateHtml = (rate !== null && rate !== undefined)
+          ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + Number(rate).toFixed(2) + '%</span>'
           : '<span class="empty">-</span>';
-        return '<tr class="clickable twoLineRow" data-code="' + code + '">' +
-          '<td>' + starHtml({ code: code, name: name }, '실시간포착') + name +
+        return '<tr class="clickable twoLineRow" data-code="' + h.code + '">' +
+          '<td>' + starHtml({ code: h.code, name: name }, '실시간포착') + name +
           (price ? '<span class="rowPrice">' + fmt(price) + '원</span>' : '') + '</td></tr>' +
           '<tr class="twoLineSubRow"><td>' + rateHtml +
-          (ev ? ' · <span class="delta">⚡방금 편입 ' + fmtHHMM(ev.time) + '</span>' : '') +
+          ' · <span class="delta">⚡' + fmtHHMM(h.time) + ' 포착</span>' +
+          (h.stillIn ? '' : ' · <span class="empty">조건이탈</span>') +
           '</td></tr>';
       }).join('');
 
@@ -2076,15 +2074,35 @@ function loadRealtimeCondition() {
         tr.addEventListener('click', (e) => {
           if (e.target.closest('.noRowClick')) return;
           const code = tr.dataset.code;
-          const item = byCodeMap[code];
-          if (item) { currentModalSourceBoard = '실시간포착'; openStockModal(item); }
+          const h = history.find(x => x.code === code);
+          const live = liveQuoteCache[code];
+          const item = byCodeMap[code] || {
+            code: code,
+            name: (h && h.name) || code,
+            price: live ? live.price : (h ? h.price : 0),
+            rate: live ? live.rate : (h ? h.rate : 0),
+            buyReq: 0, selReq: 0, cntrStr: 0, signalChecks: [], volume: 0,
+          };
+          currentModalSourceBoard = '실시간포착';
+          currentModalAddedState = '';
+          openStockModal(item);
         });
       });
     })
     .catch(() => {});
 }
 loadRealtimeCondition();
-setInterval(() => { if (!document.hidden) loadRealtimeCondition(); }, 3000);
+setInterval(() => { if (!document.hidden) loadRealtimeCondition(); }, 5000);
+
+// 하단 실시간 포착 패널 접기/펼치기 (화면 좁을 때 방해되지 않게)
+document.getElementById('conditionDockHead').addEventListener('click', () => {
+  const dock = document.getElementById('conditionDock');
+  dock.classList.toggle('collapsed');
+  document.getElementById('conditionDockToggle').textContent =
+    dock.classList.contains('collapsed') ? '▲' : '▼';
+  // 접으면 본문 여백도 줄여서 화면을 넓게 씀
+  document.body.style.paddingBottom = dock.classList.contains('collapsed') ? '54px' : '210px';
+});
 
 // 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
 function loadMarketIndex() {
@@ -2220,7 +2238,7 @@ function renderDashboard() {
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <style>
-  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 210px; }
   h1 { font-size:18px; margin:0 0 4px; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
@@ -2387,6 +2405,26 @@ function renderDashboard() {
   .topPicksBoard h2 { color:#ffd43b; }
   .topPicksBoard tr.clickable:active { background:#2a2410; }
   .intervalTag { font-size:11px; color:#888; font-weight:normal; }
+  #conditionDock {
+    position:fixed; left:0; right:0; bottom:0; z-index:80;
+    background:#17171a; border-top:1px solid #333;
+    box-shadow:0 -2px 10px rgba(0,0,0,0.5);
+  }
+  #conditionDockHead {
+    display:flex; justify-content:space-between; align-items:center;
+    padding:7px 12px; font-size:12px; font-weight:600; color:#ffd43b;
+    cursor:pointer; user-select:none;
+  }
+  #conditionDockCount { color:#888; font-weight:normal; font-size:11px; margin-left:4px; }
+  #conditionDockToggle { color:#888; font-size:11px; }
+  #conditionDockBody {
+    max-height:186px; /* 대략 3종목(2줄씩) 정도만 보이고 나머지는 스크롤 */
+    overflow-y:auto; -webkit-overflow-scrolling:touch;
+    padding:0 12px 8px;
+  }
+  #conditionDock.collapsed #conditionDockBody { display:none; }
+  #conditionDockBody table { width:100%; border-collapse:collapse; font-size:13px; }
+  #conditionDockBody td { padding:6px 4px; border-bottom:1px solid #232323; }
   #goldenWindowBanner {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
@@ -2431,11 +2469,6 @@ function renderDashboard() {
   <div class="sub" id="ts">불러오는 중...</div>
   <div id="marketIndexBar" style="display:none;"></div>
   <div id="goldenWindowBanner" style="display:none;"></div>
-
-  <div class="board" id="conditionBoard" style="display:none;">
-    <h2>⚡ 실시간 포착 <span class="intervalTag">(조건검색 - 편입 즉시)</span></h2>
-    <table id="conditionList"><tbody><tr><td class="empty">감시 중...</td></tr></tbody></table>
-  </div>
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
@@ -2506,6 +2539,16 @@ function renderDashboard() {
     <table id="all">
       <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
     </table>
+  </div>
+
+  <div id="conditionDock" style="display:none;">
+    <div id="conditionDockHead">
+      <span>⚡ 실시간 포착 <span id="conditionDockCount"></span></span>
+      <span id="conditionDockToggle">▼</span>
+    </div>
+    <div id="conditionDockBody">
+      <table id="conditionList"><tbody><tr><td class="empty">감시 중...</td></tr></tbody></table>
+    </div>
   </div>
 
   <div id="modalOverlay">
@@ -4038,6 +4081,7 @@ self.addEventListener('fetch', (e) => {
             codes: data.codes || [],
             count: data.count || 0,
             lastEventAt: data.lastEventAt,
+            history: data.history || [],
             events: data.events || [],
           });
         } catch (e) {
