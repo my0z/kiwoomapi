@@ -113,7 +113,7 @@ function isMarketHoursKST(date) {
   const day = kst.getDay(); // 0=Sun
   if (day === 0 || day === 6) return false;
   const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 44; // 09:01 ~ 15:44 (15:38/40/42/44는 놓친 종가 재시도용)
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 46; // 09:01 ~ 15:46 (15:38~46은 놓친 종가 재시도용)
 }
 
 // 장마감(15:30) 직후, 그 시점 화면에 떠 있던 종목들을 하나씩 정확하게 재조회해서
@@ -4469,7 +4469,7 @@ self.addEventListener('fetch', (e) => {
     // cron이 짝수분마다 도니까 15:35 정각은 못 맞고, 가장 가까운 15:36 틱에 한 번만 정확한 종가로 재조회
     const isFinalCloseTick = minutes === 15 * 60 + 36;
     // 15:36에 서브리퀘스트 한도 등으로 놓친 종목을 이어서 채우는 재시도 틱 (매 호출마다 한도가 리셋되므로 유효)
-    const isRetryTick = [15 * 60 + 38, 15 * 60 + 40, 15 * 60 + 42, 15 * 60 + 44].includes(minutes);
+    const isRetryTick = [15 * 60 + 38, 15 * 60 + 40, 15 * 60 + 42, 15 * 60 + 44, 15 * 60 + 46].includes(minutes);
 
     ctx.waitUntil(
       (async () => {
