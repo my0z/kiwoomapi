@@ -1255,6 +1255,9 @@ function computeRecommendations(latest, pullbackCodes) {
   const kstNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
   const kstMinutes = kstNow.getHours() * 60 + kstNow.getMinutes();
   const isLateSession = kstMinutes >= 14 * 60 + 30;
+  // 09:00~09:30은 나무위키 단타매매 기법 기준 가장 활발한 시간대(골든타임 배너와 동일 기준) -
+  // 지금까지는 배너로 알려주기만 하고 정작 점수엔 반영을 안 하고 있었음
+  const isGoldenTime = kstMinutes >= 9 * 60 && kstMinutes <= 9 * 60 + 30;
 
   return [...latest]
     .map(r => {
@@ -1275,6 +1278,15 @@ function computeRecommendations(latest, pullbackCodes) {
       if (r.bidTurnedPositive) score += 4; // 실측 근거 있음 - 기존 3에서 상향
       if (r.buyReqSpike) score += 2.5; // 실측 근거 있음 - 기존 1.5에서 상향
       if (r.sellReqThinning) score += 1.5; // 매수잔량급증과 같은 계열(수급유입) 신호지만 이건 아직 자체 백테스트 전 - 신중하게 작게
+      // 복합신호(강한매수세): 매수전환+매수잔량급증이 동시에 뜨면 개별 신호보다 훨씬 강한 확인 -
+      // 둘 다 검증된 신호가 동시에 나타나는 거라 우연히 겹칠 확률이 낮고, 방향성 있는 진짜 수급일 가능성이 큼
+      if (r.bidTurnedPositive && r.buyReqSpike) score += 2;
+      // 거래량 동반 확인: 호가잔량 신호(매수전환/매수잔량급증)는 취소되는 허수주문에 흔들릴 수 있다는 게
+      // 정석적인 주의사항 - 실제 체결거래량도 같이 튀는 경우만 "진짜 수급"으로 더 신뢰해서 추가 가점
+      const volumeConfirmed = (r.bidTurnedPositive || r.buyReqSpike) && r.volumeSpikeRatio && r.volumeSpikeRatio >= 1.5;
+      if (volumeConfirmed) score += 1.5;
+      // 체결강도 절대수준: 100 넘는지(방향)뿐 아니라 얼마나 강한지도 봄 - 150 이상은 "강한 매수세 유입"이 통상적 해석 기준
+      if ((r.cntr_str || 0) >= 150) score += 1.5;
       if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 표본 부족으로 판단 보류, 기존 유지
       score += (r.relativeStrength || 0) * 0.5;
       if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
@@ -1283,8 +1295,9 @@ function computeRecommendations(latest, pullbackCodes) {
       if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) score -= 2;
       if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
       if (isLateSession) score -= 2; // 오후 늦은 시각 - 마감까지 회복 시간이 부족
+      if (isGoldenTime) score += 1.5; // 09:00~09:30 - 가장 활발한 시간대(골든타임 배너와 동일 기준)
       if (weakMarket) score -= 1.5; // 코스피/코스닥 동반 약세 - 급등주 신호 신뢰도 하락
-      return { ...r, recoScore: score, accelerating };
+      return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: !!volumeConfirmed };
     })
     .sort((a, b) => b.recoScore - a.recoScore)
     .slice(0, 10);
@@ -1626,8 +1639,12 @@ async function load() {
     '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
     ' · 거래량 ' + fmt(r.volume) +
     ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
-    ((r.accelerating || pullbackCodes.has(r.code))
+    ((r.accelerating || r.comboBuySignal || r.volumeConfirmed || pullbackCodes.has(r.code))
       ? '<div class="momentumLine">' +
+        (r.comboBuySignal ? '<span class="delta">🔥강한매수세</span>' : '') +
+        (r.comboBuySignal && (r.volumeConfirmed || r.accelerating || pullbackCodes.has(r.code)) ? ' · ' : '') +
+        (r.volumeConfirmed ? '<span class="delta">✅거래량동반확인</span>' : '') +
+        (r.volumeConfirmed && (r.accelerating || pullbackCodes.has(r.code)) ? ' · ' : '') +
         (r.accelerating ? '<span class="delta">⚡가속중</span>' : '') +
         (r.accelerating && pullbackCodes.has(r.code) ? ' · ' : '') +
         (pullbackCodes.has(r.code) ? '<span class="delta">🌊눌림목재상승</span>' : '') +
@@ -2294,6 +2311,43 @@ document.getElementById('conditionDockHead').addEventListener('click', () => {
 
 // 지난 24시간 안에 확인할 이상상황(relay 끊김/cron실패/메모리경고 등)이 있으면 상단에 배너로 알려줌.
 // 사람이 매번 system-events를 열어보지 않아도 되게 하는 게 목적.
+// Cloudflare 실사용량 패널 - 평소엔 숨겨두고 탭하면 D1/Workers 사용량과 한도 대비 % 보여줌.
+// 관리자 API라 처음 열 때 한 번 키를 물어보고, 그 뒤로는 이 세션 안에서만 기억함(새로고침하면 다시 물어봄).
+let cfAdminKey = null;
+document.getElementById('cfUsageToggle').addEventListener('click', () => {
+  const panel = document.getElementById('cfUsagePanel');
+  if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
+
+  if (!cfAdminKey) {
+    cfAdminKey = prompt('관리자 키 입력 (사용량 조회용)');
+    if (!cfAdminKey) return;
+  }
+  panel.style.display = 'block';
+  panel.innerHTML = '<div class="empty">불러오는 중...</div>';
+
+  fetch('/api/admin/cf-usage?key=' + encodeURIComponent(cfAdminKey))
+    .then(res => res.json())
+    .then(data => {
+      if (!data.ok) {
+        panel.innerHTML = '<div style="color:#ff8787;">' + (data.error || '조회 실패') + '</div>';
+        return;
+      }
+      const bar = (pct) => {
+        const cls = pct >= 80 ? 'danger' : pct >= 50 ? 'warn' : '';
+        return '<div class="cfUsageBar"><div class="cfUsageBarFill ' + cls + '" style="width:' + Math.min(100, pct) + '%"></div></div>';
+      };
+      panel.innerHTML =
+        '<div style="color:#eee; font-weight:600; margin-bottom:4px;">Cloudflare 사용량 (오늘 UTC 기준)</div>' +
+        '<div class="cfUsageRow"><span>Workers 요청</span><span>' + fmt(data.workers.requests) + ' / ' + fmt(data.workers.limitPerDay) + ' (' + data.workers.pct + '%)</span></div>' +
+        bar(data.workers.pct) +
+        '<div class="cfUsageRow" style="margin-top:8px;"><span>D1 읽기행</span><span>' + fmt(data.d1.rowsRead) + ' / ' + fmt(data.d1.limitReadPerDay) + ' (' + data.d1.pctRead + '%)</span></div>' +
+        bar(data.d1.pctRead) +
+        '<div class="cfUsageRow" style="margin-top:8px;"><span>D1 쓰기행</span><span>' + fmt(data.d1.rowsWritten) + ' / ' + fmt(data.d1.limitWritePerDay) + ' (' + data.d1.pctWrite + '%)</span></div>' +
+        bar(data.d1.pctWrite);
+    })
+    .catch(() => { panel.innerHTML = '<div style="color:#ff8787;">조회 오류</div>'; });
+});
+
 function loadSystemStatusBanner() {
   fetch('/api/system-status-summary')
     .then(res => res.json())
@@ -2682,6 +2736,24 @@ function renderDashboard() {
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
     cursor:pointer;
   }
+  #cfUsageToggle {
+    position:fixed; left:14px; top:14px; z-index:95;
+    width:32px; height:32px; border-radius:50%; background:#232323;
+    display:flex; align-items:center; justify-content:center; font-size:14px;
+    opacity:0.5; cursor:pointer;
+  }
+  #cfUsageToggle:active { opacity:1; }
+  #cfUsagePanel {
+    position:fixed; left:14px; top:52px; z-index:95;
+    background:#1c1c1c; border:1px solid #333; border-radius:10px;
+    padding:10px 12px; font-size:11px; color:#aaa; width:220px;
+    box-shadow:0 2px 10px rgba(0,0,0,0.5);
+  }
+  #cfUsagePanel .cfUsageRow { display:flex; justify-content:space-between; margin-top:4px; }
+  #cfUsagePanel .cfUsageBar { background:#333; border-radius:4px; height:4px; margin-top:2px; overflow:hidden; }
+  #cfUsagePanel .cfUsageBarFill { height:100%; background:#69db7c; }
+  #cfUsagePanel .cfUsageBarFill.warn { background:#ffa94d; }
+  #cfUsagePanel .cfUsageBarFill.danger { background:#ff6b6b; }
   #goldenWindowBanner {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
@@ -2725,6 +2797,9 @@ function renderDashboard() {
   <div class="sub" id="ts">불러오는 중...</div>
   <div class="freshnessLegend"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
   <div id="marketIndexBar" style="display:none;"></div>
+  <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
+  <div id="cfUsagePanel" style="display:none;"></div>
+
   <div id="systemStatusBanner" style="display:none;"></div>
   <div id="goldenWindowBanner" style="display:none;"></div>
 
@@ -3596,7 +3671,7 @@ async function computeSignalBacktest(env, tickLimit) {
   const signalNames = [
     "accelerating", "bidTurnedPositive", "cntrStrRising",
     "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
-    "sellReqThinning", "realPullback",
+    "sellReqThinning", "realPullback", "comboBuySignal", "isGoldenTime", "volumeConfirmed", "strongCntrStr",
   ];
   const stats = {};
   signalNames.forEach((name) => {
@@ -3641,6 +3716,18 @@ async function computeSignalBacktest(env, tickLimit) {
         // 개선된 눌림목: 단순 되돌림+재상승이 아니라, 수급 유입 신호(매수전환/매수잔량급증/매도잔량급감) 중
         // 하나라도 동반됐을 때만 인정 - pullbackLike가 역효과였던 것을 이걸로 보완할 수 있는지 검증용
         realPullback: pullbackLike && (bidTurnedPositive || buyReqSpike || sellReqThinning),
+        // 복합신호: 매수전환+매수잔량급증이 동시에 뜨는 경우 - 개별보다 강한 확인 신호일 가능성 검증용
+        comboBuySignal: bidTurnedPositive && buyReqSpike,
+        // 허수주문 방어: 호가잔량 신호가 실제 체결거래량 증가와 같이 왔을 때만 "확인된" 신호로 봄
+        volumeConfirmed: (bidTurnedPositive || buyReqSpike) && prev.volume > 0 && (cur.volume || 0) / prev.volume >= 1.5,
+        // 체결강도 150 이상 - "강한 매수세 유입"의 통상적 해석 기준
+        strongCntrStr: hasOrderFlowData && (cur.cntr_str || 0) >= 150,
+        // 09:00~09:30 골든타임에 발생한 신호인지 (그 자체를 하나의 "신호"로 보고 효과 검증)
+        isGoldenTime: (() => {
+          const kst = new Date(new Date(cur.captured_at).getTime() + 9 * 3600 * 1000);
+          const m = kst.getUTCHours() * 60 + kst.getUTCMinutes();
+          return m >= 9 * 60 && m <= 9 * 60 + 30;
+        })(),
       };
 
       signalNames.forEach((name) => {
@@ -4324,6 +4411,106 @@ self.addEventListener('fetch', (e) => {
             interpretation:
               "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
               "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것.",
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/admin/cf-usage") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        // Cloudflare GraphQL Analytics API로 D1/Workers 실제 사용량 조회.
+        // CLOUDFLARE_API_TOKEN(Account Analytics:Read 권한), CLOUDFLARE_ACCOUNT_ID 시크릿 필요.
+        if (!env.CLOUDFLARE_API_TOKEN || !env.CLOUDFLARE_ACCOUNT_ID) {
+          return Response.json({
+            ok: false,
+            error: "CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 시크릿이 없습니다. Cloudflare 대시보드에서 API 토큰(Account Analytics:Read 권한)을 발급받아 등록해야 합니다.",
+          });
+        }
+
+        const today = new Date().toISOString().slice(0, 10); // UTC 기준 오늘 (Cloudflare 분석도 UTC 기준)
+        const query = `
+          query GetUsage($accountTag: String!, $date: String!) {
+            viewer {
+              accounts(filter: { accountTag: $accountTag }) {
+                d1AnalyticsAdaptiveGroups(
+                  filter: { date: $date }
+                  limit: 50
+                ) {
+                  sum { readQueries writeQueries rowsRead rowsWritten }
+                  dimensions { databaseId }
+                }
+                workersInvocationsAdaptive(
+                  filter: { date: $date }
+                  limit: 50
+                ) {
+                  sum { requests errors subrequests }
+                  dimensions { scriptName }
+                }
+              }
+            }
+          }`;
+
+        try {
+          const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
+            },
+            body: JSON.stringify({
+              query,
+              variables: { accountTag: env.CLOUDFLARE_ACCOUNT_ID, date: today },
+            }),
+          });
+          const data = await res.json();
+          if (data.errors && data.errors.length) {
+            // 쿼리 필드명이 실제 API와 다를 수 있음(문서가 계속 바뀜) - 에러를 그대로 보여줘서 디버깅 가능하게 함
+            return Response.json({ ok: false, error: "Cloudflare API 에러", detail: data.errors }, { status: 500 });
+          }
+
+          const account = data.data?.viewer?.accounts?.[0];
+          const d1Groups = account?.d1AnalyticsAdaptiveGroups || [];
+          const workerGroups = account?.workersInvocationsAdaptive || [];
+
+          const d1Total = d1Groups.reduce(
+            (acc, g) => ({
+              readQueries: acc.readQueries + (g.sum.readQueries || 0),
+              writeQueries: acc.writeQueries + (g.sum.writeQueries || 0),
+              rowsRead: acc.rowsRead + (g.sum.rowsRead || 0),
+              rowsWritten: acc.rowsWritten + (g.sum.rowsWritten || 0),
+            }),
+            { readQueries: 0, writeQueries: 0, rowsRead: 0, rowsWritten: 0 }
+          );
+          const workerTotal = workerGroups.reduce(
+            (acc, g) => ({
+              requests: acc.requests + (g.sum.requests || 0),
+              errors: acc.errors + (g.sum.errors || 0),
+              subrequests: acc.subrequests + (g.sum.subrequests || 0),
+            }),
+            { requests: 0, errors: 0, subrequests: 0 }
+          );
+
+          // 무료 티어 기준 한도 (2026년 기준, Cloudflare 정책 바뀌면 실제 대시보드로 재확인 필요)
+          const limits = {
+            workersRequestsPerDay: 100000,
+            d1RowsReadPerDay: 5000000,
+            d1RowsWrittenPerDay: 100000,
+          };
+
+          return Response.json({
+            ok: true,
+            date: today,
+            workers: { ...workerTotal, limitPerDay: limits.workersRequestsPerDay, pct: +((workerTotal.requests / limits.workersRequestsPerDay) * 100).toFixed(1) },
+            d1: {
+              ...d1Total,
+              limitReadPerDay: limits.d1RowsReadPerDay,
+              limitWritePerDay: limits.d1RowsWrittenPerDay,
+              pctRead: +((d1Total.rowsRead / limits.d1RowsReadPerDay) * 100).toFixed(1),
+              pctWrite: +((d1Total.rowsWritten / limits.d1RowsWrittenPerDay) * 100).toFixed(1),
+            },
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
