@@ -113,7 +113,7 @@ function isMarketHoursKST(date) {
   const day = kst.getDay(); // 0=Sun
   if (day === 0 || day === 6) return false;
   const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 36; // 09:01 ~ 15:36 (15:35 근처 정확한 종가 재조회 포함)
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 44; // 09:01 ~ 15:44 (15:38/40/42/44는 놓친 종가 재시도용)
 }
 
 // 장마감(15:30) 직후, 그 시점 화면에 떠 있던 종목들을 하나씩 정확하게 재조회해서
@@ -291,6 +291,19 @@ async function collectFinalAccurateQuotes(env) {
         (failedCodes.length ? ` - 개별실패: ${failedCodes.slice(0, 15).join(", ")}` : "")
     );
   }
+
+  // 이번에 못 받은 종목은 D1에 남겨둠 - 15:38/40/42/44 틱에서 자동으로 이어서 재시도함
+  // (매번 새 호출이라 서브리퀘스트 한도가 리셋되므로, 나눠서 하면 결국 더 많이 받아올 수 있음)
+  const succeededCodes = new Set(rows.map((r) => r.code));
+  const leftover = targets.filter((t) => !succeededCodes.has(t.code));
+  await env.DB.prepare(`DELETE FROM final_quote_pending`).run().catch(() => {}); // 어제 남은 게 있으면 정리
+  if (leftover.length) {
+    const pendStmt = env.DB.prepare(
+      `INSERT INTO final_quote_pending (code, name, market, captured_at) VALUES (?, ?, ?, ?)`
+    );
+    await env.DB.batch(leftover.map((t) => pendStmt.bind(t.code, t.name, t.market, capturedAt))).catch(() => {});
+  }
+
   if (!rows.length) return { saved: 0 };
 
   const stmt = env.DB.prepare(
@@ -299,7 +312,56 @@ async function collectFinalAccurateQuotes(env) {
   );
   const batch = rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, capturedAt));
   await env.DB.batch(batch);
-  return { saved: rows.length, capturedAt };
+  return { saved: rows.length, capturedAt, leftover: leftover.length };
+}
+
+// 15:36에 서브리퀘스트 한도나 개별 오류로 못 받은 종목들을 15:38/40/42/44 틱에서 이어서 재시도.
+// 매 호출이 새 Worker invocation이라 서브리퀘스트 한도가 그때마다 리셋되므로, 나눠서 시도하면 더 많이 채울 수 있음.
+async function retryFinalQuotePending(env) {
+  const pendRes = await env.DB.prepare(`SELECT code, name, market, captured_at FROM final_quote_pending`).all();
+  let targets = pendRes.results;
+  if (!targets.length) return { retried: 0 };
+
+  try {
+    const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+    const wlCodes = new Set(wlRes.results.map((r) => r.code));
+    if (wlCodes.size) {
+      targets = [...targets].sort((a, b) => (wlCodes.has(b.code) ? 1 : 0) - (wlCodes.has(a.code) ? 1 : 0));
+    }
+  } catch (e) {}
+
+  const token = await kiwoomIssueToken(env);
+  const rows = [];
+  const stillFailed = [];
+  for (const t of targets) {
+    try {
+      const raw = await kiwoomQuote(env, token, t.code);
+      const q = parseKiwoomQuote(raw);
+      rows.push({ ...t, price: q.price, rate: q.rate, volume: q.volume });
+    } catch (e) {
+      if (/Too many subrequests/i.test(String(e.message || e))) break; // 이번 틱도 한도 도달 - 다음 틱에 또 시도
+      stillFailed.push(t);
+    }
+    await sleep(1100);
+  }
+
+  if (rows.length) {
+    const stmt = env.DB.prepare(
+      `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`
+    );
+    await env.DB.batch(
+      rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, s.captured_at))
+    );
+    const doneCodes = rows.map((r) => r.code);
+    const ph = doneCodes.map(() => "?").join(",");
+    await env.DB.prepare(`DELETE FROM final_quote_pending WHERE code IN (${ph})`).bind(...doneCodes).run();
+  }
+
+  if (rows.length) {
+    await logSystemEvent(env, "final_quote_retry_success", `재시도로 ${rows.length}종목 추가 확보 (남은 ${targets.length - rows.length}종목)`);
+  }
+  return { retried: rows.length, stillPending: targets.length - rows.length };
 }
 
 // ---------- Cron: 저장 ----------
@@ -347,6 +409,9 @@ async function purgeOldRows(env) {
   // market_index_cache는 30초마다 행이 생기므로 더 짧게(6시간) 정리
   const indexCutoff = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`).bind(indexCutoff).run().catch(() => {});
+  // signal_backtest_history는 하루 1행이라 부담 적지만, 60일 넘은 건 정리
+  const historyCutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  await env.DB.prepare(`DELETE FROM signal_backtest_history WHERE date < ?`).bind(historyCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
 
   return result.meta?.changes ?? 0;
@@ -2163,7 +2228,24 @@ loadMarketIndex();
 setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 5000); // 5초마다 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
 
 
-// 반대로 14:30 이후는 장 마감까지 시간이 얼마 없어서, 물렸을 때 회복할 기회 자체가 부족함
+// 지난 24시간 안에 확인할 이상상황(relay 끊김/cron실패/메모리경고 등)이 있으면 상단에 배너로 알려줌.
+// 사람이 매번 system-events를 열어보지 않아도 되게 하는 게 목적.
+function loadSystemStatusBanner() {
+  fetch('/api/system-status-summary')
+    .then(res => res.json())
+    .then(data => {
+      const banner = document.getElementById('systemStatusBanner');
+      if (!data.ok || !data.hasIssues) { banner.style.display = 'none'; return; }
+      const summary = data.kinds.map(k => k.kind + ' ' + k.count + '건').join(' · ');
+      banner.textContent = '⚠️ 최근 24시간 확인 필요: ' + summary;
+      banner.style.display = 'block';
+    })
+    .catch(() => {});
+}
+loadSystemStatusBanner();
+setInterval(() => { if (!document.hidden) loadSystemStatusBanner(); }, 120000); // 2분마다
+
+// 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
 function updateGoldenWindowBanner() {
   const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
   const minutes = kst.getHours() * 60 + kst.getMinutes();
@@ -2172,10 +2254,6 @@ function updateGoldenWindowBanner() {
     banner.style.display = 'block';
     banner.className = '';
     banner.textContent = '⏰ 09:00~09:30 활발 시간대';
-  } else if (minutes >= 14 * 60 + 30 && minutes <= 15 * 60 + 30) {
-    banner.style.display = 'block';
-    banner.className = 'lateWarning';
-    banner.textContent = '⚠️ 14:30 이후 - 마감까지 시간이 짧아 신규 진입 시 회복 기회가 적습니다';
   } else {
     banner.style.display = 'none';
   }
@@ -2511,11 +2589,15 @@ function renderDashboard() {
   .dockRate { text-align:right; white-space:nowrap; width:72px; }
   .dockTime { text-align:right; white-space:nowrap; width:64px; font-size:11px; color:#888; }
   .dockIcons { font-size:11px; }
+  #systemStatusBanner {
+    background:#2a1616; color:#ff8787; font-weight:600;
+    font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
+    cursor:pointer;
+  }
   #goldenWindowBanner {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
   }
-  #goldenWindowBanner.lateWarning { background:linear-gradient(90deg,#4d5b6b,#8a939c); color:#fff; }
   #marketIndexBar {
     display:flex; gap:14px; font-size:12px; color:#aaa;
     background:#1c1c1c; border-radius:10px; padding:8px 12px; margin-bottom:14px;
@@ -2554,6 +2636,7 @@ function renderDashboard() {
   <h1>🔥 급등주 스크리너</h1>
   <div class="sub" id="ts">불러오는 중...</div>
   <div id="marketIndexBar" style="display:none;"></div>
+  <div id="systemStatusBanner" style="display:none;"></div>
   <div id="goldenWindowBanner" style="display:none;"></div>
 
   <div class="board">
@@ -3334,7 +3417,8 @@ function checkAdminKeyHeaderOnly(request, env) {
 // ---------- 엔트리포인트 ----------
 // relay/웹소켓이 죽어있으면 조용히 묻히지 않게 system_events에 기록.
 // 매 틱마다 기록하면 로그가 도배되니, 상태가 "바뀐 순간"에만 남김 (정상->비정상, 비정상->정상).
-let lastKnownRelayHealthy = null; // 모듈 스코프 - Worker 인스턴스가 재사용되는 동안은 상태 기억, 재시작되면 초기화(그럼 다음 틱에 한번 더 기록될 뿐 무해)
+let lastKnownRelayHealthy = null;
+let lastKnownMemoryHigh = false; // 메모리 위험 상태도 변화 시점에만 기록 (매 틱마다 도배 방지)
 async function checkRelayHealthForCron(env) {
   let healthy = false;
   let detail = "";
@@ -3343,6 +3427,16 @@ async function checkRelayHealthForCron(env) {
     const data = await res.json();
     healthy = !!(data.wsConnected && data.wsLoggedIn);
     detail = `wsConnected=${data.wsConnected} wsLoggedIn=${data.wsLoggedIn} lastMessageAt=${data.lastMessageAt}`;
+
+    // Oracle E2.1.Micro는 메모리 1GB - 상시 웹소켓+REST중계+종목명조회까지 얹혀있어서
+    // 여유 없이 죽을 수 있음. 위험 수준이면 알아채기 전에 미리 기록해둠.
+    const memoryHigh = typeof data.memoryRssMb === "number" && data.memoryRssMb >= 400;
+    if (memoryHigh && !lastKnownMemoryHigh) {
+      await logSystemEvent(env, "relay_memory_high", `relay 메모리 사용량 ${data.memoryRssMb}MB (1GB 중) - 여유 확인 필요`);
+    } else if (!memoryHigh && lastKnownMemoryHigh) {
+      await logSystemEvent(env, "relay_memory_normal", `relay 메모리 정상화: ${data.memoryRssMb}MB`);
+    }
+    lastKnownMemoryHigh = memoryHigh;
   } catch (e) {
     detail = "relay 접속 실패: " + (e.message || e);
   }
@@ -3358,6 +3452,112 @@ async function checkRelayHealthForCron(env) {
     await logSystemEvent(env, "relay_recovered", "웹소켓 복구됨: " + detail);
   }
   lastKnownRelayHealthy = healthy;
+}
+
+// backtest-signals의 실측 로직 - HTTP 엔드포인트와 매일 자동 실행 cron 둘 다에서 씀
+async function computeSignalBacktest(env, tickLimit) {
+  const timesRes = await env.DB.prepare(
+    `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
+  )
+    .bind(tickLimit)
+    .all();
+  const times = timesRes.results.map((r) => r.captured_at).reverse(); // 과거 -> 최신
+  if (times.length < 4) {
+    return { ok: false, error: "분석할 틱이 부족합니다 (최소 4틱 필요)" };
+  }
+
+  // times는 같은 테이블에서 뽑은 연속된 captured_at 값들이라, IN절 대신 범위(BETWEEN)로 조회해도
+  // 결과가 동일함 - 파라미터를 300개씩 바인딩하면 D1 변수 개수 제한에 걸려서 이렇게 바꿈
+  const rowsRes = await env.DB.prepare(
+    `SELECT code, change_rate, volume, cntr_str, buy_req, sel_req, captured_at
+     FROM snapshots WHERE captured_at >= ? AND captured_at <= ?`
+  )
+    .bind(times[0], times[times.length - 1])
+    .all();
+
+  const byCode = new Map();
+  for (const r of rowsRes.results) {
+    if (!byCode.has(r.code)) byCode.set(r.code, new Map());
+    byCode.get(r.code).set(r.captured_at, r);
+  }
+
+  const signalNames = [
+    "accelerating", "bidTurnedPositive", "cntrStrRising",
+    "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
+  ];
+  const stats = {};
+  signalNames.forEach((name) => {
+    stats[name] = { trueCount: 0, trueForwardSum: 0, falseCount: 0, falseForwardSum: 0 };
+  });
+  let baselineCount = 0, baselineForwardSum = 0;
+
+  for (const [code, rowByTime] of byCode) {
+    let runningMaxRate = -Infinity;
+    for (let i = 2; i < times.length - 1; i++) {
+      const older = rowByTime.get(times[i - 2]);
+      const prev = rowByTime.get(times[i - 1]);
+      const cur = rowByTime.get(times[i]);
+      const next = rowByTime.get(times[i + 1]);
+      if (!older || !prev || !cur) continue;
+      if (cur.change_rate > runningMaxRate) runningMaxRate = cur.change_rate;
+      if (!next) continue;
+
+      const forwardDelta = next.change_rate - cur.change_rate;
+      baselineCount++;
+      baselineForwardSum += forwardDelta;
+
+      const recentDelta = cur.change_rate - prev.change_rate;
+      const olderDelta = prev.change_rate - older.change_rate;
+      const signals = {
+        accelerating: recentDelta > olderDelta,
+        bidTurnedPositive: (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0),
+        cntrStrRising: (cur.cntr_str || 0) > (prev.cntr_str || 0),
+        buyReqSpike: prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5,
+        volumeSpike: prev.volume > 0 && (cur.volume || 0) / prev.volume >= 2,
+        isTodayHigh: cur.change_rate >= runningMaxRate - 0.001,
+        pullbackLike: runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0,
+      };
+
+      signalNames.forEach((name) => {
+        const bucket = signals[name] ? "true" : "false";
+        stats[name][bucket + "Count"]++;
+        stats[name][bucket + "ForwardSum"] += forwardDelta;
+      });
+    }
+  }
+
+  const baselineAvg = baselineCount ? +(baselineForwardSum / baselineCount).toFixed(4) : null;
+  const results = {};
+  signalNames.forEach((name) => {
+    const s = stats[name];
+    const trueAvg = s.trueCount ? +(s.trueForwardSum / s.trueCount).toFixed(4) : null;
+    const falseAvg = s.falseCount ? +(s.falseForwardSum / s.falseCount).toFixed(4) : null;
+    results[name] = {
+      sampleSize: s.trueCount,
+      avgForwardDeltaWhenTrue: trueAvg,
+      avgForwardDeltaWhenFalse: falseAvg,
+      edgeVsBaseline: trueAvg !== null && baselineAvg !== null ? +(trueAvg - baselineAvg).toFixed(4) : null,
+    };
+  });
+
+  return {
+    ok: true,
+    ticksAnalyzed: times.length,
+    baselineAvgForwardDeltaPct: baselineAvg,
+    signals: results,
+  };
+}
+
+// 매일 장마감 후 한 번, 그날치 신호 검증 결과를 자동으로 남김 - 사람이 매번 URL 안 열어봐도 이력이 쌓이게 함
+async function runDailySignalBacktest(env) {
+  const result = await computeSignalBacktest(env, 300);
+  if (!result.ok) return;
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO signal_backtest_history (date, result_json, created_at) VALUES (?, ?, ?)`
+  )
+    .bind(new Date().toISOString().slice(0, 10), JSON.stringify(result), new Date().toISOString())
+    .run()
+    .catch(() => {});
 }
 
 export default {
@@ -4001,6 +4201,26 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      if (url.pathname === "/api/admin/backtest-history") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        try {
+          const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10) || 14, 60);
+          const res = await env.DB.prepare(
+            `SELECT date, result_json FROM signal_backtest_history ORDER BY date DESC LIMIT ?`
+          )
+            .bind(days)
+            .all();
+          return Response.json({
+            ok: true,
+            days: res.results.map((r) => ({ date: r.date, ...JSON.parse(r.result_json) })),
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/admin/backtest-signals") {
         if (!checkAdminKey(request, url, env)) {
           return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
@@ -4010,97 +4230,10 @@ self.addEventListener('fetch', (e) => {
         // 이 결과를 보고 효과 없는 건 빼고, 효과 큰 건 가중치를 올리는 식으로 재조정해야 함.
         try {
           const tickLimit = Math.min(parseInt(url.searchParams.get("ticks") || "300", 10) || 300, 1000);
-          const timesRes = await env.DB.prepare(
-            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
-          )
-            .bind(tickLimit)
-            .all();
-          const times = timesRes.results.map((r) => r.captured_at).reverse(); // 과거 -> 최신
-          if (times.length < 4) {
-            return Response.json({ ok: false, error: "분석할 틱이 부족합니다 (최소 4틱 필요)" });
-          }
-
-          // times는 같은 테이블에서 뽑은 연속된 captured_at 값들이라, IN절 대신 범위(BETWEEN)로 조회해도
-          // 결과가 동일함 - 파라미터를 300개씩 바인딩하면 D1 변수 개수 제한에 걸려서 이렇게 바꿈
-          const rowsRes = await env.DB.prepare(
-            `SELECT code, change_rate, volume, cntr_str, buy_req, sel_req, captured_at
-             FROM snapshots WHERE captured_at >= ? AND captured_at <= ?`
-          )
-            .bind(times[0], times[times.length - 1])
-            .all();
-
-          // code별로 시간순 정렬된 배열 구성
-          const byCode = new Map();
-          for (const r of rowsRes.results) {
-            if (!byCode.has(r.code)) byCode.set(r.code, new Map());
-            byCode.get(r.code).set(r.captured_at, r);
-          }
-
-          const signalNames = [
-            "accelerating", "bidTurnedPositive", "cntrStrRising",
-            "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
-          ];
-          const stats = {};
-          signalNames.forEach((name) => {
-            stats[name] = { trueCount: 0, trueForwardSum: 0, falseCount: 0, falseForwardSum: 0 };
-          });
-          let baselineCount = 0, baselineForwardSum = 0;
-
-          for (const [code, rowByTime] of byCode) {
-            // 이 종목의 당일 등락률 최고치를 순차적으로 갱신하며(그 시점까지 알 수 있던 값만 사용 - 미래 데이터 안 씀)
-            let runningMaxRate = -Infinity;
-            for (let i = 2; i < times.length - 1; i++) {
-              const older = rowByTime.get(times[i - 2]);
-              const prev = rowByTime.get(times[i - 1]);
-              const cur = rowByTime.get(times[i]);
-              const next = rowByTime.get(times[i + 1]);
-              if (!older || !prev || !cur) continue; // 아직 등장 전이던 구간은 스킵 (runningMax는 실제 등장 시점부터 계산)
-              if (cur.change_rate > runningMaxRate) runningMaxRate = cur.change_rate;
-              if (!next) continue; // forwardDelta 계산 불가 - 결과 집계만 스킵 (runningMax 갱신은 위에서 이미 함)
-
-              const forwardDelta = next.change_rate - cur.change_rate;
-              baselineCount++;
-              baselineForwardSum += forwardDelta;
-
-              const recentDelta = cur.change_rate - prev.change_rate;
-              const olderDelta = prev.change_rate - older.change_rate;
-              const signals = {
-                accelerating: recentDelta > olderDelta,
-                bidTurnedPositive: (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0),
-                cntrStrRising: (cur.cntr_str || 0) > (prev.cntr_str || 0),
-                buyReqSpike: prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5,
-                volumeSpike: prev.volume > 0 && (cur.volume || 0) / prev.volume >= 2,
-                isTodayHigh: cur.change_rate >= runningMaxRate - 0.001,
-                pullbackLike: runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0,
-              };
-
-              signalNames.forEach((name) => {
-                const bucket = signals[name] ? "true" : "false";
-                stats[name][bucket + "Count"]++;
-                stats[name][bucket + "ForwardSum"] += forwardDelta;
-              });
-            }
-          }
-
-          const baselineAvg = baselineCount ? +(baselineForwardSum / baselineCount).toFixed(4) : null;
-          const results = {};
-          signalNames.forEach((name) => {
-            const s = stats[name];
-            const trueAvg = s.trueCount ? +(s.trueForwardSum / s.trueCount).toFixed(4) : null;
-            const falseAvg = s.falseCount ? +(s.falseForwardSum / s.falseCount).toFixed(4) : null;
-            results[name] = {
-              sampleSize: s.trueCount,
-              avgForwardDeltaWhenTrue: trueAvg,
-              avgForwardDeltaWhenFalse: falseAvg,
-              edgeVsBaseline: trueAvg !== null && baselineAvg !== null ? +(trueAvg - baselineAvg).toFixed(4) : null,
-            };
-          });
-
+          const result = await computeSignalBacktest(env, tickLimit);
+          if (!result.ok) return Response.json(result);
           return Response.json({
-            ok: true,
-            ticksAnalyzed: times.length,
-            baselineAvgForwardDeltaPct: baselineAvg,
-            signals: results,
+            ...result,
             interpretation:
               "edgeVsBaseline이 뚜렷한 양수면 그 신호가 실제로 다음 틱 상승폭을 키우는 효과가 있다는 뜻(가중치 유지/상향 근거). " +
               "0에 가깝거나 음수면 그 신호는 추천점수에서 가중치를 낮추거나 빼는 걸 검토. " +
@@ -4234,6 +4367,32 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      if (url.pathname === "/api/system-status-summary") {
+        // 화면 상단 배너용 - 세부 메시지는 안 주고 "확인할 게 있는지"만 알려줌 (관리자키 불필요, 안전)
+        try {
+          const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+          const res = await env.DB.prepare(
+            `SELECT kind, COUNT(*) as cnt, MAX(created_at) as latest FROM system_events
+             WHERE created_at >= ? AND kind IN
+               ('relay_unhealthy', 'cron_failure', 'final_quote_partial_failure', 'relay_memory_high')
+             GROUP BY kind`
+          )
+            .bind(cutoff)
+            .all()
+            .catch(() => ({ results: [] }));
+          const issues = res.results || [];
+          const totalCount = issues.reduce((s, r) => s + r.cnt, 0);
+          return Response.json({
+            ok: true,
+            hasIssues: totalCount > 0,
+            totalCount,
+            kinds: issues.map((r) => ({ kind: r.kind, count: r.cnt, latest: r.latest })),
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/relay-health") {
         // relay VM이 살아있는지 + 웹소켓이 실제로 연결/로그인 상태인지 한 번에 확인
         // (relay 프로세스는 살아있는데 웹소켓만 조용히 끊긴 경우를 잡기 위함)
@@ -4309,11 +4468,18 @@ self.addEventListener('fetch', (e) => {
     const minutes = kst.getHours() * 60 + kst.getMinutes();
     // cron이 짝수분마다 도니까 15:35 정각은 못 맞고, 가장 가까운 15:36 틱에 한 번만 정확한 종가로 재조회
     const isFinalCloseTick = minutes === 15 * 60 + 36;
+    // 15:36에 서브리퀘스트 한도 등으로 놓친 종목을 이어서 채우는 재시도 틱 (매 호출마다 한도가 리셋되므로 유효)
+    const isRetryTick = [15 * 60 + 38, 15 * 60 + 40, 15 * 60 + 42, 15 * 60 + 44].includes(minutes);
 
     ctx.waitUntil(
       (async () => {
         if (isFinalCloseTick) {
           await collectFinalAccurateQuotes(env);
+          await runDailySignalBacktest(env).catch((e) => {
+            console.error("일일 신호 백테스트 실패:", e.message || e);
+          });
+        } else if (isRetryTick) {
+          await retryFinalQuotePending(env);
         } else {
           await collectAndStore(env);
           await checkWatchlistRiskLevels(env).catch((e) => {
@@ -4326,7 +4492,7 @@ self.addEventListener('fetch', (e) => {
         }
       })().catch((e) => {
         console.error("scheduled 수집 실패:", e.message || e);
-        return logSystemEvent(env, "cron_failure", `${isFinalCloseTick ? "최종재조회" : "배치수집"} 실패: ${e.message || e}`);
+        return logSystemEvent(env, "cron_failure", `${isFinalCloseTick ? "최종재조회" : isRetryTick ? "종가재시도" : "배치수집"} 실패: ${e.message || e}`);
       })
     );
   },
