@@ -1415,6 +1415,27 @@ function renderMomentumLine(momentum) {
 }
 
 // 1줄: 별표+종목명+현재가, 2줄: 나머지 정보 — 모든 리스트(TOP20/연속상승/전체목록)가 공용으로 사용
+// 종합신호등: 배지 9개를 일일이 조합해서 읽지 않아도, 한눈에 강세/중립/주의를 판단할 수 있게 함.
+// 백테스트로 검증된 방향(매수전환/매수잔량급증 = 긍정, 당일신고가 = 부정)에 가중치를 크게 두고,
+// 검증 안 된 신호(가속중 등)는 아예 안 씀 - 확실한 근거만 반영.
+function computeVerdict(r) {
+  let score = 0;
+  const mom = r.momentum || [];
+  const recentDelta = mom[0] ? mom[0].delta : 0;
+  score += recentDelta * 2; // 지금 이 순간의 방향
+  if (r.bidTurnedPositive) score += 2;
+  if (r.buyReqSpike) score += 1.5;
+  if (r.sellReqThinning) score += 1;
+  if (r.isTodayHigh) score -= 1.5; // 백테스트상 역효과 - 이미 고점이라 되레 감점
+  if ((r.change_rate || 0) >= 28) score -= 3; // 상한가 임박 - 여력 없음
+  if ((r.price || 0) < 2000) score -= 1.5; // 동전주 위험
+  if (recentDelta < 0) score -= 2; // 지금 꺾이는 중
+
+  if (score >= 3) return { emoji: '🟢', cls: 'verdictUp' };
+  if (score <= -3) return { emoji: '🔴', cls: 'verdictDown' };
+  return { emoji: '🟡', cls: 'verdictMid' };
+}
+
 function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick, boardLabel) {
   onRowClick = onRowClick || (item => {
     const mapped = byCodeMap[item.code];
@@ -1438,7 +1459,9 @@ function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick, b
 
   let prevNode = null; // 직전 항목의 sub row (다음 항목의 main row가 이 바로 뒤에 와야 함)
   items.forEach(item => {
-    const nameHtml = starHtml(item, boardLabel) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
+    const verdict = computeVerdict(item);
+    const nameHtml = '<span class="verdictIcon ' + verdict.cls + '">' + verdict.emoji + '</span>' +
+      starHtml(item, boardLabel) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
     const line2Html = buildLine2(item) + renderMomentumLine(item.momentum) + renderBadges(item);
     let mainTr = existingMain[item.code];
     let subTr;
@@ -1619,9 +1642,12 @@ async function load() {
   byCodeMap = {};
   [...data.streak5, ...data.streak3, ...data.risingTop5, ...data.latest].forEach(r => {
     byCodeMap[r.code] = {
-      code: r.code, name: r.name, price: r.price, rate: r.change_rate,
+      code: r.code, name: r.name, price: r.price, rate: r.change_rate, change_rate: r.change_rate,
       buyReq: r.buy_req || 0, selReq: r.sel_req || 0, cntrStr: r.cntr_str || 0,
       signalChecks: r.signalChecks || [], volume: r.volume || 0,
+      // 신호등(computeVerdict) 계산에 필요한 필드들 - 실시간포착 패널에서도 신호등 쓰려고 같이 담아둠
+      momentum: r.momentum || [], isTodayHigh: r.isTodayHigh, bidTurnedPositive: r.bidTurnedPositive,
+      buyReqSpike: r.buyReqSpike, sellReqThinning: r.sellReqThinning,
     };
   });
 
@@ -1647,7 +1673,11 @@ async function load() {
   watchlistLastKnownMap = {};
   (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
   watchlistRiskMap = {};
-  (data.watchlistRisk || []).forEach(r => { watchlistRiskMap[r.code] = r.status; });
+  watchlistRiskLevelMap = {}; // { code: { stopLoss, takeProfit } } - 손절/익절 라인 인라인 표시용
+  (data.watchlistRisk || []).forEach(r => {
+    watchlistRiskMap[r.code] = r.status;
+    watchlistRiskLevelMap[r.code] = { stopLoss: r.stop_loss, takeProfit: r.take_profit };
+  });
   watchlistExitMap = {};
   (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
   renderWatchlist(data.watchlist || []);
@@ -1699,6 +1729,8 @@ function formatAddedDate(isoString) {
 
 let watchlistLastKnownMap = {}; // 밴드 밖 종목의 D1 마지막 저장 시세 (load()에서 채워짐)
 let watchlistRiskMap = {}; // { code: 'safe'|'stop_loss_hit'|'take_profit_hit' } - cron이 미리 체크해둔 것 (load()에서 채워짐)
+let watchlistRiskLevelMap = {}; // { code: { stopLoss, takeProfit } } - 손절/익절 라인 인라인 표시용 (load()에서 채워짐)
+let prevRiskState = {}; // { code: status } - 손절/익절 알림 중복 방지용
 let watchlistExitMap = {}; // { code: [이탈신호 사유들] } - 손절선 전 미리 나타나는 약세 징후 (load()에서 채워짐)
 
 // ---------- 관심종목 미니 캔들차트 (1분봉) ----------
@@ -1858,6 +1890,13 @@ function renderWatchlist(items) {
           (r.pnl.netPnlPct >= 0 ? '+' : '') + r.pnl.netPnlPct.toFixed(2) + '% (' + (r.pnl.netPnlAmount >= 0 ? '+' : '') + fmt(r.pnl.netPnlAmount) + '원)</span>'
         : (r.entryPrice === null ? '<span class="empty">진입가 확정중</span>' : '<span class="empty">시세 없음</span>');
       const riskStatus = watchlistRiskMap[r.code];
+      if ((riskStatus === 'stop_loss_hit' || riskStatus === 'take_profit_hit') && prevRiskState[r.code] !== riskStatus) {
+        sendNotify(
+          (riskStatus === 'stop_loss_hit' ? '⚠️ ' : '🎯 ') + r.name + (riskStatus === 'stop_loss_hit' ? ' 손절선 도달' : ' 익절선 도달'),
+          fmt(r.price || 0) + '원'
+        );
+      }
+      prevRiskState[r.code] = riskStatus;
       const riskBadgeHtml = riskStatus === 'stop_loss_hit'
         ? '<div class="riskBadge riskBadgeDown">⚠️ 손절선 도달</div>'
         : riskStatus === 'take_profit_hit'
@@ -1866,6 +1905,10 @@ function renderWatchlist(items) {
       const exitReasons = watchlistExitMap[r.code];
       const exitBadgeHtml = exitReasons && exitReasons.length
         ? '<div class="riskBadge riskBadgeExit">🔻이탈신호: ' + exitReasons.join(' · ') + '</div>'
+        : '';
+      const levels = watchlistRiskLevelMap[r.code];
+      const riskLevelHtml = (levels && levels.stopLoss && levels.takeProfit)
+        ? '<div class="riskLevelLine">손절 ' + fmt(levels.stopLoss) + ' · 익절 ' + fmt(levels.takeProfit) + '</div>'
         : '';
       const addedContextHtml = (r.sourceBoard || r.addedState)
         ? '<div class="addedContext">' +
@@ -1876,7 +1919,7 @@ function renderWatchlist(items) {
         : '';
       return (
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
-          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskBadgeHtml + exitBadgeHtml +
+          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskLevelHtml + riskBadgeHtml + exitBadgeHtml +
           '<div class="riskBadge riskBadgeExit realtimeExitBadge" data-code="' + r.code + '" style="display:none;"></div>' +
           '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
@@ -2124,9 +2167,10 @@ function loadRealtimeCondition() {
           if (info.cntrStr >= 105) icons += '💪';
           if (info.buyReq > info.selReq) icons += '🔄';
         }
+        const verdictHtml = info ? '<span class="verdictIcon">' + computeVerdict(info).emoji + '</span>' : '';
         return '<tr class="clickable dockRow' + (h.stillIn ? '' : ' dockRowOut') + '" data-code="' + h.code + '">' +
           '<td class="dockStar">' + starHtml({ code: h.code, name: name }, '실시간포착') + '</td>' +
-          '<td class="dockName">' + name + (icons ? ' <span class="dockIcons">' + icons + '</span>' : '') + '</td>' +
+          '<td class="dockName">' + verdictHtml + name + (icons ? ' <span class="dockIcons">' + icons + '</span>' : '') + '</td>' +
           '<td class="dockRate">' + rateHtml + '</td>' +
           '<td class="dockTime">' + (h.initial ? '<span class="empty">충족중</span>' : '⚡' + fmtHHMM(h.time)) + '</td>' +
           '</tr>';
@@ -2253,6 +2297,28 @@ function refreshRealtimeWatchlist() {
 // cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
 // "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
 const prevCntrStrMap = {}; // 직전 체결강도 - 급락 감지에 씀
+// 브라우저 알림 - 탭을 안 보고 있어도 강한 신호(관심종목 이탈신호, 손절/익절 도달)를 놓치지 않게 함.
+// 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
+let notifyEnabled = false;
+function requestNotifyPermission() {
+  if (!('Notification' in window)) return;
+  Notification.requestPermission().then(perm => { notifyEnabled = perm === 'granted'; updateNotifyButton(); });
+}
+function updateNotifyButton() {
+  const btn = document.getElementById('notifyToggleBtn');
+  if (!btn) return;
+  btn.textContent = notifyEnabled ? '🔔 알림 켜짐' : '🔕 알림 꺼짐';
+  btn.classList.toggle('active', notifyEnabled);
+}
+function sendNotify(title, body) {
+  // 탭을 보고 있을 때는 화면 배지로 이미 보이니 중복 알림 안 함 - 백그라운드일 때만 브라우저 알림
+  if (!notifyEnabled || !document.hidden) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    new Notification(title, { body: body, tag: title }); // tag로 같은 종목 알림 중복 안 쌓이게
+  } catch (e) {}
+}
+
 function updateRealtimeExitSignal(code, s) {
   const badge = document.querySelector('.realtimeExitBadge[data-code="' + code + '"]');
   if (!badge) return; // 관심종목이 아니면(리스트 종목이면) 해당 없음
@@ -2274,10 +2340,18 @@ function updateRealtimeExitSignal(code, s) {
   if (reasons.length) {
     badge.style.display = '';
     badge.innerHTML = '⚡실시간: ' + reasons.join(' · ');
+    // 새로 생긴 이탈신호일 때만 알림 (매 갱신마다 반복 알림 안 되게, 직전엔 없었던 경우만)
+    if (!prevRealtimeExitState[code]) {
+      const name = (w && w.name) || (byCodeMap[code] && byCodeMap[code].name) || code;
+      sendNotify('⚡ ' + name + ' 이탈신호', reasons.join(' · '));
+    }
+    prevRealtimeExitState[code] = true;
   } else {
     badge.style.display = 'none';
+    prevRealtimeExitState[code] = false;
   }
 }
+const prevRealtimeExitState = {}; // { code: true|false } - 알림 중복 방지용
 
 // 리스트(전체목록/추천/TOP20 등)에 이미 그려진 행의 가격·등락률만 실시간 값으로 갈아끼움.
 // 행 전체를 다시 그리지 않아서 스크롤/깜빡임 없음.
@@ -2346,6 +2420,11 @@ function renderDashboard() {
 <style>
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
+  #notifyToggleBtn {
+    font-size:11px; background:#232323; color:#888; border:none; border-radius:8px;
+    padding:4px 8px; margin-left:8px; vertical-align:middle; cursor:pointer;
+  }
+  #notifyToggleBtn.active { background:#1c2a1c; color:#69db7c; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
   .board h2 { font-size:14px; margin:0 0 8px; color:#ff6b6b; }
@@ -2476,6 +2555,8 @@ function renderDashboard() {
   .pnlNegative { color:#4d9fff; }
   .addedDate { font-size:10px; color:#666; font-weight:normal; }
   .addedContext { font-size:10px; color:#8ea8ff; font-weight:normal; margin-top:1px; }
+  .riskLevelLine { font-size:10px; color:#888; margin-top:1px; }
+  .verdictIcon { margin-right:2px; font-size:12px; }
   .riskBadge { font-size:10px; font-weight:700; margin-top:2px; }
   .riskBadgeDown { color:#4d9fff; }
   .riskBadgeUp { color:#ff6b6b; }
@@ -2594,7 +2675,7 @@ function renderDashboard() {
   <button id="reloadBtn" title="화면 새로고침">🔄</button>
   <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
-  <h1>🔥 급등주 스크리너</h1>
+  <h1>🔥 급등주 스크리너 <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button></h1>
   <div class="sub" id="ts">불러오는 중...</div>
   <div id="marketIndexBar" style="display:none;"></div>
   <div id="systemStatusBanner" style="display:none;"></div>
@@ -3696,7 +3777,7 @@ self.addEventListener('fetch', (e) => {
         // cron이 미리 체크해둔 손절/익절 도달 상태 (모달 안 열어도 바로 보이게)
         if (data.watchlist.length) {
           try {
-            const riskRes = await env.DB.prepare(`SELECT code, status FROM watchlist_risk_status`).all();
+            const riskRes = await env.DB.prepare(`SELECT code, status, price, stop_loss, take_profit FROM watchlist_risk_status`).all();
             data.watchlistRisk = riskRes.results;
           } catch (e) {
             data.watchlistRisk = []; // watchlist_risk_status 테이블이 아직 없을 수 있음
