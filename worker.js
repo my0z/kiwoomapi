@@ -1829,7 +1829,7 @@ function renderWatchlist(items) {
   }
 
   queueMiniCandleFetches(items.map(w => w.code));
-  queueLiveQuoteFetches(items.map(w => w.code));
+  refreshRealtimeWatchlist(); // 실시간 시세 즉시 1회 (이후는 3초 타이머가 담당)
   tbody.querySelectorAll('.tradeDelBtn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2049,11 +2049,33 @@ let mainRefreshTimer = setInterval(() => {
   load();
 }, 10000); // 10초마다 화면 갱신 (D1만 읽어오는 거라 키움 제한과 무관, 저장 자체는 cron이 2분마다)
 
+// 관심종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 그대로 읽어옴.
+// 기존엔 종목당 키움 TR을 1.1초 간격으로 폴링했지만(20초 주기), 이제 TR 호출 0건이라 3초마다 가능.
+function refreshRealtimeWatchlist() {
+  if (!watchlistItems.length) return;
+  fetch('/api/realtime-watchlist')
+    .then(res => res.json())
+    .then(data => {
+      if (!data.ok || !data.stocks) return;
+      let updated = false;
+      for (const code of Object.keys(data.stocks)) {
+        const s = data.stocks[code];
+        if (!s || !s.price) continue;
+        liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
+        updateWatchlistPriceCells(code);
+        if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
+        updated = true;
+      }
+      return updated;
+    })
+    .catch(() => {});
+}
+
 setInterval(() => {
   if (document.hidden) return;
-  refreshLiveQuotes(watchlistItems.map(w => w.code)); // 캐시 안 지우고 도착하는 대로 덮어씀 (깜빡임 방지)
+  refreshRealtimeWatchlist();
   // 미니 캔들차트는 한 번 로딩되면 다시 그리지 않음 (miniCandleCache 안 비움)
-}, 20000); // 관심종목 실시간 시세는 20초마다 갱신 시도 (진행 중이면 자동 스킵되는 가드 있어 안전)
+}, 3000); // 관심종목 실시간 시세 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) load(); // 화면 복귀 시 즉시 최신화
@@ -3240,20 +3262,26 @@ self.addEventListener('fetch', (e) => {
             if (recentTimes.length >= 2) {
               const tph = recentTimes.map(() => "?").join(",");
               const histRes = await env.DB.prepare(
-                `SELECT code, change_rate, cntr_str, buy_req, sel_req, captured_at
+                `SELECT code, change_rate, price, cntr_str, buy_req, sel_req, captured_at
                  FROM snapshots WHERE code IN (${ph}) AND captured_at IN (${tph})`
               )
                 .bind(...wlCodes, ...recentTimes)
                 .all();
-              // 당일 고점(등락률 기준) - 고점 대비 얼마나 밀렸는지 판단용
-              const todayPrefix2 = recentTimes[0].slice(0, 10);
-              const maxRes = await env.DB.prepare(
-                `SELECT code, MAX(change_rate) AS maxRate FROM snapshots
-                 WHERE code IN (${ph}) AND captured_at LIKE ? GROUP BY code`
-              )
-                .bind(...wlCodes, todayPrefix2 + "%")
-                .all();
-              const maxMap = new Map(maxRes.results.map((r) => [r.code, r.maxRate]));
+              // 고점 기준을 "담은 시점 이후"로 잡음.
+              // 오늘 전체 고점으로 잡으면, 이미 고점 찍고 내려온 종목을 담는 순간 바로 이탈신호가 떠서 무의미함.
+              // 실제로 알고 싶은 건 "내가 담은 뒤로 어떻게 됐는지"이므로 added_at 이후만 집계.
+              const maxRows = [];
+              for (const w of data.watchlist) {
+                const row = await env.DB.prepare(
+                  `SELECT MAX(change_rate) AS maxRate FROM snapshots WHERE code = ? AND captured_at >= ?`
+                )
+                  .bind(w.code, w.added_at)
+                  .first()
+                  .catch(() => null);
+                if (row && row.maxRate !== null) maxRows.push({ code: w.code, maxRate: row.maxRate });
+              }
+              const maxMap = new Map(maxRows.map((r) => [r.code, r.maxRate]));
+              const entryMap = new Map(data.watchlist.map((w) => [w.code, w.entry_price]));
 
               const byCode = new Map();
               for (const r of histRes.results) {
@@ -3275,16 +3303,25 @@ self.addEventListener('fetch', (e) => {
                 if ((prev.buy_req || 0) > (prev.sel_req || 0) && (cur.buy_req || 0) <= (cur.sel_req || 0)) {
                   reasons.push("매도잔량 역전");
                 }
-                // 3) 오늘 고점 대비 3%p 이상 밀림
+                // 3) 담은 뒤 고점 대비 3%p 이상 밀림 (내가 담은 이후 기준)
                 const maxRate = maxMap.get(code);
                 if (maxRate !== undefined && maxRate - cur.change_rate >= 3) {
-                  reasons.push("고점대비 -" + (maxRate - cur.change_rate).toFixed(2) + "%p");
+                  reasons.push("담은후고점대비 -" + (maxRate - cur.change_rate).toFixed(2) + "%p");
                 }
                 // 4) 최근 3틱 연속 하락 (recentTimes[0]이 최신이라 0<1<2 순서로 비교)
                 const t2 = m.get(recentTimes[2]);
                 const t3 = m.get(recentTimes[3]);
                 if (t2 && t3 && cur.change_rate < prev.change_rate && prev.change_rate < t2.change_rate && t2.change_rate < t3.change_rate) {
                   reasons.push("3틱 연속 하락");
+                }
+                // 5) 진입가 대비 2% 이상 하락 - 실제 내 손실이 커지는 중이라는 가장 직접적인 신호
+                const entryPrice = entryMap.get(code);
+                if (entryPrice > 0) {
+                  const curRow = histRes.results.find((r) => r.code === code && r.captured_at === recentTimes[0]);
+                  if (curRow && curRow.price > 0) {
+                    const pnlPct = ((curRow.price - entryPrice) / entryPrice) * 100;
+                    if (pnlPct <= -2) reasons.push("진입가대비 " + pnlPct.toFixed(2) + "%");
+                  }
                 }
 
                 if (reasons.length) data.watchlistExitSignals.push({ code, reasons });
@@ -3876,6 +3913,33 @@ self.addEventListener('fetch', (e) => {
               "momentumPositive.avgForwardDeltaPct가 momentumNegative보다 뚜렷하게 크면(양수 우세) " +
               "momentumScore/risingTop5 가정(상승 중이면 계속 상승)이 어느 정도 근거 있는 것. " +
               "차이가 거의 없거나 반대면 가중치 재검토 필요.",
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/realtime-watchlist") {
+        // 관심종목을 relay 웹소켓으로 구독시키고, 실시간 체결값을 그대로 반환.
+        // 기존 20초 폴링(종목당 1.1초 소요)을 대체 - 키움 TR 호출 0건이라 훨씬 빠르고 가벼움.
+        try {
+          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+          const codes = wlRes.results.map((r) => r.code);
+
+          // 구독 목록 동기화 (relay 쪽에서 실제 변경이 있을 때만 재등록함)
+          await kiwoomRelayFetch(env, "/realtime/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ codes }),
+          }).catch(() => {});
+
+          const res = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
+          const data = await res.json();
+          return Response.json({
+            ok: true,
+            wsConnected: data.wsConnected,
+            wsLoggedIn: data.wsLoggedIn,
+            stocks: data.stocks || {},
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
