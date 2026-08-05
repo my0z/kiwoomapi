@@ -1542,7 +1542,7 @@ async function load() {
   pushCodes(data.risingTop5);
   pushCodes(topPicks);
   pushCodes(latestList);
-  realtimeListCodes = priorityCodes.slice(0, 200);
+  realtimeListCodes = priorityCodes.slice(0, 180);
 
   watchlistLastKnownMap = {};
   (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
@@ -2043,7 +2043,7 @@ function loadRealtimeCondition() {
       conditionCodes.forEach(c => {
         if (!realtimeListCodes.includes(c)) realtimeListCodes.unshift(c);
       });
-      if (realtimeListCodes.length > 200) realtimeListCodes.length = 200;
+      if (realtimeListCodes.length > 180) realtimeListCodes.length = 180;
 
       if (!codes.length) {
         tbody.innerHTML = '<tr><td class="empty">조건 만족 종목 없음 (감시 중)</td></tr>';
@@ -2138,7 +2138,7 @@ let mainRefreshTimer = setInterval(() => {
 // 관심종목 + 화면 리스트 종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 읽어옴.
 // 키움 TR 호출 0건이라 3초마다 갱신 가능. 리스트 종목은 지금 화면에 떠 있는 것만 보냄(그룹당 200 제한).
 function refreshRealtimeWatchlist() {
-  const listParam = realtimeListCodes.slice(0, 200).join(',');
+  const listParam = realtimeListCodes.slice(0, 180).join(',');
   fetch('/api/realtime-watchlist?list=' + encodeURIComponent(listParam))
     .then(res => res.json())
     .then(data => {
@@ -4054,7 +4054,7 @@ self.addEventListener('fetch', (e) => {
 
           // 클라이언트가 ?list=코드,코드,... 로 화면에 뜬 종목을 알려줌
           const listParam = url.searchParams.get("list") || "";
-          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 200);
+          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
 
           await kiwoomRelayFetch(env, "/realtime/subscribe", {
             method: "POST",
