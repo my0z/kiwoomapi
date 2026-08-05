@@ -2053,26 +2053,23 @@ function loadRealtimeCondition() {
         return;
       }
 
+      // 한 줄 표시: 별표 · 종목명 · 등락률 · 포착시각
       tbody.innerHTML = history.slice(0, 25).map(h => {
         const live = liveQuoteCache[h.code];
-        const price = live ? live.price : h.price;
         const rate = live ? live.rate : h.rate;
         const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
         const rateHtml = (rate !== null && rate !== undefined)
           ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + Number(rate).toFixed(2) + '%</span>'
           : '<span class="empty">-</span>';
-        return '<tr class="clickable twoLineRow" data-code="' + h.code + '">' +
-          '<td>' + starHtml({ code: h.code, name: name }, '실시간포착') + name +
-          (price ? '<span class="rowPrice">' + fmt(price) + '원</span>' : '') + '</td></tr>' +
-          '<tr class="twoLineSubRow"><td>' + rateHtml +
-          (h.initial
-            ? ' · <span class="empty">조건 충족 중</span>'
-            : ' · <span class="delta">⚡' + fmtHHMM(h.time) + ' 신규포착</span>') +
-          (h.stillIn ? '' : ' · <span class="empty">조건이탈</span>') +
-          '</td></tr>';
+        return '<tr class="clickable dockRow' + (h.stillIn ? '' : ' dockRowOut') + '" data-code="' + h.code + '">' +
+          '<td class="dockStar">' + starHtml({ code: h.code, name: name }, '실시간포착') + '</td>' +
+          '<td class="dockName">' + name + '</td>' +
+          '<td class="dockRate">' + rateHtml + '</td>' +
+          '<td class="dockTime">' + (h.initial ? '<span class="empty">충족중</span>' : '⚡' + fmtHHMM(h.time)) + '</td>' +
+          '</tr>';
       }).join('');
 
-      tbody.querySelectorAll('tr.twoLineRow').forEach(tr => {
+      tbody.querySelectorAll('tr.dockRow').forEach(tr => {
         tr.addEventListener('click', (e) => {
           if (e.target.closest('.noRowClick')) return;
           const code = tr.dataset.code;
@@ -2103,7 +2100,7 @@ document.getElementById('conditionDockHead').addEventListener('click', () => {
   document.getElementById('conditionDockToggle').textContent =
     dock.classList.contains('collapsed') ? '▲' : '▼';
   // 접으면 본문 여백도 줄여서 화면을 넓게 씀
-  document.body.style.paddingBottom = dock.classList.contains('collapsed') ? '54px' : '210px';
+  document.body.style.paddingBottom = dock.classList.contains('collapsed') ? '54px' : '130px';
 });
 
 // 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
@@ -2240,7 +2237,7 @@ function renderDashboard() {
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <style>
-  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 210px; }
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 130px; }
   h1 { font-size:18px; margin:0 0 4px; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
@@ -2420,13 +2417,20 @@ function renderDashboard() {
   #conditionDockCount { color:#888; font-weight:normal; font-size:11px; margin-left:4px; }
   #conditionDockToggle { color:#888; font-size:11px; }
   #conditionDockBody {
-    max-height:186px; /* 대략 3종목(2줄씩) 정도만 보이고 나머지는 스크롤 */
+    max-height:96px; /* 한 줄 표시 기준 약 3종목만 보이고 나머지는 스크롤 */
     overflow-y:auto; -webkit-overflow-scrolling:touch;
     padding:0 12px 8px;
   }
   #conditionDock.collapsed #conditionDockBody { display:none; }
   #conditionDockBody table { width:100%; border-collapse:collapse; font-size:13px; }
   #conditionDockBody td { padding:6px 4px; border-bottom:1px solid #232323; }
+  #conditionDockBody tr.dockRow { cursor:pointer; }
+  #conditionDockBody tr.dockRow:active { background:#2a2a2a; }
+  #conditionDockBody tr.dockRowOut { opacity:0.45; } /* 조건에서 이탈한 종목은 흐리게 */
+  .dockStar { width:34px; padding-right:0 !important; }
+  .dockName { text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:0; }
+  .dockRate { text-align:right; white-space:nowrap; width:72px; }
+  .dockTime { text-align:right; white-space:nowrap; width:64px; font-size:11px; color:#888; }
   #goldenWindowBanner {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
