@@ -1786,6 +1786,33 @@ function updateWatchlistPriceCells(code) {
     ? '<span class="' + (pnl.netPnlPct >= 0 ? 'pnlPositive' : 'pnlNegative') + '">' +
       (pnl.netPnlPct >= 0 ? '+' : '') + pnl.netPnlPct.toFixed(2) + '% (' + (pnl.netPnlAmount >= 0 ? '+' : '') + fmt(pnl.netPnlAmount) + '원)</span>'
     : '<span class="empty">시세 없음</span>';
+
+  updatePeakDrawdown(code, currentPrice, entryPrice);
+}
+
+// 담은 뒤 실시간 최고가 대비 지금 몇 % 빠졌는지 - 문턱값(-2% 등) 넘기 전부터 항상 보여줌.
+// 기존 이탈신호는 문턱값을 넘어야만 뜨는데, 정작 중요한 건 "꺾이기 시작하는 그 순간"이라
+// 매 3초 실시간 틱마다 고점을 갱신하며 지금 낙폭을 계속 노출함 (2분 cron보다 훨씬 빠른 반응).
+const watchlistPeakPrice = {}; // { code: peakPriceSinceTracking } - 페이지를 새로고침하면 그 시점부터 다시 추적됨
+function updatePeakDrawdown(code, currentPrice, entryPrice) {
+  const el = document.querySelector('.peakDrawdownLine[data-code="' + code + '"]');
+  if (!el || !currentPrice) return;
+
+  const baseline = entryPrice > 0 ? entryPrice : currentPrice; // 진입가가 있으면 진입가부터, 없으면 지금 가격부터 추적 시작
+  if (!watchlistPeakPrice[code] || currentPrice > watchlistPeakPrice[code]) {
+    watchlistPeakPrice[code] = Math.max(watchlistPeakPrice[code] || baseline, currentPrice);
+  }
+  const peak = watchlistPeakPrice[code];
+  const drawdownPct = ((currentPrice - peak) / peak) * 100;
+
+  if (drawdownPct >= -0.15) {
+    // 고점 근처(0.15% 이내)면 굳이 안 보여줌 - 노이즈만 되니까
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = '';
+  const cls = drawdownPct <= -2 ? 'down' : drawdownPct <= -1 ? 'peakWarnMid' : 'peakWarnLight';
+  el.innerHTML = '<span class="' + cls + '">고점(' + fmt(peak) + ') 대비 ' + drawdownPct.toFixed(2) + '%</span>';
 }
 
 // watchlist.added_at(UTC ISO) -> 키움 차트 시간 포맷(KST YYYYMMDDHHMMSS)으로 변환
@@ -1921,6 +1948,7 @@ function renderWatchlist(items) {
         '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
           '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskLevelHtml + riskBadgeHtml + exitBadgeHtml +
           '<div class="riskBadge riskBadgeExit realtimeExitBadge" data-code="' + r.code + '" style="display:none;"></div>' +
+          '<div class="peakDrawdownLine" data-code="' + r.code + '" style="display:none;"></div>' +
           '</td>' +
           '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
           '<td>' + rateHtml + '</td>' +
@@ -2198,7 +2226,7 @@ function loadRealtimeCondition() {
     .catch(() => {});
 }
 loadRealtimeCondition();
-setInterval(() => { if (!document.hidden) loadRealtimeCondition(); }, 5000);
+setInterval(() => { if (!document.hidden) loadRealtimeCondition(); }, 3000); // 5초->3초 (relay 메모리 읽기라 부담 없음)
 
 // 하단 실시간 포착 패널 접기/펼치기 (화면 좁을 때 방해되지 않게)
 document.getElementById('conditionDockHead').addEventListener('click', () => {
@@ -2230,7 +2258,7 @@ function loadMarketIndex() {
     .catch(() => {});
 }
 loadMarketIndex();
-setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 5000); // 5초마다 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
+setInterval(() => { if (!document.hidden) loadMarketIndex(); }, 2000); // 5초->2초 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음, 실제 수신 간격이 약 2초라 이보다 빨라도 의미 없음)
 
 
 // 지난 24시간 안에 확인할 이상상황(relay 끊김/cron실패/메모리경고 등)이 있으면 상단에 배너로 알려줌.
@@ -2270,7 +2298,7 @@ load();
 let mainRefreshTimer = setInterval(() => {
   if (document.hidden) return; // 백그라운드면 새로고침 스킵
   load();
-}, 10000); // 10초마다 화면 갱신 (D1만 읽어오는 거라 키움 제한과 무관, 저장 자체는 cron이 2분마다)
+}, 15000); // 10초->15초 (momentum/연속상승 등 D1 지표는 cron이 2분마다만 갱신하므로 이보다 자주 당겨도 새 데이터가 없음 - 그만큼 아낀 여유를 실시간쪽에 씀)
 
 // 관심종목 + 화면 리스트 종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 읽어옴.
 // 키움 TR 호출 0건이라 3초마다 갱신 가능. 리스트 종목은 지금 화면에 떠 있는 것만 보냄(그룹당 200 제한).
@@ -2374,7 +2402,7 @@ setInterval(() => {
   if (document.hidden) return;
   refreshRealtimeWatchlist();
   // 미니 캔들차트는 한 번 로딩되면 다시 그리지 않음 (miniCandleCache 안 비움)
-}, 3000); // 실시간 시세 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음)
+}, 2000); // 3초->2초 (relay 웹소켓 캐시 조회라 키움 TR 부하 없음, 실제 수신 간격이 약 2초)
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) load(); // 화면 복귀 시 즉시 최신화
@@ -2426,6 +2454,7 @@ function renderDashboard() {
   }
   #notifyToggleBtn.active { background:#1c2a1c; color:#69db7c; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
+  .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
   .board h2 { font-size:14px; margin:0 0 8px; color:#ff6b6b; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -2556,6 +2585,9 @@ function renderDashboard() {
   .addedDate { font-size:10px; color:#666; font-weight:normal; }
   .addedContext { font-size:10px; color:#8ea8ff; font-weight:normal; margin-top:1px; }
   .riskLevelLine { font-size:10px; color:#888; margin-top:1px; }
+  .peakDrawdownLine { font-size:10px; margin-top:1px; }
+  .peakWarnLight { color:#888; } /* -0.15%~-1% : 아직 크게 걱정할 단계는 아니지만 꺾이는 중 */
+  .peakWarnMid { color:#ffa94d; } /* -1%~-2% : 주의 */
   .verdictIcon { margin-right:2px; font-size:12px; }
   .riskBadge { font-size:10px; font-weight:700; margin-top:2px; }
   .riskBadgeDown { color:#4d9fff; }
@@ -2677,6 +2709,7 @@ function renderDashboard() {
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
   <h1>🔥 급등주 스크리너 <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button></h1>
   <div class="sub" id="ts">불러오는 중...</div>
+  <div class="freshnessLegend"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
   <div id="marketIndexBar" style="display:none;"></div>
   <div id="systemStatusBanner" style="display:none;"></div>
   <div id="goldenWindowBanner" style="display:none;"></div>
