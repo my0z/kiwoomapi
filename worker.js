@@ -244,28 +244,51 @@ async function collectFinalAccurateQuotes(env) {
   )
     .bind(lastTime)
     .all();
-  const targets = codesRes.results;
+  let targets = codesRes.results;
   if (!targets.length) return { saved: 0 };
+
+  // Cloudflare Workers는 호출당 서브리퀘스트 개수에 상한이 있어서(실측상 약 50개),
+  // 종목이 많으면 뒤쪽 종목들은 애초에 처리가 안 됨. 그러니 관심종목을 먼저 처리해서
+  // 한도에 걸리더라도 실제로 중요한(담아둔) 종목들만은 정확한 종가를 확보하게 함.
+  try {
+    const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+    const wlCodes = new Set(wlRes.results.map((r) => r.code));
+    if (wlCodes.size) {
+      targets = [...targets].sort((a, b) => (wlCodes.has(b.code) ? 1 : 0) - (wlCodes.has(a.code) ? 1 : 0));
+    }
+  } catch (e) {
+    // 우선순위 정렬 실패해도 전체 흐름엔 지장 없음 - 원래 순서로 진행
+  }
 
   const token = await kiwoomIssueToken(env);
   const rows = [];
   const failedCodes = [];
+  let hitSubrequestLimit = false;
   for (const t of targets) {
     try {
       const raw = await kiwoomQuote(env, token, t.code);
       const q = parseKiwoomQuote(raw);
       rows.push({ code: t.code, name: t.name, price: q.price, rate: q.rate, volume: q.volume, market: t.market });
     } catch (e) {
+      const msg = String(e.message || e);
+      if (/Too many subrequests/i.test(msg)) {
+        // 이 시점부터는 뭘 시도해도 똑같이 실패함(플랫폼 한도) - 나머지 종목을 헛되이 순회하지 않고 바로 중단
+        hitSubrequestLimit = true;
+        break;
+      }
       // 개별 종목 조회 실패는 건너뜀 (그 종목만 최종 갱신 안 됨, 나머지는 계속 진행) - 아래에서 모아서 로그만 남김
-      failedCodes.push(t.code + ":" + String(e.message || e).slice(0, 80));
+      failedCodes.push(t.code + ":" + msg.slice(0, 80));
     }
     await sleep(1100); // 키움 TR 초당1건 제한
   }
-  if (failedCodes.length) {
+  const skippedCount = targets.length - rows.length - failedCodes.length;
+  if (failedCodes.length || hitSubrequestLimit) {
     await logSystemEvent(
       env,
       "final_quote_partial_failure",
-      `${failedCodes.length}/${targets.length}종목 최종시세 재조회 실패: ${failedCodes.slice(0, 15).join(", ")}`
+      `${rows.length}/${targets.length}종목만 최종시세 재조회 성공` +
+        (hitSubrequestLimit ? ` (서브리퀘스트 한도 도달, ${skippedCount}종목 시도 자체를 안 함)` : "") +
+        (failedCodes.length ? ` - 개별실패: ${failedCodes.slice(0, 15).join(", ")}` : "")
     );
   }
   if (!rows.length) return { saved: 0 };
