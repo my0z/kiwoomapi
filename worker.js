@@ -550,19 +550,25 @@ async function getLatest(env) {
     const volumeSpikeRatio = prevRow && prevRow.volume > 0 ? r.volume / prevRow.volume : null;
     const todayMaxRate = todayMaxMap.get(r.code) ?? r.change_rate;
 
+    // 15:36 마감 정밀조회(collectFinalAccurateQuotes)는 가격/등락률/거래량만 받고 체결강도·매수잔량·매도잔량은
+    // 항상 0으로 저장함(ka10007 개별조회라 그 필드들을 안 받아옴). 그 틱이 "지금"이나 "직전"으로 잡히면
+    // 수급기반 배지가 전부 오판됨(매도잔량이 실제값->0으로 "급감"한 걸로 잘못 계산됨) - 그래서 셋 다 0인 틱은 걸러냄.
+    const isPlaceholderRow = (row) => !row || (row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0);
+    const hasOrderFlowData = !isPlaceholderRow(r) && !isPlaceholderRow(prevRow);
+
     // 매수전환: 직전엔 매도잔량이 더 많았는데 지금 막 매수잔량 우위로 뒤집힌 것 - 초반 반전 신호
     const bidTurnedPositive = !!(
-      prevRow &&
+      hasOrderFlowData &&
       (r.buy_req || 0) > (r.sel_req || 0) &&
       (prevRow.buy_req || 0) <= (prevRow.sel_req || 0)
     );
     // 체결강도개선: 직전 틱보다 지금 체결강도가 더 세짐 - 매수 압력이 커지는 중이라는 신호
-    const cntrStrRising = !!(prevRow && (r.cntr_str || 0) > (prevRow.cntr_str || 0));
+    const cntrStrRising = !!(hasOrderFlowData && (r.cntr_str || 0) > (prevRow.cntr_str || 0));
     // 매수잔량급증: 직전 틱 대비 매수잔량이 1.5배 이상 - 매수 대기 물량이 갑자기 쌓이는 중
-    const buyReqSpike = !!(prevRow && prevRow.buy_req > 0 && (r.buy_req || 0) / prevRow.buy_req >= 1.5);
+    const buyReqSpike = !!(hasOrderFlowData && prevRow.buy_req > 0 && (r.buy_req || 0) / prevRow.buy_req >= 1.5);
     // 매도잔량급감: 직전 틱 대비 매도잔량이 절반 이하로 줄어듦 - 매도 대기 물량이 빠지는 중.
     // 매수전환/매수잔량급증과 같은 "새로 유입되는 수급 변화" 계열 신호(백테스트에서 이 계열만 효과 확인됨) - 아직 자체 백테스트는 안 함
-    const sellReqThinning = !!(prevRow && prevRow.sel_req > 0 && (r.sel_req || 0) / prevRow.sel_req <= 0.5);
+    const sellReqThinning = !!(hasOrderFlowData && prevRow.sel_req > 0 && (r.sel_req || 0) / prevRow.sel_req <= 0.5);
     // 신규진입: 직전 틱엔 이 종목이 5~15% 밴드에 없었음 - 방금 막 새로 터진 종목
     const freshEntry = withMom.momentum.length === 0;
 
@@ -3607,14 +3613,18 @@ async function computeSignalBacktest(env, tickLimit) {
 
       const recentDelta = cur.change_rate - prev.change_rate;
       const olderDelta = prev.change_rate - older.change_rate;
-      const bidTurnedPositive = (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0);
-      const buyReqSpike = prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5;
-      const sellReqThinning = prev.sel_req > 0 && (cur.sel_req || 0) / prev.sel_req <= 0.5;
+      // 15:36 마감 정밀조회는 체결강도/매수잔량/매도잔량을 항상 0으로 저장함 - 그 틱이 cur나 prev로 잡히면
+      // 수급신호가 전부 오판되므로(실제값->0을 "급감"으로 착각) 걸러냄
+      const isPlaceholderRow = (row) => row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0;
+      const hasOrderFlowData = !isPlaceholderRow(cur) && !isPlaceholderRow(prev);
+      const bidTurnedPositive = hasOrderFlowData && (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0);
+      const buyReqSpike = hasOrderFlowData && prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5;
+      const sellReqThinning = hasOrderFlowData && prev.sel_req > 0 && (cur.sel_req || 0) / prev.sel_req <= 0.5;
       const pullbackLike = runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0;
       const signals = {
         accelerating: recentDelta > olderDelta,
         bidTurnedPositive,
-        cntrStrRising: (cur.cntr_str || 0) > (prev.cntr_str || 0),
+        cntrStrRising: hasOrderFlowData && (cur.cntr_str || 0) > (prev.cntr_str || 0),
         buyReqSpike,
         volumeSpike: prev.volume > 0 && (cur.volume || 0) / prev.volume >= 2,
         isTodayHigh: cur.change_rate >= runningMaxRate - 0.001,
