@@ -2462,7 +2462,12 @@ function loadWatchlistDailyStats() {
     .then(data => {
       const tag = document.getElementById('autoRemovedTag');
       if (!data.ok || (!data.added && !data.removed)) { tag.style.display = 'none'; return; }
-      tag.textContent = '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목';
+      const netWon = data.netWon || 0;
+      const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
+      tag.innerHTML =
+        '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
+        ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
+        ' (익 +' + (data.profitWon || 0).toLocaleString() + ' / 손 ' + (data.lossWon || 0).toLocaleString() + ')';
       tag.style.display = 'inline';
     })
     .catch(() => {});
@@ -4581,6 +4586,34 @@ self.addEventListener('fetch', (e) => {
             return Response.json({ ok: true, horizon, sampleSize: 0, note: "아직 기록된 성과 데이터가 없습니다. 관심종목을 담고 30분 이상 지나야 쌓입니다." });
           }
 
+          // 관심종목 화면과 동일하게 "100만원 매수 가정"으로 손익 금액 환산 - 수수료/세금은 화면 표시와
+          // 달리 여기선 생략(비율 기반 근사치). 건별 손익금을 승/패로 나눠 합산해서 "얼마 벌고 얼마 잃었는지" 파악.
+          const BUY_AMOUNT = 1000000;
+          const moneyAgg = (keyFn) => {
+            const map = new Map();
+            rows.forEach((r) => {
+              for (const k of keyFn(r)) {
+                if (!k) continue;
+                if (!map.has(k)) map.set(k, { profitSum: 0, lossSum: 0, profitCount: 0, lossCount: 0 });
+                const s = map.get(k);
+                const amount = BUY_AMOUNT * (r.pnl_pct / 100);
+                if (amount > 0) { s.profitSum += amount; s.profitCount++; }
+                else if (amount < 0) { s.lossSum += amount; s.lossCount++; }
+              }
+            });
+            const out = {};
+            for (const [k, s] of map) {
+              out[k] = {
+                profitWon: Math.round(s.profitSum),
+                lossWon: Math.round(s.lossSum),
+                netWon: Math.round(s.profitSum + s.lossSum),
+                profitCount: s.profitCount,
+                lossCount: s.lossCount,
+              };
+            }
+            return out;
+          };
+
           const agg = (keyFn) => {
             const map = new Map();
             rows.forEach((r) => {
@@ -4606,17 +4639,29 @@ self.addEventListener('fetch', (e) => {
 
           const overallAvg = +(rows.reduce((s, r) => s + r.pnl_pct, 0) / rows.length).toFixed(3);
           const overallWinRate = +((rows.filter((r) => r.pnl_pct > 0).length / rows.length) * 100).toFixed(1);
+          const overallProfitWon = Math.round(rows.reduce((s, r) => s + Math.max(0, BUY_AMOUNT * (r.pnl_pct / 100)), 0));
+          const overallLossWon = Math.round(rows.reduce((s, r) => s + Math.min(0, BUY_AMOUNT * (r.pnl_pct / 100)), 0));
 
           return Response.json({
             ok: true,
             horizon,
             sampleSize: rows.length,
-            overall: { avgPnlPct: overallAvg, winRatePct: overallWinRate },
+            buyAmountAssumedWon: BUY_AMOUNT,
+            overall: {
+              avgPnlPct: overallAvg,
+              winRatePct: overallWinRate,
+              profitWon: overallProfitWon,
+              lossWon: overallLossWon,
+              netWon: overallProfitWon + overallLossWon,
+            },
             byBoard: agg((r) => [r.source_board]),
+            byBoardMoney: moneyAgg((r) => [r.source_board]),
             bySignal: agg((r) => (r.added_state || "").split(",").filter(Boolean)),
+            bySignalMoney: moneyAgg((r) => (r.added_state || "").split(",").filter(Boolean)),
             interpretation:
               "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
-              "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것.",
+              "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것. " +
+              "profitWon/lossWon/netWon은 종목당 100만원 매수 가정(수수료·세금 미반영)으로 환산한 근사 금액.",
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -4867,10 +4912,29 @@ self.addEventListener('fetch', (e) => {
             .all();
           const byKind = {};
           for (const r of res.results || []) byKind[r.kind] = r.cnt;
+
+          // 오늘 recorded_at으로 확정된 성과(정상 30/60분 경과분 + 손절삭제분) 기준 실현손익 금액.
+          // horizon 30/60 둘 다 있는 종목은 30분 것만 카운트해서 중복 집계 방지.
+          const BUY_AMOUNT = 1000000;
+          const perfRes = await env.DB.prepare(
+            `SELECT pnl_pct FROM watchlist_performance WHERE horizon_min = 30 AND recorded_at >= ?`
+          )
+            .bind(todayStartUtc)
+            .all();
+          let profitWon = 0, lossWon = 0;
+          for (const r of perfRes.results || []) {
+            const amount = BUY_AMOUNT * (r.pnl_pct / 100);
+            if (amount > 0) profitWon += amount;
+            else lossWon += amount;
+          }
+
           return Response.json({
             ok: true,
             added: byKind.watchlist_added || 0,
             removed: byKind.watchlist_auto_removed || 0,
+            profitWon: Math.round(profitWon),
+            lossWon: Math.round(lossWon),
+            netWon: Math.round(profitWon + lossWon),
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
