@@ -122,8 +122,38 @@ function isMarketHoursKST(date) {
 // 관심종목이 ATR 기반 손절/익절 라인에 도달했는지 cron이 대신 체크해서 D1에 남김.
 // 원래는 모달을 직접 열어야만 알 수 있었던 것 - watchlist_risk_status 테이블 필요(schema.sql 참고).
 // 관심종목은 보통 소수(몇 개)라 종목당 1.1초 순차조회를 매 틱마다 해도 부담 적음.
+// 관심종목이 손절 등으로 삭제되기 직전에 호출 - 삭제되면 watchlist에서 사라져 trackWatchlistPerformance가
+// 더 이상 추적을 못 하게 되므로, 아직 기록 안 된 horizon(30/60분)에 대해 삭제 시점 가격을 "확정 결과"로 남겨둠.
+// 그래야 performance-report가 "살아남은 것만" 좋게 보이는 왜곡(생존 편향) 없이 실제 승률을 반영함.
+async function recordWatchlistExitPerformance(env, w, exitPrice, actualPnlPct) {
+  try {
+    for (const horizon of [30, 60]) {
+      const already = await env.DB.prepare(
+        `SELECT 1 FROM watchlist_performance WHERE code = ? AND added_at = ? AND horizon_min = ?`
+      )
+        .bind(w.code, w.added_at, horizon)
+        .first()
+        .catch(() => null);
+      if (already) continue; // 이미 정상 경로로 기록됐으면 덮어쓰지 않음
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO watchlist_performance
+         (code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          w.code, w.name, w.added_at, horizon, w.entry_price, exitPrice,
+          +actualPnlPct.toFixed(3), w.source_board || "", (w.added_state || "") + ",손절삭제", new Date().toISOString()
+        )
+        .run()
+        .catch(() => {});
+    }
+  } catch (e) {
+    // 기록 실패해도 삭제 자체는 진행 - 통계 누락보다 손절 지연이 더 나쁨
+  }
+}
+
 async function checkWatchlistRiskLevels(env) {
-  const wlRes = await env.DB.prepare(`SELECT code, name, entry_price FROM watchlist`).all();
+  const wlRes = await env.DB.prepare(`SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`).all();
   const items = wlRes.results;
   if (!items.length) return { checked: 0 };
 
@@ -148,6 +178,9 @@ async function checkWatchlistRiskLevels(env) {
       if (w.entry_price && w.entry_price > 0) {
         const pnlPct = ((quote.price - w.entry_price) / w.entry_price) * 100;
         if (pnlPct <= AUTO_REMOVE_PNL_PCT) {
+          // 삭제되면 watchlist에서 사라져서 trackWatchlistPerformance가 못 보게 됨 -
+          // 손절 확정 손익을 먼저 기록해둬야 성과 통계가 "살아남은 것만" 반영하는 왜곡을 피함
+          await recordWatchlistExitPerformance(env, w, quote.price, pnlPct);
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
           await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제 [cron]`);
@@ -4035,6 +4068,16 @@ self.addEventListener('fetch', (e) => {
         try {
           const { code, pnlPct, name } = await request.json();
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
+          // 삭제 전 필요한 필드 확보 - relay는 code/pnlPct/name만 보내므로 나머지는 여기서 조회
+          const w = await env.DB.prepare(
+            `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
+          )
+            .bind(code)
+            .first();
+          if (w && typeof pnlPct === "number" && w.entry_price > 0) {
+            const exitPrice = w.entry_price * (1 + pnlPct / 100);
+            await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
+          }
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
           const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
