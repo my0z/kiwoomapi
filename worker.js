@@ -2910,13 +2910,13 @@ function renderDashboard() {
   }
   #cfUsageToggle {
     position:fixed; left:14px; top:60px; z-index:94;
-    width:32px; height:32px; border-radius:50%; background:#232323;
-    display:flex; align-items:center; justify-content:center; font-size:14px;
-    opacity:0.5; cursor:pointer;
+    width:48px; height:48px; border-radius:50%; background:#232323;
+    display:flex; align-items:center; justify-content:center; font-size:22px;
+    opacity:0.8; cursor:pointer;
   }
   #cfUsageToggle:active { opacity:1; }
   #cfUsagePanel {
-    position:fixed; left:14px; top:98px; z-index:94;
+    position:fixed; left:14px; top:114px; z-index:94;
     background:#1c1c1c; border:1px solid #333; border-radius:10px;
     padding:10px 12px; font-size:11px; color:#aaa; width:220px;
     box-shadow:0 2px 10px rgba(0,0,0,0.5);
