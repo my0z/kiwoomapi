@@ -2970,10 +2970,11 @@ function renderDashboard() {
   <button id="reloadBtn" title="화면 새로고침">🔄</button>
   <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
-  <h1>🔥 급등주 스크리너 <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button></h1>
-  <div class="sub" id="ts">불러오는 중...</div>
-  <div class="freshnessLegend"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
-  <div id="marketIndexBar" style="display:none;"></div>
+  <h1 style="display:none;">🔥 급등주 스크리너 <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button></h1>
+  <span id="ts" style="display:none;"></span>
+  <div class="sub" style="display:none;"></div>
+  <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
+  <div id="marketIndexBar" style="display:none; position:sticky; top:0; z-index:95;"></div>
   <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
   <div id="cfUsagePanel" style="display:none;"></div>
 
