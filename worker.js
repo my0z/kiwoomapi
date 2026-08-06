@@ -699,7 +699,6 @@ const periodRow = document.getElementById('periodRow');
 const modalPriceBtn = document.getElementById('modalPriceBtn');
 const modalRiskBtn = document.getElementById('modalRiskBtn');
 const modalAiBtn = document.getElementById('modalAiBtn');
-const modalInfoBtn = document.getElementById('modalInfoBtn');
 const modalCancelBtn = document.getElementById('modalCancelBtn');
 let currentModalCode = null;
 let currentModalName = null;
@@ -732,7 +731,6 @@ function openStockModal(item) {
   modalPriceBtn.onclick = () => { currentModalView = 'quote'; showQuote(item.code); };
   modalRiskBtn.onclick = () => { currentModalView = 'risk'; showRiskLevels(item.code); };
   modalAiBtn.onclick = () => { currentModalView = 'ai'; showAiAnalysis(item); };
-  modalInfoBtn.onclick = () => { currentModalView = 'info'; showStockInfo(item.code); };
   updateStarButton(item.code, item.name, item.price);
   modalOverlay.classList.add('open');
   setHeavyButtonsDisabled(true);
@@ -977,55 +975,7 @@ function showRiskLevels(code, silent) {
     });
 }
 
-function showStockInfo(code) {
-  modalDetail.innerHTML = '<div class="detailLoading">불러오는 중...</div>';
-  fetch('/api/stock-info?code=' + code)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) {
-        modalDetail.innerHTML = '<div class="detailError">조회 실패: ' + (data.error || '알 수 없는 오류') + '</div>';
-        return;
-      }
-      const r = data.raw || {};
-      // 키움 REST ka10001 응답 필드명이 실측 전이라 여러 후보 키를 순서대로 시도.
-      const pick = (...keys) => {
-        for (const k of keys) { if (r[k] !== undefined && r[k] !== null && r[k] !== '') return r[k]; }
-        return null;
-      };
-      const per = pick('per', 'PER');
-      const pbr = pick('pbr', 'PBR');
-      const eps = pick('eps', 'EPS');
-      const bps = pick('bps', 'BPS');
-      const roe = pick('roe', 'ROE');
-      const marketCap = pick('mac', 'market_cap', 'stk_totl_mrkt_amt', '시가총액');
-      const listedShares = pick('flo_stk', 'listed_stock', '상장주식');
-      const faceValue = pick('fav', 'face_value', '액면가');
-      const foreignRate = pick('for_exh_rt', 'foreign_rate', '외인소진률');
-      const row = (label, val, unit) => val !== null
-        ? '<div>' + label + '<b>' + val + (unit || '') + '</b></div>' : '';
-      const grid = [
-        row('PER', per, '배'),
-        row('PBR', pbr, '배'),
-        row('EPS', eps, '원'),
-        row('BPS', bps, '원'),
-        row('ROE', roe, '%'),
-        row('시가총액', marketCap, '억원'),
-        row('상장주식수', listedShares, '주'),
-        row('액면가', faceValue, '원'),
-        row('외인소진률', foreignRate, '%'),
-      ].filter(Boolean).join('');
-
-      modalDetail.innerHTML =
-        (grid ? '<div class="detailGrid">' + grid + '</div>' : '<div class="detailError">표시 가능한 필드를 찾지 못했습니다 (필드명 확인 필요)</div>') +
-        '<details style="margin-top:10px; font-size:11px; color:#888;"><summary>원본 응답 보기</summary>' +
-        '<pre style="white-space:pre-wrap; word-break:break-all;">' + JSON.stringify(r, null, 2) + '</pre></details>';
-    })
-    .catch(err => {
-      modalDetail.innerHTML = '<div class="detailError">네트워크 오류: ' + err.message + '</div>';
-    });
-}
-
-
+function showQuote(code, silent) {
   if (!silent) modalDetail.innerHTML = '<div class="detailLoading">불러오는 중...</div>';
   fetch('/api/quote?code=' + code)
     .then(res => res.json())
@@ -2893,9 +2843,7 @@ function renderDashboard() {
   .modalBtn.price { background:#2a2a2a; color:#eee; }
   .modalBtn.risk { background:#2a2a2a; color:#ffa94d; }
   .modalBtn.ai { background:#2a2a2a; color:#a78bfa; }
-  .modalBtn.info { background:#2a2a2a; color:#66d9e8; }
-  .actionRow { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
-  .actionRow .modalBtn { flex:1 1 40%; }
+  .actionRow { display:flex; gap:8px; margin-bottom:10px; }
   .actionRow .modalBtn {
     flex:1; width:auto; margin-bottom:0; padding:10px 4px;
     font-size:12px; white-space:nowrap;
@@ -3146,7 +3094,6 @@ function renderDashboard() {
         <button class="modalBtn price" id="modalPriceBtn">💰 현재가</button>
         <button class="modalBtn risk" id="modalRiskBtn">🎯 손절/익절</button>
         <button class="modalBtn ai" id="modalAiBtn">🤖 AI 분석</button>
-        <button class="modalBtn info" id="modalInfoBtn">📋 기본정보</button>
       </div>
       <button class="modalBtn cancel" id="modalCancelBtn">닫기</button>
     </div>
@@ -3536,14 +3483,6 @@ function parseKiwoomQuote(json) {
     volume: abs(json.trde_qty ?? json.now_trde_qty),
     raw: json,
   };
-}
-
-// ---------- 키움 REST API: 종목 기본정보(ka10001) ----------
-async function kiwoomStockInfo(env, token, code) {
-  const data = await kiwoomApiCall(env, token, "/api/dostk/stkinfo", "ka10001", {
-    stk_cd: code,
-  });
-  return data;
 }
 
 // ---------- 키움 REST API: 차트 (분/일/주/월봉 통합) ----------
@@ -4418,18 +4357,6 @@ self.addEventListener('fetch', (e) => {
           const items = await naverNewsSearch(env, q);
           await classifyNewsSentiment(env, items);
           return Response.json({ ok: true, items });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/stock-info") {
-        try {
-          const code = url.searchParams.get("code");
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          const token = await kiwoomIssueToken(env);
-          const data = await kiwoomStockInfo(env, token, code);
-          return Response.json({ ok: true, raw: data });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
