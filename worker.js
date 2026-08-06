@@ -2515,7 +2515,7 @@ function renderPnlHistoryChart(daily) {
     const y = d.netWon >= 0 ? zeroY - barH : zeroY;
     const color = d.netWon > 0 ? '#e03131' : (d.netWon < 0 ? '#1971c2' : '#495057');
     const label = d.date.slice(5); // MM-DD
-    const tipText = d.date + ': ' + (d.netWon >= 0 ? '+' : '') + d.netWon.toLocaleString() + '원 (승률 ' + d.winRatePct + '%, ' + d.count + '건)';
+    const tipText = d.date + ': ' + (d.avgPnlPct >= 0 ? '+' : '') + d.avgPnlPct + '% / ' + (d.netWon >= 0 ? '+' : '') + d.netWon.toLocaleString() + '원 (승률 ' + d.winRatePct + '%, ' + d.count + '건)';
     // title은 데스크톱 마우스 hover에만 반응하고 모바일 터치엔 안 뜸 -
     // 같은 막대에 클릭/탭 이벤트도 걸어서 터치 사용자는 탭하면 아래 텍스트로 보이게 함.
     // 히트박스를 위아래로 넓혀서(투명 rect) 막대가 얇을 때도 탭하기 쉽게 함.
@@ -2537,6 +2537,10 @@ function renderPnlHistoryChart(daily) {
     '</svg>' +
     '<div id="pnlHistoryTip" style="font-size:11px; color:#adb5bd; padding:4px 2px; min-height:14px;">막대를 탭하면 상세 내역이 여기 표시됩니다</div>';
 }
+function todayKstDateStr() {
+  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  return kst.getFullYear() + '-' + String(kst.getMonth() + 1).padStart(2, '0') + '-' + String(kst.getDate()).padStart(2, '0');
+}
 function loadPnlHistory() {
   fetch('/api/watchlist-pnl-history?days=30')
     .then(res => res.json())
@@ -2545,6 +2549,21 @@ function loadPnlHistory() {
       if (!data.ok || !data.daily || !data.daily.length) { board.style.display = 'none'; return; }
       board.style.display = 'block';
       renderPnlHistoryChart(data.daily);
+
+      // 당일 요약 - 접힌 상태에서도 오늘 손익률/금액이 바로 보이게 토글 줄에 표시
+      const summaryEl = document.getElementById('pnlHistoryTodaySummary');
+      const today = data.daily.find(d => d.date === todayKstDateStr());
+      if (summaryEl) {
+        if (today) {
+          const color = today.netWon > 0 ? '#e03131' : (today.netWon < 0 ? '#1971c2' : 'inherit');
+          summaryEl.innerHTML = '· 오늘 <span style="color:' + color + '">' +
+            (today.avgPnlPct >= 0 ? '+' : '') + today.avgPnlPct + '% / ' +
+            (today.netWon >= 0 ? '+' : '') + today.netWon.toLocaleString() + '원</span>';
+        } else {
+          summaryEl.textContent = '';
+        }
+      }
+
       pnlHistoryLoaded = true;
     })
     .catch(() => {});
@@ -2552,9 +2571,9 @@ function loadPnlHistory() {
 document.getElementById('pnlHistoryToggle').addEventListener('click', () => {
   pnlHistoryExpanded = !pnlHistoryExpanded;
   const chartEl = document.getElementById('pnlHistoryChart');
-  const toggleEl = document.getElementById('pnlHistoryToggle');
+  const arrowEl = document.getElementById('pnlHistoryArrow');
   chartEl.style.display = pnlHistoryExpanded ? 'block' : 'none';
-  toggleEl.textContent = '📊 일별 실현손익 히스토리 ' + (pnlHistoryExpanded ? '▴' : '▾');
+  if (arrowEl) arrowEl.textContent = pnlHistoryExpanded ? '▴' : '▾';
   if (pnlHistoryExpanded && !pnlHistoryLoaded) loadPnlHistory();
 });
 loadPnlHistory(); // 접힌 상태에서도 데이터 유무만 먼저 확인해서 board 표시 여부를 정함
@@ -3013,7 +3032,7 @@ function renderDashboard() {
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
     <div id="pnlHistoryBoard" style="display:none; margin-bottom:10px;">
-      <div id="pnlHistoryToggle" style="cursor:pointer; color:#868e96; font-size:12px; user-select:none;">📊 일별 실현손익 히스토리 ▾</div>
+      <div id="pnlHistoryToggle" style="cursor:pointer; color:#868e96; font-size:12px; user-select:none;">📊 일별 실현손익 히스토리 <span id="pnlHistoryTodaySummary"></span> <span id="pnlHistoryArrow">▾</span></div>
       <div id="pnlHistoryChart" style="display:none;"></div>
     </div>
     <table id="watchlist">
@@ -5056,11 +5075,12 @@ self.addEventListener('fetch', (e) => {
 
           const byDate = new Map();
           for (const r of res.results || []) {
-            if (!byDate.has(r.kstDate)) byDate.set(r.kstDate, { profitWon: 0, lossWon: 0, count: 0, wins: 0 });
+            if (!byDate.has(r.kstDate)) byDate.set(r.kstDate, { profitWon: 0, lossWon: 0, count: 0, wins: 0, pnlPctSum: 0 });
             const s = byDate.get(r.kstDate);
             const amount = BUY_AMOUNT * (r.pnl_pct / 100);
             if (amount > 0) { s.profitWon += amount; s.wins++; }
             else s.lossWon += amount;
+            s.pnlPctSum += r.pnl_pct;
             s.count++;
           }
 
@@ -5071,6 +5091,7 @@ self.addEventListener('fetch', (e) => {
             netWon: Math.round(s.profitWon + s.lossWon),
             count: s.count,
             winRatePct: +((s.wins / s.count) * 100).toFixed(1),
+            avgPnlPct: +(s.pnlPctSum / s.count).toFixed(2),
           }));
 
           return Response.json({ ok: true, days, daily });
