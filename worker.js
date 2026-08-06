@@ -2311,41 +2311,17 @@ document.getElementById('conditionDockHead').addEventListener('click', () => {
 
 // 지난 24시간 안에 확인할 이상상황(relay 끊김/cron실패/메모리경고 등)이 있으면 상단에 배너로 알려줌.
 // 사람이 매번 system-events를 열어보지 않아도 되게 하는 게 목적.
-// Cloudflare 실사용량 패널 - 평소엔 숨겨두고 탭하면 D1/Workers 사용량과 한도 대비 % 보여줌.
-// 관리자 API라 처음 열 때 한 번 키를 물어보고, 그 뒤로는 이 세션 안에서만 기억함(새로고침하면 다시 물어봄).
-let cfAdminKey = null;
+// Cloudflare 사용량 바로가기 - GraphQL API 인증이 계속 막혀서(계정 권한 이슈),
+// 커스텀 패널 대신 Cloudflare가 이미 잘 보여주는 실제 대시보드로 바로 이동하는 링크로 대체함.
+// 평소엔 숨겨두고 탭하면 펼쳐짐.
 document.getElementById('cfUsageToggle').addEventListener('click', () => {
   const panel = document.getElementById('cfUsagePanel');
   if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
-
-  if (!cfAdminKey) {
-    cfAdminKey = prompt('관리자 키 입력 (사용량 조회용)');
-    if (!cfAdminKey) return;
-  }
   panel.style.display = 'block';
-  panel.innerHTML = '<div class="empty">불러오는 중...</div>';
-
-  fetch('/api/admin/cf-usage?key=' + encodeURIComponent(cfAdminKey))
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) {
-        panel.innerHTML = '<div style="color:#ff8787;">' + (data.error || '조회 실패') + '</div>';
-        return;
-      }
-      const bar = (pct) => {
-        const cls = pct >= 80 ? 'danger' : pct >= 50 ? 'warn' : '';
-        return '<div class="cfUsageBar"><div class="cfUsageBarFill ' + cls + '" style="width:' + Math.min(100, pct) + '%"></div></div>';
-      };
-      panel.innerHTML =
-        '<div style="color:#eee; font-weight:600; margin-bottom:4px;">Cloudflare 사용량 (오늘 UTC 기준)</div>' +
-        '<div class="cfUsageRow"><span>Workers 요청</span><span>' + fmt(data.workers.requests) + ' / ' + fmt(data.workers.limitPerDay) + ' (' + data.workers.pct + '%)</span></div>' +
-        bar(data.workers.pct) +
-        '<div class="cfUsageRow" style="margin-top:8px;"><span>D1 읽기행</span><span>' + fmt(data.d1.rowsRead) + ' / ' + fmt(data.d1.limitReadPerDay) + ' (' + data.d1.pctRead + '%)</span></div>' +
-        bar(data.d1.pctRead) +
-        '<div class="cfUsageRow" style="margin-top:8px;"><span>D1 쓰기행</span><span>' + fmt(data.d1.rowsWritten) + ' / ' + fmt(data.d1.limitWritePerDay) + ' (' + data.d1.pctWrite + '%)</span></div>' +
-        bar(data.d1.pctWrite);
-    })
-    .catch(() => { panel.innerHTML = '<div style="color:#ff8787;">조회 오류</div>'; });
+  panel.innerHTML =
+    '<div style="color:#eee; font-weight:600; margin-bottom:6px;">Cloudflare 사용량 바로가기</div>' +
+    '<a href="https://dash.cloudflare.com/709dcc6af36c8ee7b6d3d99e7a9fe422/workers/services/view/kiwoomapi/production" target="_blank" rel="noopener" class="cfUsageLink">📈 Workers 요청/CPU 사용량</a>' +
+    '<a href="https://dash.cloudflare.com/709dcc6af36c8ee7b6d3d99e7a9fe422/workers/d1" target="_blank" rel="noopener" class="cfUsageLink">🗄️ D1 데이터베이스 사용량</a>';
 });
 
 function loadSystemStatusBanner() {
@@ -2754,6 +2730,11 @@ function renderDashboard() {
   #cfUsagePanel .cfUsageBarFill { height:100%; background:#69db7c; }
   #cfUsagePanel .cfUsageBarFill.warn { background:#ffa94d; }
   #cfUsagePanel .cfUsageBarFill.danger { background:#ff6b6b; }
+  #cfUsagePanel .cfUsageLink {
+    display:block; background:#232323; color:#8ea8ff; text-decoration:none;
+    padding:8px 10px; border-radius:8px; margin-top:6px; font-size:12px;
+  }
+  #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
   #goldenWindowBanner {
     background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
@@ -4411,106 +4392,6 @@ self.addEventListener('fetch', (e) => {
             interpretation:
               "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
               "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것.",
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/admin/cf-usage") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        // Cloudflare GraphQL Analytics API로 D1/Workers 실제 사용량 조회.
-        // CLOUDFLARE_API_TOKEN(Account Analytics:Read 권한), CLOUDFLARE_ACCOUNT_ID 시크릿 필요.
-        if (!env.CLOUDFLARE_API_TOKEN || !env.CLOUDFLARE_ACCOUNT_ID) {
-          return Response.json({
-            ok: false,
-            error: "CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 시크릿이 없습니다. Cloudflare 대시보드에서 API 토큰(Account Analytics:Read 권한)을 발급받아 등록해야 합니다.",
-          });
-        }
-
-        const today = new Date().toISOString().slice(0, 10); // UTC 기준 오늘 (Cloudflare 분석도 UTC 기준)
-        const query = `
-          query GetUsage($accountTag: String!, $date: String!) {
-            viewer {
-              accounts(filter: { accountTag: $accountTag }) {
-                d1AnalyticsAdaptiveGroups(
-                  filter: { date: $date }
-                  limit: 50
-                ) {
-                  sum { readQueries writeQueries rowsRead rowsWritten }
-                  dimensions { databaseId }
-                }
-                workersInvocationsAdaptive(
-                  filter: { date: $date }
-                  limit: 50
-                ) {
-                  sum { requests errors subrequests }
-                  dimensions { scriptName }
-                }
-              }
-            }
-          }`;
-
-        try {
-          const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
-            },
-            body: JSON.stringify({
-              query,
-              variables: { accountTag: env.CLOUDFLARE_ACCOUNT_ID, date: today },
-            }),
-          });
-          const data = await res.json();
-          if (data.errors && data.errors.length) {
-            // 쿼리 필드명이 실제 API와 다를 수 있음(문서가 계속 바뀜) - 에러를 그대로 보여줘서 디버깅 가능하게 함
-            return Response.json({ ok: false, error: "Cloudflare API 에러", detail: data.errors }, { status: 500 });
-          }
-
-          const account = data.data?.viewer?.accounts?.[0];
-          const d1Groups = account?.d1AnalyticsAdaptiveGroups || [];
-          const workerGroups = account?.workersInvocationsAdaptive || [];
-
-          const d1Total = d1Groups.reduce(
-            (acc, g) => ({
-              readQueries: acc.readQueries + (g.sum.readQueries || 0),
-              writeQueries: acc.writeQueries + (g.sum.writeQueries || 0),
-              rowsRead: acc.rowsRead + (g.sum.rowsRead || 0),
-              rowsWritten: acc.rowsWritten + (g.sum.rowsWritten || 0),
-            }),
-            { readQueries: 0, writeQueries: 0, rowsRead: 0, rowsWritten: 0 }
-          );
-          const workerTotal = workerGroups.reduce(
-            (acc, g) => ({
-              requests: acc.requests + (g.sum.requests || 0),
-              errors: acc.errors + (g.sum.errors || 0),
-              subrequests: acc.subrequests + (g.sum.subrequests || 0),
-            }),
-            { requests: 0, errors: 0, subrequests: 0 }
-          );
-
-          // 무료 티어 기준 한도 (2026년 기준, Cloudflare 정책 바뀌면 실제 대시보드로 재확인 필요)
-          const limits = {
-            workersRequestsPerDay: 100000,
-            d1RowsReadPerDay: 5000000,
-            d1RowsWrittenPerDay: 100000,
-          };
-
-          return Response.json({
-            ok: true,
-            date: today,
-            workers: { ...workerTotal, limitPerDay: limits.workersRequestsPerDay, pct: +((workerTotal.requests / limits.workersRequestsPerDay) * 100).toFixed(1) },
-            d1: {
-              ...d1Total,
-              limitReadPerDay: limits.d1RowsReadPerDay,
-              limitWritePerDay: limits.d1RowsWrittenPerDay,
-              pctRead: +((d1Total.rowsRead / limits.d1RowsReadPerDay) * 100).toFixed(1),
-              pctWrite: +((d1Total.rowsWritten / limits.d1RowsWrittenPerDay) * 100).toFixed(1),
-            },
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
