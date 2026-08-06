@@ -2909,14 +2909,14 @@ function renderDashboard() {
     cursor:pointer;
   }
   #cfUsageToggle {
-    position:fixed; left:14px; top:14px; z-index:95;
+    position:fixed; left:14px; top:60px; z-index:94;
     width:32px; height:32px; border-radius:50%; background:#232323;
     display:flex; align-items:center; justify-content:center; font-size:14px;
     opacity:0.5; cursor:pointer;
   }
   #cfUsageToggle:active { opacity:1; }
   #cfUsagePanel {
-    position:fixed; left:14px; top:52px; z-index:95;
+    position:fixed; left:14px; top:98px; z-index:94;
     background:#1c1c1c; border:1px solid #333; border-radius:10px;
     padding:10px 12px; font-size:11px; color:#aaa; width:220px;
     box-shadow:0 2px 10px rgba(0,0,0,0.5);
