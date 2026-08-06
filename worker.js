@@ -413,6 +413,9 @@ async function purgeOldRows(env) {
   await env.DB.prepare(`DELETE FROM signal_backtest_history WHERE date < ?`).bind(historyCutoff).run().catch(() => {});
   // daily_ohlc_cache도 하루 지나면 무의미 (다음날은 또 새 일봉이라 어차피 재조회됨)
   await env.DB.prepare(`DELETE FROM daily_ohlc_cache WHERE updated_at < ?`).bind(shortCutoff).run().catch(() => {});
+  // watchlist_fine_snapshots는 30초마다 쌓여서 금방 커짐 - 2일만 유지
+  const fineCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(`DELETE FROM watchlist_fine_snapshots WHERE captured_at < ?`).bind(fineCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
 
   return result.meta?.changes ?? 0;
@@ -3753,8 +3756,41 @@ async function runDailySignalBacktest(env) {
     .catch(() => {});
 }
 
+// 관심종목 30초 촘촘 기록 - 전체 150~200종목을 이 주기로 D1에 쓰면 하루 쓰기 한도(10만행)를 넘기지만,
+// 관심종목은 보통 15~20개뿐이라 여유 충분함. 새 cron을 안 만들고, 화면이 열려있는 동안 이미 2초마다
+// 도는 실시간 폴링(이 함수를 부르는 /api/realtime-all)에 편승 - 화면 안 보고 있으면 자연히 기록도 안 됨
+// (Cloudflare cron 최소 단위가 1분이라 cron으로는 애초에 30초 주기가 불가능함)
+const FINE_SNAPSHOT_INTERVAL_MS = 30000;
+async function maybeWriteFineWatchlistSnapshot(env, codes, stocks) {
+  if (!codes.length) return;
+  try {
+    // 마지막 기록 시각을 D1에 저장해두고, 이번 요청이 그로부터 30초 이상 지났을 때만 씀
+    // (Worker는 요청마다 새 인스턴스일 수 있어서 메모리로는 상태를 못 지킴 - D1에 저장)
+    const stateRow = await env.DB.prepare(`SELECT last_written_at FROM fine_snapshot_state WHERE id = 1`).first().catch(() => null);
+    const lastWritten = stateRow ? new Date(stateRow.last_written_at).getTime() : 0;
+    if (Date.now() - lastWritten < FINE_SNAPSHOT_INTERVAL_MS) return;
+
+    const now = new Date().toISOString();
+    const validRows = codes.filter((c) => stocks[c] && stocks[c].price).map((c) => ({ code: c, ...stocks[c] }));
+    if (!validRows.length) return;
+
+    const stmt = env.DB.prepare(
+      `INSERT INTO watchlist_fine_snapshots (code, price, rate, cntr_str, buy_req, sel_req, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    await env.DB.batch(validRows.map((r) => stmt.bind(r.code, r.price, r.rate || 0, r.cntrStr || 0, 0, 0, now)));
+
+    await env.DB.prepare(
+      `INSERT INTO fine_snapshot_state (id, last_written_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_written_at = excluded.last_written_at`
+    )
+      .bind(now)
+      .run();
+  } catch (e) {
+    // 기록 실패해도 실시간 화면 표시 자체엔 지장 없어야 하므로 조용히 무시
+  }
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     try {
@@ -4551,6 +4587,12 @@ self.addEventListener('fetch', (e) => {
 
           const res = await kiwoomRelayFetch(env, "/realtime/all", { method: "GET" });
           const data = await res.json();
+
+          // 관심종목만 30초 촘촘 기록 (응답을 막지 않도록 기다리지 않고 백그라운드로 실행)
+          if (codes.length && data.stocks) {
+            ctx.waitUntil(maybeWriteFineWatchlistSnapshot(env, codes, data.stocks));
+          }
+
           return Response.json({
             ok: true,
             wsConnected: data.wsConnected,
