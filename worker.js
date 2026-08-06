@@ -564,10 +564,14 @@ async function getLatest(env) {
     repeatMap = new Map(JSON.parse(extrasCached.repeat_json));
   } else {
     const threeDaysAgoIso = new Date(new Date(times[0]).getTime() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    // 당일 시작/끝 경계를 명시적 범위로 - `LIKE ? `(바인딩 파라미터)는 SQLite 플래너가 prefix 최적화를
+    // 못 태우는 경우가 많아 captured_at 인덱스가 있어도 풀스캔이 됨. >= / < 범위 비교로 바꾸면 확실히 인덱스를 탐.
+    const todayStartIso = todayPrefix + "T00:00:00.000Z";
+    const todayEndIso = todayPrefix + "T23:59:59.999Z";
     const [todayMaxRes, repeatRes] = await Promise.all([
       // 당일 종목별 등락률 최고치 - 지금이 그 최고치를 찍고 있는 중인지(신고가 경신) 판단용
-      env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at LIKE ? GROUP BY code`)
-        .bind(todayPrefix + "%")
+      env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at >= ? AND captured_at <= ? GROUP BY code`)
+        .bind(todayStartIso, todayEndIso)
         .all(),
       // 최근 3일간 이 종목이 급등리스트(5%+)에 며칠 등장했는지 - 일회성 vs 지속 관심 구분용
       env.DB.prepare(
