@@ -2491,6 +2491,80 @@ function loadWatchlistDailyStats() {
 loadWatchlistDailyStats();
 setInterval(() => { if (!document.hidden) loadWatchlistDailyStats(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
 
+// 일별 실현손익 히스토리 - 화면 표시(오늘치 실현손익)는 자정에 초기화되지만 원본 기록은 D1에 계속
+// 남아있어서, 여기서 과거 날짜별로 묶어 막대그래프로 보여줌. 접었다 펼 수 있게 해서 평소엔 안 거슬리게 함.
+let pnlHistoryLoaded = false;
+let pnlHistoryExpanded = false;
+function renderPnlHistoryChart(daily) {
+  const chartEl = document.getElementById('pnlHistoryChart');
+  if (!daily || !daily.length) {
+    chartEl.innerHTML = '<div class="empty" style="padding:8px 0;">아직 기록된 날짜별 데이터가 없습니다.</div>';
+    return;
+  }
+  const w = 700, h = 140, padL = 50, padR = 10, padT = 10, padB = 20;
+  const barAreaW = w - padL - padR;
+  const barGap = 4;
+  const barW = Math.max(4, barAreaW / daily.length - barGap);
+  const maxAbs = Math.max(1, ...daily.map(d => Math.abs(d.netWon)));
+  const zeroY = padT + (h - padT - padB) / 2;
+  const scaleY = (h - padT - padB) / 2 / maxAbs;
+
+  const bars = daily.map((d, i) => {
+    const x = padL + i * (barW + barGap);
+    const barH = Math.abs(d.netWon) * scaleY;
+    const y = d.netWon >= 0 ? zeroY - barH : zeroY;
+    const color = d.netWon > 0 ? '#e03131' : (d.netWon < 0 ? '#1971c2' : '#495057');
+    const label = d.date.slice(5); // MM-DD
+    const tipText = d.date + ': ' + (d.netWon >= 0 ? '+' : '') + d.netWon.toLocaleString() + '원 (승률 ' + d.winRatePct + '%, ' + d.count + '건)';
+    // title은 데스크톱 마우스 hover에만 반응하고 모바일 터치엔 안 뜸 -
+    // 같은 막대에 클릭/탭 이벤트도 걸어서 터치 사용자는 탭하면 아래 텍스트로 보이게 함.
+    // 히트박스를 위아래로 넓혀서(투명 rect) 막대가 얇을 때도 탭하기 쉽게 함.
+    const hitY = padT, hitH = h - padT - padB;
+    return '<rect class="pnlBarHit" data-tip="' + tipText.replace(/"/g, '&quot;') + '" x="' + x.toFixed(1) + '" y="' + hitY + '" width="' + barW.toFixed(1) + '" height="' + hitH + '" fill="transparent" style="cursor:pointer;">' +
+      '</rect>' +
+      '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + Math.max(1, barH).toFixed(1) + '" fill="' + color + '" style="pointer-events:none;">' +
+      '<title>' + tipText + '</title>' +
+      '</rect>' +
+      (daily.length <= 20 ? '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (h - 6) + '" font-size="8" fill="#868e96" text-anchor="middle" style="pointer-events:none;">' + label + '</text>' : '');
+  }).join('');
+
+  chartEl.innerHTML =
+    '<svg viewBox="0 0 ' + w + ' ' + h + '" style="width:100%; height:' + h + 'px;">' +
+    '<line x1="' + padL + '" y1="' + zeroY.toFixed(1) + '" x2="' + (w - padR) + '" y2="' + zeroY.toFixed(1) + '" stroke="#495057" stroke-width="1"/>' +
+    '<text x="' + (padL - 6) + '" y="' + (padT + 4) + '" font-size="9" fill="#868e96" text-anchor="end">+' + maxAbs.toLocaleString() + '</text>' +
+    '<text x="' + (padL - 6) + '" y="' + (h - padB) + '" font-size="9" fill="#868e96" text-anchor="end">-' + maxAbs.toLocaleString() + '</text>' +
+    bars +
+    '</svg>' +
+    '<div id="pnlHistoryTip" style="font-size:11px; color:#adb5bd; padding:4px 2px; min-height:14px;">막대를 탭하면 상세 내역이 여기 표시됩니다</div>';
+}
+function loadPnlHistory() {
+  fetch('/api/watchlist-pnl-history?days=30')
+    .then(res => res.json())
+    .then(data => {
+      const board = document.getElementById('pnlHistoryBoard');
+      if (!data.ok || !data.daily || !data.daily.length) { board.style.display = 'none'; return; }
+      board.style.display = 'block';
+      renderPnlHistoryChart(data.daily);
+      pnlHistoryLoaded = true;
+    })
+    .catch(() => {});
+}
+document.getElementById('pnlHistoryToggle').addEventListener('click', () => {
+  pnlHistoryExpanded = !pnlHistoryExpanded;
+  const chartEl = document.getElementById('pnlHistoryChart');
+  const toggleEl = document.getElementById('pnlHistoryToggle');
+  chartEl.style.display = pnlHistoryExpanded ? 'block' : 'none';
+  toggleEl.textContent = '📊 일별 실현손익 히스토리 ' + (pnlHistoryExpanded ? '▴' : '▾');
+  if (pnlHistoryExpanded && !pnlHistoryLoaded) loadPnlHistory();
+});
+loadPnlHistory(); // 접힌 상태에서도 데이터 유무만 먼저 확인해서 board 표시 여부를 정함
+document.getElementById('pnlHistoryChart').addEventListener('click', (e) => {
+  const bar = e.target.closest('.pnlBarHit');
+  if (!bar) return;
+  const tipEl = document.getElementById('pnlHistoryTip');
+  if (tipEl) tipEl.textContent = bar.dataset.tip;
+});
+
 // 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
 function updateGoldenWindowBanner() {
   const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
@@ -2938,6 +3012,10 @@ function renderDashboard() {
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
+    <div id="pnlHistoryBoard" style="display:none; margin-bottom:10px;">
+      <div id="pnlHistoryToggle" style="cursor:pointer; color:#868e96; font-size:12px; user-select:none;">📊 일별 실현손익 히스토리 ▾</div>
+      <div id="pnlHistoryChart" style="display:none;"></div>
+    </div>
     <table id="watchlist">
       <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
       <tbody><tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr></tbody>
@@ -4952,6 +5030,50 @@ self.addEventListener('fetch', (e) => {
             lossWon: Math.round(lossWon),
             netWon: Math.round(profitWon + lossWon),
           });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // 날짜별 실현손익 히스토리 - 화면 표시는 당일 자정에 초기화되지만 원본 기록(watchlist_performance)은
+      // 계속 D1에 남아있으므로, 여기서 날짜별로 묶어서 과거 추이를 차트로 보여줄 수 있게 함.
+      if (url.pathname === "/api/watchlist-pnl-history") {
+        try {
+          const days = Math.min(parseInt(url.searchParams.get("days") || "30", 10) || 30, 180);
+          const BUY_AMOUNT = 1000000;
+          // recorded_at(KST)의 날짜만 뽑아서 그룹핑. horizon_min=30만 써서 60분치와 중복집계 방지(daily-stats와 동일 기준).
+          const res = await env.DB.prepare(
+            `SELECT
+               date(datetime(recorded_at, '+9 hours')) AS kstDate,
+               pnl_pct
+             FROM watchlist_performance
+             WHERE horizon_min = 30
+               AND recorded_at >= datetime('now', '-' || ? || ' days')
+             ORDER BY kstDate ASC`
+          )
+            .bind(days)
+            .all();
+
+          const byDate = new Map();
+          for (const r of res.results || []) {
+            if (!byDate.has(r.kstDate)) byDate.set(r.kstDate, { profitWon: 0, lossWon: 0, count: 0, wins: 0 });
+            const s = byDate.get(r.kstDate);
+            const amount = BUY_AMOUNT * (r.pnl_pct / 100);
+            if (amount > 0) { s.profitWon += amount; s.wins++; }
+            else s.lossWon += amount;
+            s.count++;
+          }
+
+          const daily = [...byDate.entries()].map(([date, s]) => ({
+            date,
+            profitWon: Math.round(s.profitWon),
+            lossWon: Math.round(s.lossWon),
+            netWon: Math.round(s.profitWon + s.lossWon),
+            count: s.count,
+            winRatePct: +((s.wins / s.count) * 100).toFixed(1),
+          }));
+
+          return Response.json({ ok: true, days, daily });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
