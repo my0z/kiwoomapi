@@ -2235,6 +2235,12 @@ function fmtHHMM(t) {
 const autoAddedCondCodes = new Set();
 const AUTO_ADD_MAX = 10; // 관심종목 무한정 늘어나는 것 방지 - 동시 보유 상한
 function autoAddConditionHits(history, condName) {
+  // 15:40 이후는 정규장 마감(15:30) 직후라 매매 실익이 없어 신규 자동편입을 중지.
+  // 재편입(이미 담긴 종목 상단이동)도 같이 막음 - 새 판단을 더 안 하겠다는 의미이므로.
+  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const kstMinutes = kst.getHours() * 60 + kst.getMinutes();
+  if (kstMinutes >= 15 * 60 + 40) return;
+
   const label = '자동편입' + (condName ? '(' + condName + ')' : '');
   for (const h of history) {
     if (h.initial || !h.time) continue; // 최초 스냅샷부터 있던 건 "신규 편입"이 아님
