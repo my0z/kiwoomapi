@@ -2296,6 +2296,7 @@ function autoAddConditionHits(history, condName) {
     watchlistCodes.add(h.code);
     watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: label }, ...watchlistItems];
     renderWatchlist(watchlistItems);
+    sendNotify('⚡ 신규 포착: ' + name, condName ? condName + ' 조건 충족' : '실시간 조건검색 편입');
     fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2431,7 +2432,7 @@ function pollRealtimeAll() {
     .catch(() => {});
 }
 pollRealtimeAll();
-setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000); // 통합 폴링 2초 (relay 메모리 읽기라 부담 없음, 실제 수신 간격이 약 2초)
+setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 1000); // 통합 폴링 1초 (relay 메모리 읽기라 부담 없음 - 단타 대응 위해 2초에서 단축)
 
 // 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
 // cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
@@ -2609,7 +2610,8 @@ function requestNotifyPermission() {
 function updateNotifyButton() {
   const btn = document.getElementById('notifyToggleBtn');
   if (!btn) return;
-  btn.textContent = notifyEnabled ? '🔔 알림 켜짐' : '🔕 알림 꺼짐';
+  btn.textContent = notifyEnabled ? '🔔' : '🔕';
+  btn.title = notifyEnabled ? '알림 켜짐 (탭 누르면 끄기 안내)' : '알림 꺼짐 - 눌러서 켜기';
   btn.classList.toggle('active', notifyEnabled);
 }
 function sendNotify(title, body) {
@@ -2717,8 +2719,10 @@ function renderDashboard() {
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
   #notifyToggleBtn {
-    font-size:11px; background:#232323; color:#888; border:none; border-radius:8px;
-    padding:4px 8px; margin-left:8px; vertical-align:middle; cursor:pointer;
+    position:fixed; right:14px; top:60px; z-index:94;
+    width:48px; height:48px; border-radius:50%; background:#232323; color:#888;
+    display:flex; align-items:center; justify-content:center; font-size:20px;
+    border:none; box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer; opacity:0.9;
   }
   #notifyToggleBtn.active { background:#1c2a1c; color:#69db7c; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
@@ -2940,7 +2944,8 @@ function renderDashboard() {
     position:fixed; left:14px; top:60px; z-index:94;
     width:48px; height:48px; border-radius:50%; background:#232323;
     display:flex; align-items:center; justify-content:center; font-size:22px;
-    opacity:0.8; cursor:pointer;
+    border:1px solid #3a3a3a; box-shadow:0 2px 8px rgba(0,0,0,0.4);
+    opacity:0.9; cursor:pointer;
   }
   #cfUsageToggle:active { opacity:1; }
   #cfUsagePanel {
@@ -2998,7 +3003,8 @@ function renderDashboard() {
   <button id="reloadBtn" title="화면 새로고침">🔄</button>
   <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
-  <h1 style="display:none;">🔥 급등주 스크리너 <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button></h1>
+  <h1 style="display:none;">🔥 급등주 스크리너</h1>
+  <button id="notifyToggleBtn" onclick="requestNotifyPermission()" title="알림 꺼짐 - 눌러서 켜기">🔕</button>
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
