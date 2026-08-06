@@ -566,9 +566,8 @@ async function getLatest(env) {
     const threeDaysAgoIso = new Date(new Date(times[0]).getTime() - 3 * 24 * 60 * 60 * 1000).toISOString();
     const [todayMaxRes, repeatRes] = await Promise.all([
       // 당일 종목별 등락률 최고치 - 지금이 그 최고치를 찍고 있는 중인지(신고가 경신) 판단용
-      // LIKE 'prefix%'는 인덱스를 못 타서 풀스캔 유발 - 범위비교(>=/<)로 전환
-      env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at >= ? AND captured_at < ? GROUP BY code`)
-        .bind(todayPrefix, todayPrefix + "\uFFFF")
+      env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at LIKE ? GROUP BY code`)
+        .bind(todayPrefix + "%")
         .all(),
       // 최근 3일간 이 종목이 급등리스트(5%+)에 며칠 등장했는지 - 일회성 vs 지속 관심 구분용
       env.DB.prepare(
@@ -1772,7 +1771,6 @@ document.getElementById('fullReloadBtn').addEventListener('click', (e) => {
 // ---------- 관심종목(즐겨찾기) ----------
 let watchlistCodes = new Set();
 let watchlistItems = []; // 관심종목 원본 데이터 (낙관적 업데이트 시 이 배열을 직접 조작)
-let watchlistSort = 'added'; // 'added' | 'pnlDesc' | 'pnlAsc'
 
 // 실질 수익률 계산: 정수 주식 매수, 매수/매도 수수료 각 0.015%, 매도 시 증권거래세 0.20%(2026년 기준, 코스피/코스닥 동일)
 const KIWOOM_FEE_RATE = 0.00015;
@@ -1983,13 +1981,6 @@ function renderWatchlist(items) {
     };
   });
 
-  if (watchlistSort === 'pnlDesc') {
-    rows.sort((a, b) => (b.pnl ? b.pnl.netPnlPct : -Infinity) - (a.pnl ? a.pnl.netPnlPct : -Infinity));
-  } else if (watchlistSort === 'pnlAsc') {
-    rows.sort((a, b) => (a.pnl ? a.pnl.netPnlPct : Infinity) - (b.pnl ? b.pnl.netPnlPct : Infinity));
-  }
-  // 'added'(기본)는 서버가 준 순서(added_at DESC) 그대로 유지 - 별도 정렬 없음
-
   if (!rows.length) {
     tbody.innerHTML = '<tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr>';
   } else {
@@ -2073,25 +2064,6 @@ function renderWatchlist(items) {
     });
   });
 }
-
-document.getElementById('wlSortByAdded').addEventListener('click', (e) => {
-  watchlistSort = 'added';
-  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderWatchlist(watchlistItems);
-});
-document.getElementById('wlSortByPnlDesc').addEventListener('click', (e) => {
-  watchlistSort = 'pnlDesc';
-  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderWatchlist(watchlistItems);
-});
-document.getElementById('wlSortByPnlAsc').addEventListener('click', (e) => {
-  watchlistSort = 'pnlAsc';
-  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderWatchlist(watchlistItems);
-});
 
 // 관심종목 단독 새로고침 (별표 토글 직후처럼 즉시 반영이 필요할 때만 사용,
 // 평상시 10초 주기 갱신은 /api/latest 응답에 묻어오는 데이터로 처리해서 별도 요청 안 나감)
@@ -2296,7 +2268,6 @@ function autoAddConditionHits(history, condName) {
     watchlistCodes.add(h.code);
     watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: label }, ...watchlistItems];
     renderWatchlist(watchlistItems);
-    sendNotify('⚡ 신규 포착: ' + name, condName ? condName + ' 조건 충족' : '실시간 조건검색 편입');
     fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2432,7 +2403,7 @@ function pollRealtimeAll() {
     .catch(() => {});
 }
 pollRealtimeAll();
-setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 1000); // 통합 폴링 1초 (relay 메모리 읽기라 부담 없음 - 단타 대응 위해 2초에서 단축)
+setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000); // 통합 폴링 2초 (relay 메모리 읽기라 부담 없음, 실제 수신 간격이 약 2초)
 
 // 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
 // cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
@@ -2490,7 +2461,7 @@ function loadWatchlistDailyStats() {
     .then(res => res.json())
     .then(data => {
       const tag = document.getElementById('autoRemovedTag');
-      if (!data.ok) { tag.style.display = 'none'; return; }
+      if (!data.ok || (!data.added && !data.removed)) { tag.style.display = 'none'; return; }
       const netWon = data.netWon || 0;
       const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
       tag.innerHTML =
@@ -2604,43 +2575,14 @@ function refreshRealtimeWatchlist() {
 // 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
 let notifyEnabled = false;
 function requestNotifyPermission() {
-  if (!('Notification' in window)) {
-    alert('이 브라우저는 알림 기능을 지원하지 않습니다.');
-    return;
-  }
-  if (Notification.permission === 'denied') {
-    alert('브라우저 설정에서 이 사이트의 알림 권한이 차단되어 있습니다.\n브라우저 주소창의 자물쇠(사이트 설정) 아이콘에서 알림을 허용으로 바꿔주세요.');
-    return;
-  }
-  if (Notification.permission === 'granted') {
-    // 이미 허용된 상태에서 다시 누르면 알림 자체를 켜기/끄기 토글 (권한 재요청은 브라우저가 무시함)
-    notifyEnabled = !notifyEnabled;
-    updateNotifyButton();
-    return;
-  }
-  // Promise 방식과 구형 콜백 방식을 모두 지원 (일부 브라우저는 Promise .then이 안정적으로 안 불림)
-  const handleResult = (perm) => {
-    notifyEnabled = perm === 'granted';
-    updateNotifyButton();
-  };
-  try {
-    const p = Notification.requestPermission(handleResult);
-    if (p && typeof p.then === 'function') {
-      p.then(handleResult).catch(() => {});
-    }
-  } catch (e) {}
+  if (!('Notification' in window)) return;
+  Notification.requestPermission().then(perm => { notifyEnabled = perm === 'granted'; updateNotifyButton(); });
 }
 function updateNotifyButton() {
   const btn = document.getElementById('notifyToggleBtn');
   if (!btn) return;
-  btn.textContent = notifyEnabled ? '🔔' : '🔕';
-  btn.title = notifyEnabled ? '알림 켜짐 - 눌러서 끄기' : '알림 꺼짐 - 눌러서 켜기';
+  btn.textContent = notifyEnabled ? '🔔 알림 켜짐' : '🔕 알림 꺼짐';
   btn.classList.toggle('active', notifyEnabled);
-  const label = document.getElementById('notifyStatusLabel');
-  if (label) {
-    label.textContent = notifyEnabled ? '켜짐' : '꺼짐';
-    label.classList.toggle('active', notifyEnabled);
-  }
 }
 function sendNotify(title, body) {
   // 탭을 보고 있을 때는 화면 배지로 이미 보이니 중복 알림 안 함 - 백그라운드일 때만 브라우저 알림
@@ -2747,19 +2689,10 @@ function renderDashboard() {
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
   #notifyToggleBtn {
-    position:fixed; right:14px; top:60px; z-index:94;
-    width:48px; height:48px; border-radius:50%; background:#2a1414; color:#ff8787;
-    display:flex; align-items:center; justify-content:center; font-size:20px;
-    border:2px solid #4a2020; box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer; opacity:0.95;
+    font-size:11px; background:#232323; color:#888; border:none; border-radius:8px;
+    padding:4px 8px; margin-left:8px; vertical-align:middle; cursor:pointer;
   }
-  #notifyToggleBtn.active { background:#0f2415; color:#69db7c; border-color:#1f4a2a; }
-  #notifyStatusLabel {
-    position:fixed; right:10px; top:110px; z-index:94;
-    font-size:10px; font-weight:600; color:#ff8787; background:#1c1c1c;
-    padding:2px 8px; border-radius:8px; text-align:center; width:44px;
-    box-shadow:0 2px 6px rgba(0,0,0,0.4);
-  }
-  #notifyStatusLabel.active { color:#69db7c; }
+  #notifyToggleBtn.active { background:#1c2a1c; color:#69db7c; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
@@ -2979,8 +2912,7 @@ function renderDashboard() {
     position:fixed; left:14px; top:60px; z-index:94;
     width:48px; height:48px; border-radius:50%; background:#232323;
     display:flex; align-items:center; justify-content:center; font-size:22px;
-    border:1px solid #3a3a3a; box-shadow:0 2px 8px rgba(0,0,0,0.4);
-    opacity:0.9; cursor:pointer;
+    opacity:0.8; cursor:pointer;
   }
   #cfUsageToggle:active { opacity:1; }
   #cfUsagePanel {
@@ -3038,9 +2970,7 @@ function renderDashboard() {
   <button id="reloadBtn" title="화면 새로고침">🔄</button>
   <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
-  <h1 style="display:none;">🔥 급등주 스크리너</h1>
-  <button id="notifyToggleBtn" onclick="requestNotifyPermission()" title="알림 꺼짐 - 눌러서 켜기">🔕</button>
-  <div id="notifyStatusLabel">꺼짐</div>
+  <h1 style="display:none;">🔥 급등주 스크리너 <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button></h1>
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
@@ -3053,11 +2983,6 @@ function renderDashboard() {
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
-    <div class="sortToggle">
-      <button class="sortBtn active" id="wlSortByAdded">추가순</button>
-      <button class="sortBtn" id="wlSortByPnlDesc">수익률 높은순</button>
-      <button class="sortBtn" id="wlSortByPnlAsc">수익률 낮은순</button>
-    </div>
     <div id="pnlHistoryChart" style="display:none;"></div>
     <table id="watchlist">
       <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
