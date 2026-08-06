@@ -2604,8 +2604,31 @@ function refreshRealtimeWatchlist() {
 // 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
 let notifyEnabled = false;
 function requestNotifyPermission() {
-  if (!('Notification' in window)) return;
-  Notification.requestPermission().then(perm => { notifyEnabled = perm === 'granted'; updateNotifyButton(); });
+  if (!('Notification' in window)) {
+    alert('이 브라우저는 알림 기능을 지원하지 않습니다.');
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    alert('브라우저 설정에서 이 사이트의 알림 권한이 차단되어 있습니다.\n브라우저 주소창의 자물쇠(사이트 설정) 아이콘에서 알림을 허용으로 바꿔주세요.');
+    return;
+  }
+  if (Notification.permission === 'granted') {
+    // 이미 허용된 상태에서 다시 누르면 알림 자체를 켜기/끄기 토글 (권한 재요청은 브라우저가 무시함)
+    notifyEnabled = !notifyEnabled;
+    updateNotifyButton();
+    return;
+  }
+  // Promise 방식과 구형 콜백 방식을 모두 지원 (일부 브라우저는 Promise .then이 안정적으로 안 불림)
+  const handleResult = (perm) => {
+    notifyEnabled = perm === 'granted';
+    updateNotifyButton();
+  };
+  try {
+    const p = Notification.requestPermission(handleResult);
+    if (p && typeof p.then === 'function') {
+      p.then(handleResult).catch(() => {});
+    }
+  } catch (e) {}
 }
 function updateNotifyButton() {
   const btn = document.getElementById('notifyToggleBtn');
