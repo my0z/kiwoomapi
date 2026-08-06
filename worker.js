@@ -1290,7 +1290,6 @@ function computeRecommendations(latest, pullbackCodes) {
       if (volumeConfirmed) score += 1.5;
       // 체결강도 절대수준: 100 넘는지(방향)뿐 아니라 얼마나 강한지도 봄 - 150 이상은 "강한 매수세 유입"이 통상적 해석 기준
       if ((r.cntr_str || 0) >= 150) score += 1.5;
-      if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) score += 2; // 표본 부족으로 판단 보류, 기존 유지
       score += (r.relativeStrength || 0) * 0.5;
       if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
       if ((r.price || 0) < 2000) score -= 3; // 동전주 위험
