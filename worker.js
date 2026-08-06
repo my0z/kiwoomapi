@@ -1771,6 +1771,7 @@ document.getElementById('fullReloadBtn').addEventListener('click', (e) => {
 // ---------- 관심종목(즐겨찾기) ----------
 let watchlistCodes = new Set();
 let watchlistItems = []; // 관심종목 원본 데이터 (낙관적 업데이트 시 이 배열을 직접 조작)
+let watchlistSort = 'added'; // 'added' | 'pnlDesc' | 'pnlAsc'
 
 // 실질 수익률 계산: 정수 주식 매수, 매수/매도 수수료 각 0.015%, 매도 시 증권거래세 0.20%(2026년 기준, 코스피/코스닥 동일)
 const KIWOOM_FEE_RATE = 0.00015;
@@ -1981,6 +1982,12 @@ function renderWatchlist(items) {
     };
   });
 
+  if (watchlistSort === 'pnlDesc') {
+    rows.sort((a, b) => (b.pnl ? b.pnl.netPnlPct : -Infinity) - (a.pnl ? a.pnl.netPnlPct : -Infinity));
+  } else if (watchlistSort === 'pnlAsc') {
+    rows.sort((a, b) => (a.pnl ? a.pnl.netPnlPct : Infinity) - (b.pnl ? b.pnl.netPnlPct : Infinity));
+  }
+
   if (!rows.length) {
     tbody.innerHTML = '<tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr>';
   } else {
@@ -2064,6 +2071,25 @@ function renderWatchlist(items) {
     });
   });
 }
+
+document.getElementById('wlSortByAdded').addEventListener('click', (e) => {
+  watchlistSort = 'added';
+  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  renderWatchlist(watchlistItems);
+});
+document.getElementById('wlSortByPnlDesc').addEventListener('click', (e) => {
+  watchlistSort = 'pnlDesc';
+  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  renderWatchlist(watchlistItems);
+});
+document.getElementById('wlSortByPnlAsc').addEventListener('click', (e) => {
+  watchlistSort = 'pnlAsc';
+  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  renderWatchlist(watchlistItems);
+});
 
 // 관심종목 단독 새로고침 (별표 토글 직후처럼 즉시 반영이 필요할 때만 사용,
 // 평상시 10초 주기 갱신은 /api/latest 응답에 묻어오는 데이터로 처리해서 별도 요청 안 나감)
@@ -2983,6 +3009,11 @@ function renderDashboard() {
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
+    <div class="sortToggle">
+      <button class="sortBtn active" id="wlSortByAdded">추가순</button>
+      <button class="sortBtn" id="wlSortByPnlDesc">수익률 높은순</button>
+      <button class="sortBtn" id="wlSortByPnlAsc">수익률 낮은순</button>
+    </div>
     <div id="pnlHistoryChart" style="display:none;"></div>
     <table id="watchlist">
       <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
