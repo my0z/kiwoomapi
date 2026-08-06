@@ -123,12 +123,13 @@ function isMarketHoursKST(date) {
 // 원래는 모달을 직접 열어야만 알 수 있었던 것 - watchlist_risk_status 테이블 필요(schema.sql 참고).
 // 관심종목은 보통 소수(몇 개)라 종목당 1.1초 순차조회를 매 틱마다 해도 부담 적음.
 async function checkWatchlistRiskLevels(env) {
-  const wlRes = await env.DB.prepare(`SELECT code, name FROM watchlist`).all();
+  const wlRes = await env.DB.prepare(`SELECT code, name, entry_price FROM watchlist`).all();
   const items = wlRes.results;
   if (!items.length) return { checked: 0 };
 
   const token = await kiwoomIssueToken(env);
   let checked = 0;
+  const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제
   for (const w of items) {
     try {
       // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
@@ -142,6 +143,18 @@ async function checkWatchlistRiskLevels(env) {
       let status = "safe";
       if (quote.price <= stopLoss) status = "stop_loss_hit";
       else if (quote.price >= takeProfit) status = "take_profit_hit";
+
+      // 손익률 -1.5% 이하 - 관심종목에서 바로 제거 (risk_status도 같이 정리)
+      if (w.entry_price && w.entry_price > 0) {
+        const pnlPct = ((quote.price - w.entry_price) / w.entry_price) * 100;
+        if (pnlPct <= AUTO_REMOVE_PNL_PCT) {
+          await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
+          await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
+          await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제 [cron]`);
+          checked++;
+          continue;
+        }
+      }
 
       await env.DB.prepare(
         `INSERT INTO watchlist_risk_status (code, status, price, stop_loss, take_profit, checked_at)
@@ -2405,6 +2418,20 @@ function loadSystemStatusBanner() {
 loadSystemStatusBanner();
 setInterval(() => { if (!document.hidden) loadSystemStatusBanner(); }, 120000); // 2분마다
 
+function loadAutoRemovedCount() {
+  fetch('/api/watchlist-auto-removed-today')
+    .then(res => res.json())
+    .then(data => {
+      const tag = document.getElementById('autoRemovedTag');
+      if (!data.ok || !data.count) { tag.style.display = 'none'; return; }
+      tag.textContent = '오늘 손절 자동삭제 ' + data.count + '종목';
+      tag.style.display = 'inline';
+    })
+    .catch(() => {});
+}
+loadAutoRemovedCount();
+setInterval(() => { if (!document.hidden) loadAutoRemovedCount(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
+
 // 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
 function updateGoldenWindowBanner() {
   const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
@@ -2851,7 +2878,7 @@ function renderDashboard() {
   <div id="goldenWindowBanner" style="display:none;"></div>
 
   <div class="board">
-    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
+    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
     <table id="watchlist">
       <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
       <tbody><tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr></tbody>
@@ -3978,6 +4005,41 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      // relay(오라클 VM) 전용 - 진입가 목록 조회. relay가 이미 웹소켓으로 들고 있는 실시간가와
+      // 여기서 받은 entry_price를 비교해서 손익률 -1.5% 이하 여부를 relay 쪽에서 즉시 판단함
+      // (2분 cron보다 훨씬 빠르게, 초 단위로 체크 가능).
+      if (url.pathname === "/api/watchlist-entries" && request.method === "GET") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
+        }
+        try {
+          const res = await env.DB.prepare(`SELECT code, entry_price FROM watchlist WHERE entry_price > 0`).all();
+          return Response.json({ ok: true, items: res.results });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // relay 전용 - 손익률 -1.5% 이하 도달 시 관심종목 자동삭제 (2분 cron의 checkWatchlistRiskLevels와
+      // 같은 기준, relay는 실시간가를 이미 들고 있어서 더 빠르게 트리거 가능).
+      if (url.pathname === "/api/watchlist/auto-remove" && request.method === "POST") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
+        }
+        try {
+          const { code, pnlPct, name } = await request.json();
+          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
+          await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
+          await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
+          const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
+          await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제 [relay]`);
+          console.log(`relay 손절 자동삭제: ${code} (${pnlStr}%)`);
+          return Response.json({ ok: true });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/latest") {
         const [data, watchlistRes] = await Promise.all([
           getLatest(env),
@@ -4736,6 +4798,23 @@ self.addEventListener('fetch', (e) => {
             totalCount,
             kinds: issues.map((r) => ({ kind: r.kind, count: r.cnt, latest: r.latest })),
           });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // 오늘 자동삭제(손절) 건수 - 관심종목 패널 헤더에 표시용
+      if (url.pathname === "/api/watchlist-auto-removed-today") {
+        try {
+          const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+          const todayStartKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
+          const todayStartUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
+          const res = await env.DB.prepare(
+            `SELECT COUNT(*) as cnt FROM system_events WHERE kind = 'watchlist_auto_removed' AND created_at >= ?`
+          )
+            .bind(todayStartUtc)
+            .first();
+          return Response.json({ ok: true, count: (res && res.cnt) || 0 });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
