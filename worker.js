@@ -1289,10 +1289,13 @@ function computeRecommendations(latest, pullbackCodes) {
       //   isTodayHigh -0.064(표본9322) / pullbackLike -0.040(표본9235) -> 오히려 역효과라 가중치 제거
       //   volumeSpike는 표본 17개뿐이라(30 미만) 판단 보류, 기존 가중치 유지
       // 하루치 데이터라 확정은 아님 - ticks 늘려서 며칠 더 쌓인 뒤 재검증 필요.
+      // 2026-08-06 performance-report: 추천종목TOP10 표본20 avgPnlPct -0.837%/승률45% - overall(50.9%)보다 계속 나쁨.
+      // recentDelta*8은 백테스트 미검증 신호인데 가중치가 제일 커서(0.5%차이=4점) 검증된 수급신호를 압도하고 있었음.
+      // recentDelta 비중 축소 + 검증된 수급신호(bidTurnedPositive/buyReqSpike) 비중 상향으로 균형 조정.
       let score = 0;
-      score += recentDelta * 8; // 지금 이 순간의 방향/속도에 가장 큰 가중치 (이번 백테스트 대상 아님, 유지)
-      if (r.bidTurnedPositive) score += 4; // 실측 근거 있음 - 기존 3에서 상향
-      if (r.buyReqSpike) score += 2.5; // 실측 근거 있음 - 기존 1.5에서 상향
+      score += recentDelta * 4; // 미검증 신호라 가중치 축소 (기존 8 -> 4)
+      if (r.bidTurnedPositive) score += 5.5; // 실측 근거 있음 - 기존 4에서 상향
+      if (r.buyReqSpike) score += 3.5; // 실측 근거 있음 - 기존 2.5에서 상향
       if (r.sellReqThinning) score += 1.5; // 매수잔량급증과 같은 계열(수급유입) 신호지만 이건 아직 자체 백테스트 전 - 신중하게 작게
       // 복합신호(강한매수세): 매수전환+매수잔량급증이 동시에 뜨면 개별 신호보다 훨씬 강한 확인 -
       // 둘 다 검증된 신호가 동시에 나타나는 거라 우연히 겹칠 확률이 낮고, 방향성 있는 진짜 수급일 가능성이 큼
