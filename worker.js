@@ -2180,6 +2180,47 @@ function fmtHHMM(t) {
   return s.length >= 4 ? s.slice(0, 2) + ':' + s.slice(2, 4) : s;
 }
 
+// 조건검색 신규편입 종목 관심종목 자동추가 - "이미 충족중이던 것"(initial)은 새 신호가 아니라서 제외,
+// 이번 세션에서 한 번 처리한 code는 autoAddedCondCodes에 남겨서 재편입/재렌더링 때 중복 추가 안 되게 함.
+const autoAddedCondCodes = new Set();
+const AUTO_ADD_MAX = 10; // 관심종목 무한정 늘어나는 것 방지 - 동시 보유 상한
+function autoAddConditionHits(history) {
+  for (const h of history) {
+    if (h.initial || !h.time) continue; // 최초 스냅샷부터 있던 건 "신규 편입"이 아님
+    if (autoAddedCondCodes.has(h.code)) continue;
+    autoAddedCondCodes.add(h.code);
+    if (watchlistCodes.has(h.code)) continue; // 이미 수동으로 담겨있으면 스킵
+    if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
+
+    const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
+    watchlistCodes.add(h.code);
+    watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: '자동편입' }, ...watchlistItems];
+    renderWatchlist(watchlistItems);
+    fetch('/api/watchlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: h.code, name, sourceBoard: '실시간포착', addedState: '자동편입' }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.ok) {
+          const w = watchlistItems.find(x => x.code === h.code);
+          if (w) { w.entry_price = data.entryPrice; renderWatchlist(watchlistItems); }
+        } else {
+          // 서버 저장 실패 시 로컬 상태도 되돌림
+          watchlistCodes.delete(h.code);
+          watchlistItems = watchlistItems.filter(x => x.code !== h.code);
+          renderWatchlist(watchlistItems);
+        }
+      })
+      .catch(() => {
+        watchlistCodes.delete(h.code);
+        watchlistItems = watchlistItems.filter(x => x.code !== h.code);
+        renderWatchlist(watchlistItems);
+      });
+  }
+}
+
 function renderConditionDock(cond) {
   const board = document.getElementById('conditionDock');
   if (!cond || !cond.seq) { board.style.display = 'none'; return; }
@@ -2195,6 +2236,7 @@ function renderConditionDock(cond) {
 
   // 편입 이력 기준으로 표시 - 조건에서 금방 빠져나간 종목도 사라지지 않고 남음
   const history = cond.history || [];
+  autoAddConditionHits(history);
   const countEl = document.getElementById('conditionDockCount');
   if (countEl) countEl.textContent = history.length ? '(' + history.length + '건 · 현재 조건 ' + (cond.count || 0) + ')' : '';
   if (!history.length) {
