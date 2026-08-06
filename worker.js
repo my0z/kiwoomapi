@@ -2187,10 +2187,8 @@ function autoAddConditionHits(history, condName) {
   const label = '자동편입' + (condName ? '(' + condName + ')' : '');
   for (const h of history) {
     if (h.initial || !h.time) continue; // 최초 스냅샷부터 있던 건 "신규 편입"이 아님
-    if (autoAddedCondCodes.has(h.code)) continue;
-    autoAddedCondCodes.add(h.code);
     if (watchlistCodes.has(h.code)) {
-      // 이미 관심종목에 있으면 새로 담지 않고 리스트 맨 위로만 이동
+      // 이미 관심종목에 있으면 새로 담지 않고 매번 리스트 맨 위로 이동 (재편입마다 반복 실행)
       // (클라이언트만 올리면 15초 주기 load()가 서버 added_at 기준으로 되돌려버리므로 서버도 같이 갱신)
       const idx = watchlistItems.findIndex(w => w.code === h.code);
       if (idx > 0) {
@@ -2199,15 +2197,20 @@ function autoAddConditionHits(history, condName) {
         watchlistItems.unshift(w);
         renderWatchlist(watchlistItems);
       }
-      const existing = watchlistItems.find(w => w.code === h.code);
-      const nm = existing ? existing.name : h.code;
-      fetch('/api/watchlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: h.code, name: nm, sourceBoard: '실시간포착', addedState: label, touchOnly: true }),
-      }).catch(() => {});
+      if (!autoAddedCondCodes.has(h.code + ':' + h.time)) {
+        autoAddedCondCodes.add(h.code + ':' + h.time); // 같은 편입 이벤트로 중복 POST 방지 (편입시각 단위)
+        const existing = watchlistItems.find(w => w.code === h.code);
+        const nm = existing ? existing.name : h.code;
+        fetch('/api/watchlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: h.code, name: nm, sourceBoard: '실시간포착', addedState: label, touchOnly: true }),
+        }).catch(() => {});
+      }
       continue;
     }
+    if (autoAddedCondCodes.has(h.code + ':' + h.time)) continue;
+    autoAddedCondCodes.add(h.code + ':' + h.time);
     if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
 
     const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
