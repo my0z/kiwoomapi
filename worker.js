@@ -1903,11 +1903,13 @@ function renderMiniCandles(candles, addedAt) {
       const diff = Math.abs(Number(c.time) - Number(addedKst));
       if (diff < nearestDiff) { nearestDiff = diff; nearestIdx = i; }
     });
-    // 추가 시점이 이 차트가 보여주는 시간 범위 안에 있을 때만 표시 (범위 밖이면 마커가 엉뚱한 끝에 붙어 오해를 줌)
+    // 추가 시점이 차트 범위 안이면 정확한 위치에, 범위를 벗어나면(장마감 후 추가 등)
+    // 가장 가까운 쪽 끝 캔들에 표시 - 정확한 시각은 아니어도 "그 근처에 추가됐다"는 사실은 전달됨
     const firstTime = Number(candles[0].time), lastTime = Number(candles[candles.length - 1].time);
     const addedNum = Number(addedKst);
-    if (nearestIdx >= 0 && addedNum >= firstTime && addedNum <= lastTime) {
-      const markerX = pad + nearestIdx * candleW + candleW / 2;
+    if (nearestIdx >= 0) {
+      const clampedIdx = addedNum < firstTime ? 0 : (addedNum > lastTime ? candles.length - 1 : nearestIdx);
+      const markerX = pad + clampedIdx * candleW + candleW / 2;
       addedMarkerHtml =
         '<line x1="' + markerX.toFixed(1) + '" y1="0" x2="' + markerX.toFixed(1) + '" y2="' + h + '" stroke="#ffd43b" stroke-width="1" stroke-dasharray="3,2"/>' +
         '<text x="' + markerX.toFixed(1) + '" y="9" fill="#ffd43b" font-size="8" text-anchor="middle">★</text>';
