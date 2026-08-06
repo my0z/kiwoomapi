@@ -2192,12 +2192,21 @@ function autoAddConditionHits(history, condName) {
     autoAddedCondCodes.add(h.code);
     if (watchlistCodes.has(h.code)) {
       // 이미 관심종목에 있으면 새로 담지 않고 리스트 맨 위로만 이동
+      // (클라이언트만 올리면 15초 주기 load()가 서버 added_at 기준으로 되돌려버리므로 서버도 같이 갱신)
       const idx = watchlistItems.findIndex(w => w.code === h.code);
       if (idx > 0) {
         const [w] = watchlistItems.splice(idx, 1);
+        w.added_at = new Date().toISOString();
         watchlistItems.unshift(w);
         renderWatchlist(watchlistItems);
       }
+      const existing = watchlistItems.find(w => w.code === h.code);
+      const nm = existing ? existing.name : h.code;
+      fetch('/api/watchlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: h.code, name: nm, sourceBoard: '실시간포착', addedState: label, touchOnly: true }),
+      }).catch(() => {});
       continue;
     }
     if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
@@ -3902,8 +3911,23 @@ self.addEventListener('fetch', (e) => {
 
       if (url.pathname === "/api/watchlist" && request.method === "POST") {
         try {
-          const { code, name, sourceBoard, addedState } = await request.json();
+          const { code, name, sourceBoard, addedState, touchOnly } = await request.json();
           if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
+
+          // 재편입(이미 관심종목에 있는 종목이 조건검색에 다시 걸림) - 진입가/최초편입시각 건드리지 않고
+          // added_at만 지금 시각으로 올려서 리스트 상단 유지 + added_state에 최신 사유 반영
+          if (touchOnly) {
+            const existing = await env.DB.prepare(`SELECT entry_price FROM watchlist WHERE code = ?`).bind(code).first();
+            if (existing) {
+              await env.DB.prepare(
+                `UPDATE watchlist SET added_at = ?, added_state = ? WHERE code = ?`
+              )
+                .bind(new Date().toISOString(), addedState || "", code)
+                .run();
+              return Response.json({ ok: true, entryPrice: existing.entry_price });
+            }
+            // D1에 없는데 클라이언트만 있던 상태(레이스) - 아래 일반 경로로 신규 추가 진행
+          }
 
           let entryPrice = 0;
 
