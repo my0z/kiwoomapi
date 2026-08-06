@@ -2184,22 +2184,32 @@ function fmtHHMM(t) {
 // 이번 세션에서 한 번 처리한 code는 autoAddedCondCodes에 남겨서 재편입/재렌더링 때 중복 추가 안 되게 함.
 const autoAddedCondCodes = new Set();
 const AUTO_ADD_MAX = 10; // 관심종목 무한정 늘어나는 것 방지 - 동시 보유 상한
-function autoAddConditionHits(history) {
+function autoAddConditionHits(history, condName) {
+  const label = '자동편입' + (condName ? '(' + condName + ')' : '');
   for (const h of history) {
     if (h.initial || !h.time) continue; // 최초 스냅샷부터 있던 건 "신규 편입"이 아님
     if (autoAddedCondCodes.has(h.code)) continue;
     autoAddedCondCodes.add(h.code);
-    if (watchlistCodes.has(h.code)) continue; // 이미 수동으로 담겨있으면 스킵
+    if (watchlistCodes.has(h.code)) {
+      // 이미 관심종목에 있으면 새로 담지 않고 리스트 맨 위로만 이동
+      const idx = watchlistItems.findIndex(w => w.code === h.code);
+      if (idx > 0) {
+        const [w] = watchlistItems.splice(idx, 1);
+        watchlistItems.unshift(w);
+        renderWatchlist(watchlistItems);
+      }
+      continue;
+    }
     if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
 
     const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
     watchlistCodes.add(h.code);
-    watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: '자동편입' }, ...watchlistItems];
+    watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: label }, ...watchlistItems];
     renderWatchlist(watchlistItems);
     fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: h.code, name, sourceBoard: '실시간포착', addedState: '자동편입' }),
+      body: JSON.stringify({ code: h.code, name, sourceBoard: '실시간포착', addedState: label }),
     })
       .then(res => res.json())
       .then(data => {
@@ -2236,7 +2246,7 @@ function renderConditionDock(cond) {
 
   // 편입 이력 기준으로 표시 - 조건에서 금방 빠져나간 종목도 사라지지 않고 남음
   const history = cond.history || [];
-  autoAddConditionHits(history);
+  autoAddConditionHits(history, cond.name);
   const countEl = document.getElementById('conditionDockCount');
   if (countEl) countEl.textContent = history.length ? '(' + history.length + '건 · 현재 조건 ' + (cond.count || 0) + ')' : '';
   if (!history.length) {
@@ -4601,6 +4611,7 @@ self.addEventListener('fetch', (e) => {
             ok: true,
             wsConnected: data.wsConnected,
             seq: data.seq,
+            name: data.name,
             codes: data.codes || [],
             count: data.count || 0,
             lastEventAt: data.lastEventAt,
@@ -4641,7 +4652,7 @@ self.addEventListener('fetch', (e) => {
             wsLoggedIn: data.wsLoggedIn,
             index: data.index || { kospi: null, kosdaq: null },
             stocks: data.stocks || {},
-            condition: data.condition || { seq: null, codes: [], count: 0, history: [] },
+            condition: data.condition || { seq: null, name: null, codes: [], count: 0, history: [] },
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
