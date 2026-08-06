@@ -2475,6 +2475,66 @@ function loadWatchlistDailyStats() {
 loadWatchlistDailyStats();
 setInterval(() => { if (!document.hidden) loadWatchlistDailyStats(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
 
+// 일별 실현손익 히스토리 - SVG 막대그래프, 외부 라이브러리 없이 자체 렌더링.
+// PC(hover)/모바일(tap) 둘 다 지원하도록 각 막대에 마우스/터치 이벤트를 이벤트 위임으로 붙임(.pnlBarHit).
+function renderPnlHistoryChart(history) {
+  const el = document.getElementById('pnlHistoryChart');
+  if (!history || !history.length) { el.style.display = 'none'; return; }
+
+  const W = 320, H = 90, padTop = 8, padBottom = 18, barGap = 3;
+  const barW = Math.max(4, (W - barGap * (history.length - 1)) / history.length);
+  const maxAbs = Math.max(1, ...history.map(d => Math.abs(d.netWon)));
+  const zeroY = padTop + (H - padTop - padBottom) / 2;
+  const halfH = (H - padTop - padBottom) / 2;
+
+  let bars = '';
+  history.forEach((d, i) => {
+    const x = i * (barW + barGap);
+    const h = Math.max(1, Math.abs(d.netWon) / maxAbs * halfH);
+    const y = d.netWon >= 0 ? zeroY - h : zeroY;
+    const color = d.netWon > 0 ? '#e03131' : (d.netWon < 0 ? '#1971c2' : '#666');
+    const mmdd = d.date.slice(5).replace('-', '/');
+    const tip = mmdd + ' ' + (d.netWon >= 0 ? '+' : '') + d.netWon.toLocaleString() + '원 (' + d.count + '건)';
+    bars += '<rect class="pnlBarHit" data-tip="' + tip + '" x="' + x.toFixed(1) + '" y="' + y.toFixed(1) +
+      '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + color + '" rx="1"></rect>';
+  });
+
+  el.innerHTML =
+    '<div style="font-size:11px; color:#999; margin:4px 0 2px;">일별 실현손익 추이 (최근 ' + history.length + '일)</div>' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%; height:' + H + 'px; display:block;">' +
+    '<line x1="0" y1="' + zeroY.toFixed(1) + '" x2="' + W + '" y2="' + zeroY.toFixed(1) + '" stroke="#444" stroke-width="1"></line>' +
+    bars +
+    '</svg>' +
+    '<div id="pnlBarTip" style="font-size:11px; color:#ccc; min-height:14px; margin-top:2px;"></div>';
+  el.style.display = 'block';
+}
+
+function loadPnlHistoryChart() {
+  fetch('/api/watchlist-pnl-history?days=14')
+    .then(res => res.json())
+    .then(data => {
+      if (!data.ok) return;
+      renderPnlHistoryChart(data.history);
+    })
+    .catch(() => {});
+}
+loadPnlHistoryChart();
+setInterval(() => { if (!document.hidden) loadPnlHistoryChart(); }, 120000); // 2분마다
+
+// 막대 hover(PC)/tap(모바일) 공통 처리 - 이벤트 위임이라 매 렌더링마다 리스너 재등록 불필요
+document.addEventListener('mouseover', (e) => {
+  const bar = e.target.closest('.pnlBarHit');
+  if (!bar) return;
+  const tip = document.getElementById('pnlBarTip');
+  if (tip) tip.textContent = bar.getAttribute('data-tip') || '';
+});
+document.addEventListener('click', (e) => {
+  const bar = e.target.closest('.pnlBarHit');
+  if (!bar) return;
+  const tip = document.getElementById('pnlBarTip');
+  if (tip) tip.textContent = bar.getAttribute('data-tip') || '';
+});
+
 // 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
 function updateGoldenWindowBanner() {
   const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
@@ -2922,6 +2982,7 @@ function renderDashboard() {
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
+    <div id="pnlHistoryChart" style="display:none;"></div>
     <table id="watchlist">
       <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
       <tbody><tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr></tbody>
@@ -4942,6 +5003,48 @@ self.addEventListener('fetch', (e) => {
             lossWon: Math.round(lossWon),
             netWon: Math.round(profitWon + lossWon),
           });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // 날짜별 실현손익 히스토리 - 당일 표시는 자정에 초기화되지만 원본 기록(watchlist_performance)은
+      // 계속 D1에 남아있으므로, 날짜별로 묶어서 과거 추이를 차트로 보여줌.
+      if (url.pathname === "/api/watchlist-pnl-history") {
+        try {
+          const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10) || 14, 90);
+          const BUY_AMOUNT = 1000000;
+          const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+          // recorded_at은 UTC 저장이므로 KST(+9h) 보정 후 날짜만 뽑아서 그룹핑.
+          // horizon_min=30만 써서 60분치와 중복집계 방지 (daily-stats와 동일 기준).
+          const res = await env.DB.prepare(
+            `SELECT DATE(datetime(recorded_at, '+9 hours')) as d, pnl_pct
+             FROM watchlist_performance
+             WHERE horizon_min = 30 AND recorded_at >= ?
+             ORDER BY recorded_at ASC`
+          )
+            .bind(cutoff)
+            .all();
+
+          const byDate = {};
+          for (const r of res.results || []) {
+            if (!byDate[r.d]) byDate[r.d] = { profitWon: 0, lossWon: 0, count: 0 };
+            const amount = BUY_AMOUNT * (r.pnl_pct / 100);
+            if (amount > 0) byDate[r.d].profitWon += amount;
+            else byDate[r.d].lossWon += amount;
+            byDate[r.d].count += 1;
+          }
+
+          const dates = Object.keys(byDate).sort();
+          const history = dates.map((d) => ({
+            date: d,
+            profitWon: Math.round(byDate[d].profitWon),
+            lossWon: Math.round(byDate[d].lossWon),
+            netWon: Math.round(byDate[d].profitWon + byDate[d].lossWon),
+            count: byDate[d].count,
+          }));
+
+          return Response.json({ ok: true, history });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
