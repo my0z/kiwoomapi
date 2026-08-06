@@ -1507,6 +1507,10 @@ function computeVerdict(r) {
 }
 
 function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick, boardLabel) {
+  // 이미 관심종목에 담긴 종목은 다른 보드에 중복으로 안 보이게 제외 - 어차피 관심종목 패널에서
+  // 계속 추적 중이라 여기 또 떠 있으면 잡음만 늘어남.
+  items = (items || []).filter(item => !watchlistCodes.has(item.code));
+
   onRowClick = onRowClick || (item => {
     const mapped = byCodeMap[item.code];
     if (mapped) {
@@ -2323,7 +2327,13 @@ function renderConditionDock(cond) {
   }
 
   // 한 줄 표시: 별표 · 종목명(+신호아이콘) · 등락률 · 포착시각
-  tbody.innerHTML = history.slice(0, 25).map(h => {
+  // 이미 관심종목에 담긴 건 표시에서만 제외 - autoAddConditionHits는 위에서 원본 history로 이미 처리됨
+  const displayHistory = history.filter(h => !watchlistCodes.has(h.code));
+  if (!displayHistory.length) {
+    tbody.innerHTML = '<tr><td class="empty">전부 관심종목에 담김</td></tr>';
+    return;
+  }
+  tbody.innerHTML = displayHistory.slice(0, 25).map(h => {
     const live = liveQuoteCache[h.code];
     const rate = live ? live.rate : h.rate;
     const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
