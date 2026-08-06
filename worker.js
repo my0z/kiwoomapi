@@ -2421,19 +2421,19 @@ function loadSystemStatusBanner() {
 loadSystemStatusBanner();
 setInterval(() => { if (!document.hidden) loadSystemStatusBanner(); }, 120000); // 2분마다
 
-function loadAutoRemovedCount() {
-  fetch('/api/watchlist-auto-removed-today')
+function loadWatchlistDailyStats() {
+  fetch('/api/watchlist-daily-stats')
     .then(res => res.json())
     .then(data => {
       const tag = document.getElementById('autoRemovedTag');
-      if (!data.ok || !data.count) { tag.style.display = 'none'; return; }
-      tag.textContent = '오늘 손절 자동삭제 ' + data.count + '종목';
+      if (!data.ok || (!data.added && !data.removed)) { tag.style.display = 'none'; return; }
+      tag.textContent = '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목';
       tag.style.display = 'inline';
     })
     .catch(() => {});
 }
-loadAutoRemovedCount();
-setInterval(() => { if (!document.hidden) loadAutoRemovedCount(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
+loadWatchlistDailyStats();
+setInterval(() => { if (!document.hidden) loadWatchlistDailyStats(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
 
 // 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
 function updateGoldenWindowBanner() {
@@ -3991,6 +3991,7 @@ self.addEventListener('fetch', (e) => {
           )
             .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
             .run();
+          await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
           return Response.json({ ok: true, entryPrice });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -4806,18 +4807,26 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
-      // 오늘 자동삭제(손절) 건수 - 관심종목 패널 헤더에 표시용
-      if (url.pathname === "/api/watchlist-auto-removed-today") {
+      // 오늘 관심종목 추가/자동삭제 건수 - 관심종목 패널 헤더에 표시용
+      if (url.pathname === "/api/watchlist-daily-stats") {
         try {
           const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
           const todayStartKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
           const todayStartUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
           const res = await env.DB.prepare(
-            `SELECT COUNT(*) as cnt FROM system_events WHERE kind = 'watchlist_auto_removed' AND created_at >= ?`
+            `SELECT kind, COUNT(*) as cnt FROM system_events
+             WHERE kind IN ('watchlist_added', 'watchlist_auto_removed') AND created_at >= ?
+             GROUP BY kind`
           )
             .bind(todayStartUtc)
-            .first();
-          return Response.json({ ok: true, count: (res && res.cnt) || 0 });
+            .all();
+          const byKind = {};
+          for (const r of res.results || []) byKind[r.kind] = r.cnt;
+          return Response.json({
+            ok: true,
+            added: byKind.watchlist_added || 0,
+            removed: byKind.watchlist_auto_removed || 0,
+          });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
