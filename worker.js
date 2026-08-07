@@ -2715,10 +2715,12 @@ function renderDashboard() {
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
   #notifyToggleBtn {
-    font-size:11px; background:#232323; color:#888; border:none; border-radius:8px;
-    padding:4px 8px; margin-left:8px; vertical-align:middle; cursor:pointer;
+    position:fixed; right:14px; top:60px; z-index:94;
+    width:48px; height:48px; border-radius:50%; background:#2a1414; color:#ff8787;
+    display:flex; align-items:center; justify-content:center; font-size:12px;
+    border:2px solid #4a2020; box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer; opacity:0.95;
   }
-  #notifyToggleBtn.active { background:#1c2a1c; color:#69db7c; }
+  #notifyToggleBtn.active { background:#0f2415; color:#69db7c; border-color:#1f4a2a; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
