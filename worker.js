@@ -2015,12 +2015,6 @@ function renderWatchlist(items) {
           (r.pnl.netPnlPct >= 0 ? '+' : '') + r.pnl.netPnlPct.toFixed(2) + '% (' + (r.pnl.netPnlAmount >= 0 ? '+' : '') + fmt(r.pnl.netPnlAmount) + '원)</span>'
         : (r.entryPrice === null ? '<span class="empty">진입가 확정중</span>' : '<span class="empty">시세 없음</span>');
       const riskStatus = watchlistRiskMap[r.code];
-      if ((riskStatus === 'stop_loss_hit' || riskStatus === 'take_profit_hit') && prevRiskState[r.code] !== riskStatus) {
-        sendNotify(
-          (riskStatus === 'stop_loss_hit' ? '⚠️ ' : '🎯 ') + r.name + (riskStatus === 'stop_loss_hit' ? ' 손절선 도달' : ' 익절선 도달'),
-          fmt(r.price || 0) + '원'
-        );
-      }
       prevRiskState[r.code] = riskStatus;
       const riskBadgeHtml = riskStatus === 'stop_loss_hit'
         ? '<div class="riskBadge riskBadgeDown">⚠️ 손절선 도달</div>'
@@ -2615,26 +2609,6 @@ function refreshRealtimeWatchlist() {
 // "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
 // 브라우저 알림 - 탭을 안 보고 있어도 강한 신호(관심종목 이탈신호, 손절/익절 도달)를 놓치지 않게 함.
 // 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
-let notifyEnabled = false;
-function requestNotifyPermission() {
-  if (!('Notification' in window)) return;
-  Notification.requestPermission().then(perm => { notifyEnabled = perm === 'granted'; updateNotifyButton(); });
-}
-function updateNotifyButton() {
-  const btn = document.getElementById('notifyToggleBtn');
-  if (!btn) return;
-  btn.textContent = notifyEnabled ? '🔔 알림 켜짐' : '🔕 알림 꺼짐';
-  btn.classList.toggle('active', notifyEnabled);
-}
-function sendNotify(title, body) {
-  // 탭을 보고 있을 때는 화면 배지로 이미 보이니 중복 알림 안 함 - 백그라운드일 때만 브라우저 알림
-  if (!notifyEnabled || !document.hidden) return;
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  try {
-    new Notification(title, { body: body, tag: title }); // tag로 같은 종목 알림 중복 안 쌓이게
-  } catch (e) {}
-}
-
 function updateRealtimeExitSignal(code, s) {
   const badge = document.querySelector('.realtimeExitBadge[data-code="' + code + '"]');
   if (!badge) return; // 관심종목이 아니면(리스트 종목이면) 해당 없음
@@ -2656,18 +2630,13 @@ function updateRealtimeExitSignal(code, s) {
   if (reasons.length) {
     badge.style.display = '';
     badge.innerHTML = '⚡실시간: ' + reasons.join(' · ');
-    // 새로 생긴 이탈신호일 때만 알림 (매 갱신마다 반복 알림 안 되게, 직전엔 없었던 경우만)
-    if (!prevRealtimeExitState[code]) {
-      const name = (w && w.name) || (byCodeMap[code] && byCodeMap[code].name) || code;
-      sendNotify('⚡ ' + name + ' 이탈신호', reasons.join(' · '));
-    }
     prevRealtimeExitState[code] = true;
   } else {
     badge.style.display = 'none';
     prevRealtimeExitState[code] = false;
   }
 }
-const prevRealtimeExitState = {}; // { code: true|false } - 알림 중복 방지용
+const prevRealtimeExitState = {}; // { code: true|false } - 뱃지 신규발생 판단용 (과거엔 알림 중복방지에도 썼음)
 
 // 리스트(전체목록/추천/TOP20 등)에 이미 그려진 행의 가격·등락률만 실시간 값으로 갈아끼움.
 // 행 전체를 다시 그리지 않아서 스크롤/깜빡임 없음.
@@ -2730,13 +2699,6 @@ function renderDashboard() {
 <style>
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
-  #notifyToggleBtn {
-    position:fixed; right:14px; top:60px; z-index:94;
-    width:48px; height:48px; border-radius:50%; background:#2a1414; color:#ff8787;
-    display:flex; align-items:center; justify-content:center; font-size:12px;
-    border:2px solid #4a2020; box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer; opacity:0.95;
-  }
-  #notifyToggleBtn.active { background:#0f2415; color:#69db7c; border-color:#1f4a2a; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
@@ -3015,7 +2977,6 @@ function renderDashboard() {
   <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
   <h1 style="display:none;">🔥 급등주 스크리너</h1>
-  <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button>
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
