@@ -2512,6 +2512,7 @@ document.addEventListener('click', (e) => {
 
 // 관심종목 미니차트 캔들 hover(PC)/touch(모바일) - 커서/손가락이 지나가는 캔들의 시간·가격·거래량을
 // 차트 위 툴팁에 표시. 이벤트 위임이라 renderMiniCandles가 몇 번을 다시 그려도 리스너 재등록 불필요.
+let lastShownMiniChartTip = null; // 매 mousemove마다 document.querySelectorAll로 전체를 훑지 않기 위해 마지막 표시된 툴팁만 추적
 function showMiniChartTip(hitEl) {
   const wrap = hitEl.closest('.miniChartWrap');
   if (!wrap) return;
@@ -2519,6 +2520,7 @@ function showMiniChartTip(hitEl) {
   if (!tip) return;
   tip.textContent = hitEl.getAttribute('data-tip') || '';
   tip.style.display = 'block';
+  lastShownMiniChartTip = tip;
 }
 function hideMiniChartTip(wrapEl) {
   const tip = wrapEl && wrapEl.querySelector('.miniChartTip');
@@ -2527,10 +2529,11 @@ function hideMiniChartTip(wrapEl) {
 document.addEventListener('mousemove', (e) => {
   const hit = e.target.closest('.miniChartHit');
   if (hit) { showMiniChartTip(hit); return; }
-  // 차트 영역 밖으로 나가면 툴팁 숨김(단, 다른 미니차트 위로 옮겨가는 중이면 그 차트가 바로 표시하므로 깜빡임 없음)
-  const wrap = e.target.closest('.miniChartWrap');
-  if (!wrap) {
-    document.querySelectorAll('.miniChartTip').forEach(t => t.style.display = 'none');
+  // 차트 영역 밖이면 마지막으로 보여준 툴팁 하나만 숨김 - 관심종목이 많아도 매번 전체 DOM을
+  // 훑지 않으므로(document.querySelectorAll을 mousemove마다 호출하던 게 체감 렉의 원인이었음) 가벼움.
+  if (lastShownMiniChartTip) {
+    lastShownMiniChartTip.style.display = 'none';
+    lastShownMiniChartTip = null;
   }
 });
 document.addEventListener('mouseleave', (e) => {
