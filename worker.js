@@ -292,138 +292,6 @@ async function logSystemEvent(env, kind, message) {
   }
 }
 
-async function collectFinalAccurateQuotes(env) {
-  const capturedAt = new Date().toISOString();
-  const timesRes = await env.DB.prepare(
-    `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`
-  ).all();
-  if (!timesRes.results.length) return { saved: 0 };
-  const lastTime = timesRes.results[0].captured_at;
-  const codesRes = await env.DB.prepare(
-    `SELECT DISTINCT code, name, market FROM snapshots WHERE captured_at = ?`
-  )
-    .bind(lastTime)
-    .all();
-  let targets = codesRes.results;
-  if (!targets.length) return { saved: 0 };
-
-  // Cloudflare Workers는 호출당 서브리퀘스트 개수에 상한이 있어서(실측상 약 50개),
-  // 종목이 많으면 뒤쪽 종목들은 애초에 처리가 안 됨. 그러니 관심종목을 먼저 처리해서
-  // 한도에 걸리더라도 실제로 중요한(담아둔) 종목들만은 정확한 종가를 확보하게 함.
-  try {
-    const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-    const wlCodes = new Set(wlRes.results.map((r) => r.code));
-    if (wlCodes.size) {
-      targets = [...targets].sort((a, b) => (wlCodes.has(b.code) ? 1 : 0) - (wlCodes.has(a.code) ? 1 : 0));
-    }
-  } catch (e) {
-    // 우선순위 정렬 실패해도 전체 흐름엔 지장 없음 - 원래 순서로 진행
-  }
-
-  const token = await kiwoomIssueToken(env);
-  const rows = [];
-  const failedCodes = [];
-  let hitSubrequestLimit = false;
-  for (const t of targets) {
-    try {
-      const raw = await kiwoomQuote(env, token, t.code);
-      const q = parseKiwoomQuote(raw);
-      rows.push({ code: t.code, name: t.name, price: q.price, rate: q.rate, volume: q.volume, market: t.market });
-    } catch (e) {
-      const msg = String(e.message || e);
-      if (/Too many subrequests/i.test(msg)) {
-        // 이 시점부터는 뭘 시도해도 똑같이 실패함(플랫폼 한도) - 나머지 종목을 헛되이 순회하지 않고 바로 중단
-        hitSubrequestLimit = true;
-        break;
-      }
-      // 개별 종목 조회 실패는 건너뜀 (그 종목만 최종 갱신 안 됨, 나머지는 계속 진행) - 아래에서 모아서 로그만 남김
-      failedCodes.push(t.code + ":" + msg.slice(0, 80));
-    }
-    await sleep(1100); // 키움 TR 초당1건 제한
-  }
-  const skippedCount = targets.length - rows.length - failedCodes.length;
-  if (failedCodes.length || hitSubrequestLimit) {
-    await logSystemEvent(
-      env,
-      "final_quote_partial_failure",
-      `${rows.length}/${targets.length}종목만 최종시세 재조회 성공` +
-        (hitSubrequestLimit ? ` (서브리퀘스트 한도 도달, ${skippedCount}종목 시도 자체를 안 함)` : "") +
-        (failedCodes.length ? ` - 개별실패: ${failedCodes.slice(0, 15).join(", ")}` : "")
-    );
-  }
-
-  // 이번에 못 받은 종목은 D1에 남겨둠 - 15:38/40/42/44 틱에서 자동으로 이어서 재시도함
-  // (매번 새 호출이라 서브리퀘스트 한도가 리셋되므로, 나눠서 하면 결국 더 많이 받아올 수 있음)
-  const succeededCodes = new Set(rows.map((r) => r.code));
-  const leftover = targets.filter((t) => !succeededCodes.has(t.code));
-  await env.DB.prepare(`DELETE FROM final_quote_pending`).run().catch(() => {}); // 어제 남은 게 있으면 정리
-  if (leftover.length) {
-    const pendStmt = env.DB.prepare(
-      `INSERT INTO final_quote_pending (code, name, market, captured_at) VALUES (?, ?, ?, ?)`
-    );
-    await env.DB.batch(leftover.map((t) => pendStmt.bind(t.code, t.name, t.market, capturedAt))).catch(() => {});
-  }
-
-  if (!rows.length) return { saved: 0 };
-
-  const stmt = env.DB.prepare(
-    `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`
-  );
-  const batch = rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, capturedAt));
-  await env.DB.batch(batch);
-  return { saved: rows.length, capturedAt, leftover: leftover.length };
-}
-
-// 15:36에 서브리퀘스트 한도나 개별 오류로 못 받은 종목들을 15:38/40/42/44 틱에서 이어서 재시도.
-// 매 호출이 새 Worker invocation이라 서브리퀘스트 한도가 그때마다 리셋되므로, 나눠서 시도하면 더 많이 채울 수 있음.
-async function retryFinalQuotePending(env) {
-  const pendRes = await env.DB.prepare(`SELECT code, name, market, captured_at FROM final_quote_pending`).all();
-  let targets = pendRes.results;
-  if (!targets.length) return { retried: 0 };
-
-  try {
-    const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-    const wlCodes = new Set(wlRes.results.map((r) => r.code));
-    if (wlCodes.size) {
-      targets = [...targets].sort((a, b) => (wlCodes.has(b.code) ? 1 : 0) - (wlCodes.has(a.code) ? 1 : 0));
-    }
-  } catch (e) {}
-
-  const token = await kiwoomIssueToken(env);
-  const rows = [];
-  const stillFailed = [];
-  for (const t of targets) {
-    try {
-      const raw = await kiwoomQuote(env, token, t.code);
-      const q = parseKiwoomQuote(raw);
-      rows.push({ ...t, price: q.price, rate: q.rate, volume: q.volume });
-    } catch (e) {
-      if (/Too many subrequests/i.test(String(e.message || e))) break; // 이번 틱도 한도 도달 - 다음 틱에 또 시도
-      stillFailed.push(t);
-    }
-    await sleep(1100);
-  }
-
-  if (rows.length) {
-    const stmt = env.DB.prepare(
-      `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`
-    );
-    await env.DB.batch(
-      rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, s.captured_at))
-    );
-    const doneCodes = rows.map((r) => r.code);
-    const ph = doneCodes.map(() => "?").join(",");
-    await env.DB.prepare(`DELETE FROM final_quote_pending WHERE code IN (${ph})`).bind(...doneCodes).run();
-  }
-
-  if (rows.length) {
-    await logSystemEvent(env, "final_quote_retry_success", `재시도로 ${rows.length}종목 추가 확보 (남은 ${targets.length - rows.length}종목)`);
-  }
-  return { retried: rows.length, stillPending: targets.length - rows.length };
-}
-
 // ---------- Cron: 저장 ----------
 async function collectAndStore(env) {
   const now = new Date();
@@ -614,7 +482,7 @@ async function getLatest(env) {
     const volumeSpikeRatio = prevRow && prevRow.volume > 0 ? r.volume / prevRow.volume : null;
     const todayMaxRate = todayMaxMap.get(r.code) ?? r.change_rate;
 
-    // 15:36 마감 정밀조회(collectFinalAccurateQuotes)는 가격/등락률/거래량만 받고 체결강도·매수잔량·매도잔량은
+    // 15:36 마감 정밀조회(relay의 runFinalQuoteReconcile)는 가격/등락률/거래량만 받고 체결강도·매수잔량·매도잔량은
     // 항상 0으로 저장함(ka10007 개별조회라 그 필드들을 안 받아옴). 그 틱이 "지금"이나 "직전"으로 잡히면
     // 수급기반 배지가 전부 오판됨(매도잔량이 실제값->0으로 "급감"한 걸로 잘못 계산됨) - 그래서 셋 다 0인 틱은 걸러냄.
     const isPlaceholderRow = (row) => !row || (row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0);
@@ -1767,6 +1635,14 @@ async function load() {
   });
   watchlistExitMap = {};
   (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
+  // /api/latest 응답에 이미 포함된 관심종목 미니차트를 먼저 캐시에 채워넣음 - 이러면
+  // renderWatchlist가 부르는 queueMiniCandleFetches는 대부분 "이미 있음"으로 스킵되고,
+  // 정말 relay에 캐시가 없던 종목만 개별조회 폴백을 탐(첫 로드부터 차트가 거의 즉시 뜸).
+  if (data.miniCandles) {
+    Object.keys(data.miniCandles).forEach(code => {
+      if (!(code in miniCandleCache)) miniCandleCache[code] = data.miniCandles[code].candles;
+    });
+  }
   renderWatchlist(data.watchlist || []);
 }
 
@@ -2441,12 +2317,14 @@ function startRealtimeStream() {
 // ---------- 클라이언트 장시간 판단 (D1/relay 불필요 폴링 억제용) ----------
 // 장마감 후에도 탭을 계속 켜놨을 때 15초/30초/2분 주기 폴링들이 D1을 계속 두드리는 낭비를 막기 위해,
 // 장중이 아니면 각 타이머 콜백 자체를 스킵함(타이머는 유지, 실행만 건너뜀 - 장 시작하면 자동 재개).
-function isMarketHoursClient() {
+// cutoffMinute 기본값은 15:50이지만, mainRefreshTimer만 15:50 일괄정리 결과를 화면에 반영해야 해서
+// 15:52까지 살려둠(다른 타이머보다 2분 늦게 꺼짐).
+function isMarketHoursClient(cutoffMinute) {
   const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
   const day = kst.getDay();
   if (day === 0 || day === 6) return false;
   const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 50;
+  return minutes >= 9 * 60 + 1 && minutes <= (cutoffMinute ?? 15 * 60 + 50);
 }
 
 startRealtimeStream();
@@ -2606,20 +2484,10 @@ function updateGoldenWindowBanner() {
 updateGoldenWindowBanner();
 setInterval(updateGoldenWindowBanner, 30000);
 
-// 장마감 후 D1 부하 방지용 클라이언트 장시간 판단 - 15:52까지는 정상 유지(15:50 일괄정리 결과가
-// 화면에 반영되는 걸 봐야 하므로), 그 이후부터 다음 장 시작 전까지 폴링 스킵.
-function isMarketHoursClientForMainRefresh() {
-  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  const day = kst.getDay();
-  if (day === 0 || day === 6) return false;
-  const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 52;
-}
-
 load();
 let mainRefreshTimer = setInterval(() => {
   if (document.hidden) return; // 백그라운드면 새로고침 스킵
-  if (!isMarketHoursClientForMainRefresh()) return; // 장마감 후엔 데이터가 안 바뀌므로 스킵(D1 부하 방지)
+  if (!isMarketHoursClient(15 * 60 + 52)) return; // 장마감 후엔 스킵(D1 부하 방지) - 15:50 일괄정리 결과 반영까지는 살려둠
   load();
 }, 15000); // 10초->15초 (momentum/연속상승 등 D1 지표는 cron이 2분마다만 갱신하므로 이보다 자주 당겨도 새 데이터가 없음 - 그만큼 아낀 여유를 실시간쪽에 씀)
 
@@ -4321,6 +4189,20 @@ self.addEventListener('fetch', (e) => {
           env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all(),
         ]);
         data.watchlist = watchlistRes.results;
+
+        // 관심종목 미니차트를 여기서 한 번에 받아와 응답에 포함시킴 - 클라이언트가 종목별로
+        // /api/mini-candles를 따로 부르는 왕복을 없애서 첫 로드 시 차트가 즉시 뜨게 함(가장 빠른 경로).
+        // relay가 없거나 실패해도 빈 값으로 두고 클라이언트의 기존 개별조회 폴백이 채워줌.
+        data.miniCandles = {};
+        if (data.watchlist.length && env.RELAY_URL && env.RELAY_SECRET) {
+          try {
+            const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
+            const mcData = await mcRes.json();
+            if (mcData.ok) data.miniCandles = mcData.cache;
+          } catch (e) {
+            // 실패해도 클라이언트가 종목별 개별조회로 폴백하므로 문제없음
+          }
+        }
 
         // 밴드 밖(오늘 5~15% 목록에 없는) 관심종목은 D1에 저장된 가장 최근 시세로 대체
         // (키움 API 재조회 없이, 이미 수집해둔 데이터만 사용)
