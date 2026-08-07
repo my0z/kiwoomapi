@@ -1851,19 +1851,34 @@ function renderMiniCandles(candles, addedAt) {
   // 매 mousemove마다 새 엘리먼트를 만들지 않고 속성만 바꾸는 방식이라 가벼움.
   const crosshairHtml = '<line class="miniChartCrosshair" x1="0" y1="0" x2="0" y2="' + h + '" stroke="#fff" stroke-width="1" stroke-dasharray="2,2" opacity="0" pointer-events="none"/>';
 
-  // 현재가(마지막 캔들 종가)가 오늘 차트 구간의 최고가/최저가 대비 몇 % 위치인지 표시.
-  // 최고가 대비는 항상 0% 이하(고점에서 얼마나 빠졌는지), 최저가 대비는 항상 0% 이상(저점에서 얼마나 올랐는지).
+  // 현재가(마지막 캔들 종가)가 오늘 차트 구간의 최고가/최저가 대비 몇 % 위치인지, 실제 최고가/최저가
+  // 캔들이 있는 y좌표 옆에 라벨로 표시(하단 별도 텍스트가 아니라 그 값이 실제로 찍힌 자리에).
   const currentPrice = candles[candles.length - 1].close;
   const fromHighPct = ((currentPrice - max) / max) * 100;
   const fromLowPct = ((currentPrice - min) / min) * 100;
-  const rangeInfoHtml = '<div class="miniChartRangeInfo">' +
-    '<span>최고대비 <b class="down">' + fromHighPct.toFixed(1) + '%</b></span>' +
-    '<span>최저대비 <b class="up">+' + fromLowPct.toFixed(1) + '%</b></span>' +
-    '</div>';
+  // 최고가/최저가가 여러 캔들에 걸쳐 있으면(동률) 가장 최근(오른쪽) 캔들을 대표로 삼음
+  let highIdx = 0, lowIdx = 0;
+  candles.forEach((c, i) => {
+    if (c.high >= candles[highIdx].high) highIdx = i;
+    if (c.low <= candles[lowIdx].low) lowIdx = i;
+  });
+  const highY = h - pad - ((max - min) / range) * (h - pad * 2); // = pad, 최고가는 항상 차트 맨 위
+  const lowY = h - pad - ((min - min) / range) * (h - pad * 2); // = h - pad, 최저가는 항상 차트 맨 아래
+  const highLabelX = Math.min(w - 44, Math.max(2, pad + highIdx * candleW + candleW / 2 + 4));
+  const lowLabelX = Math.min(w - 44, Math.max(2, pad + lowIdx * candleW + candleW / 2 + 4));
+  // 두 캔들이 가까워서(구간이 짧은 차트) 라벨이 겹칠 것 같으면 최고가 라벨은 살짝 아래로, 최저가 라벨은 살짝 위로 벌림
+  const labelsClose = Math.abs(highY - lowY) < 16;
+  const highLabelY = labelsClose ? highY + 9 : highY + 8;
+  const lowLabelY = labelsClose ? lowY - 4 : lowY - 3;
+  const rangeLabelsHtml =
+    '<text x="' + highLabelX.toFixed(1) + '" y="' + highLabelY.toFixed(1) + '" fill="#4d9fff" font-size="8" font-weight="600">' +
+    fromHighPct.toFixed(1) + '%</text>' +
+    '<text x="' + lowLabelX.toFixed(1) + '" y="' + lowLabelY.toFixed(1) + '" fill="#ff6b6b" font-size="8" font-weight="600">' +
+    '+' + fromLowPct.toFixed(1) + '%</text>';
 
   return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' +
     '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
-    bars + addedMarkerHtml + crosshairHtml + hitAreas + '</svg>' + timeLabelsHtml + rangeInfoHtml + '</div>';
+    bars + addedMarkerHtml + crosshairHtml + rangeLabelsHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
 }
 
 // 관심종목 삭제는 낙관적 업데이트(서버 응답 기다리지 않고 화면 먼저 반영)라 실패해도 사용자가
@@ -2825,10 +2840,6 @@ function renderDashboard() {
     padding:3px 8px; font-size:11px; color:#eee; white-space:nowrap; pointer-events:none; z-index:5;
   }
   .miniChartHit { cursor:crosshair; }
-  .miniChartRangeInfo { display:flex; justify-content:space-between; font-size:10px; color:#888; padding:2px 6px 0; }
-  .miniChartRangeInfo b { font-weight:600; }
-  .miniChartRangeInfo b.up { color:#ff6b6b; }
-  .miniChartRangeInfo b.down { color:#4d9fff; }
   .liveDot { color:#69db7c; animation:blink 1.5s ease-in-out infinite; }
   @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.2; } }
   .chartWrap { overflow:hidden; touch-action:none; cursor:grab; border-radius:8px; background:#151515; }
