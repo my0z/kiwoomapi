@@ -4272,6 +4272,48 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      // relay 전용 - 15:50 일괄정리. 그 시점 관심종목 전체를 훑어서 +2.5%/-1.5% 조건에 걸리는
+      // 종목을 한 번에 익절/손절 확정삭제. 이후(15:50~장마감)엔 다시 매매중지 유지되므로 이 라우트는
+      // 15:50 매매중지 게이트를 우회하는 별도 엔드포인트로 둠 (auto-remove와 게이트 조건이 반대).
+      if (url.pathname === "/api/watchlist/final-sweep" && request.method === "POST") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
+        }
+        try {
+          const { items } = await request.json(); // [{code, name, pnlPct}, ...] - relay가 실시간가로 이미 계산해서 보냄
+          if (!Array.isArray(items) || !items.length) {
+            return Response.json({ ok: true, removed: 0 });
+          }
+          let removed = 0;
+          const details = [];
+          for (const it of items) {
+            if (typeof it.pnlPct !== "number") continue;
+            if (!(it.pnlPct >= 2.5 || it.pnlPct <= -1.5)) continue; // 조건 재검증 (relay 판단을 신뢰하되 이중확인)
+            const w = await env.DB.prepare(
+              `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
+            )
+              .bind(it.code)
+              .first();
+            if (!w) continue;
+            if (w.entry_price > 0) {
+              const exitPrice = w.entry_price * (1 + it.pnlPct / 100);
+              await recordWatchlistExitPerformance(env, w, exitPrice, it.pnlPct);
+            }
+            await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(it.code).run();
+            await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(it.code).run();
+            const reason = it.pnlPct >= 2.5 ? "익절" : "손절";
+            details.push(`${w.name}(${it.code}) ${it.pnlPct.toFixed(2)}%[${reason}]`);
+            removed++;
+          }
+          if (removed > 0) {
+            await logSystemEvent(env, "watchlist_final_sweep", `15:50 일괄정리 ${removed}종목 삭제 - ${details.join(", ")}`);
+          }
+          return Response.json({ ok: true, removed });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       // relay 전용 - 손익률 -1.5% 이하 도달 시 관심종목 자동삭제 (2분 cron의 checkWatchlistRiskLevels와
       // 같은 기준, relay는 실시간가를 이미 들고 있어서 더 빠르게 트리거 가능).
       if (url.pathname === "/api/watchlist/auto-remove" && request.method === "POST") {
