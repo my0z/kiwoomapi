@@ -1853,6 +1853,8 @@ function renderMiniCandles(candles, addedAt) {
 
   // 현재가(마지막 캔들 종가)가 오늘 차트 구간의 최고가/최저가 대비 몇 % 위치인지, 실제 최고가/최저가
   // 캔들이 있는 y좌표 옆에 라벨로 표시(하단 별도 텍스트가 아니라 그 값이 실제로 찍힌 자리에).
+  // SVG <text>는 preserveAspectRatio="none"으로 가로가 늘어날 때 글자도 같이 옆으로 늘어나 보이는
+  // 문제가 있어서, 비율 왜곡 없는 HTML 절대위치 오버레이로 그림(퍼센트 좌표라 컨테이너 크기 무관).
   const currentPrice = candles[candles.length - 1].close;
   const fromHighPct = ((currentPrice - max) / max) * 100;
   const fromLowPct = ((currentPrice - min) / min) * 100;
@@ -1862,23 +1864,22 @@ function renderMiniCandles(candles, addedAt) {
     if (c.high >= candles[highIdx].high) highIdx = i;
     if (c.low <= candles[lowIdx].low) lowIdx = i;
   });
-  const highY = h - pad - ((max - min) / range) * (h - pad * 2); // = pad, 최고가는 항상 차트 맨 위
-  const lowY = h - pad - ((min - min) / range) * (h - pad * 2); // = h - pad, 최저가는 항상 차트 맨 아래
-  const highLabelX = Math.min(w - 44, Math.max(2, pad + highIdx * candleW + candleW / 2 + 4));
-  const lowLabelX = Math.min(w - 44, Math.max(2, pad + lowIdx * candleW + candleW / 2 + 4));
-  // 두 캔들이 가까워서(구간이 짧은 차트) 라벨이 겹칠 것 같으면 최고가 라벨은 살짝 아래로, 최저가 라벨은 살짝 위로 벌림
-  const labelsClose = Math.abs(highY - lowY) < 16;
-  const highLabelY = labelsClose ? highY + 9 : highY + 8;
-  const lowLabelY = labelsClose ? lowY - 4 : lowY - 3;
+  const highXPct = ((pad + highIdx * candleW + candleW / 2) / w) * 100;
+  const lowXPct = ((pad + lowIdx * candleW + candleW / 2) / w) * 100;
+  // 최고가는 차트 맨 위, 최저가는 차트 맨 아래 - 라벨이 서로 가까운 x위치에 있으면(구간이 짧은 차트)
+  // 위아래로 확실히 벌려서 겹치지 않게 함. 화면 오른쪽 끝에 붙지 않도록 clamp.
+  const highLeftPct = Math.min(88, Math.max(2, highXPct));
+  const lowLeftPct = Math.min(88, Math.max(2, lowXPct));
+  const closeX = Math.abs(highXPct - lowXPct) < 15;
   const rangeLabelsHtml =
-    '<text x="' + highLabelX.toFixed(1) + '" y="' + highLabelY.toFixed(1) + '" fill="#4d9fff" font-size="8" font-weight="600">' +
-    fromHighPct.toFixed(1) + '%</text>' +
-    '<text x="' + lowLabelX.toFixed(1) + '" y="' + lowLabelY.toFixed(1) + '" fill="#ff6b6b" font-size="8" font-weight="600">' +
-    '+' + fromLowPct.toFixed(1) + '%</text>';
+    '<div class="miniChartRangeLabel down" style="left:' + highLeftPct.toFixed(1) + '%; top:' + (closeX ? '14px' : '1px') + ';">' +
+    fromHighPct.toFixed(1) + '%</div>' +
+    '<div class="miniChartRangeLabel up" style="left:' + lowLeftPct.toFixed(1) + '%; bottom:' + (closeX ? '12px' : '1px') + ';">' +
+    '+' + fromLowPct.toFixed(1) + '%</div>';
 
-  return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' +
+  return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' + rangeLabelsHtml +
     '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
-    bars + addedMarkerHtml + crosshairHtml + rangeLabelsHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
+    bars + addedMarkerHtml + crosshairHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
 }
 
 // 관심종목 삭제는 낙관적 업데이트(서버 응답 기다리지 않고 화면 먼저 반영)라 실패해도 사용자가
@@ -2834,6 +2835,12 @@ function renderDashboard() {
   .chartRange { font-size:11px; color:#888; text-align:center; margin-top:4px; }
   .chartTimeLabels { display:flex; justify-content:space-between; font-size:10px; color:#666; padding:2px 6px 0; }
   .miniChartWrap { position:relative; }
+  .miniChartRangeLabel {
+    position:absolute; font-size:9px; font-weight:600; padding:0 3px; border-radius:2px;
+    background:rgba(10,10,10,0.7); pointer-events:none; z-index:3; white-space:nowrap; line-height:1.4;
+  }
+  .miniChartRangeLabel.down { color:#4d9fff; }
+  .miniChartRangeLabel.up { color:#ff6b6b; }
   .miniChartTip {
     position:absolute; top:2px; left:50%; transform:translateX(-50%);
     background:rgba(20,20,20,0.92); border:1px solid #333; border-radius:6px;
