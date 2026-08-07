@@ -2418,6 +2418,7 @@ function startRealtimeStream() {
   let gotFirstMessage = false;
   es.onmessage = (e) => {
     gotFirstMessage = true;
+    if (document.hidden) return; // 백그라운드 탭에서는 불필요한 DOM 갱신 스킵 (연결 자체는 유지)
     try {
       const data = JSON.parse(e.data);
       renderMarketIndexBar(data.index);
