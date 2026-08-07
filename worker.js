@@ -4320,28 +4320,25 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/latest") {
-        const [data, watchlistRes] = await Promise.all([
+        const needMini = url.searchParams.get("mini") === "1";
+        // relay 미니차트 요청도 D1 조회들과 함께 병렬로 시작함 - 예전엔 D1 조회를 다 기다린
+        // "다음에" relay를 또 기다려서 (D1 소요시간 + relay 왕복시간)이 그대로 더해졌었음.
+        // 병렬로 바꾸면 전체 대기시간이 "둘 중 더 느린 쪽" 하나로 줄어듦 - 첫 로드 체감속도의 핵심 병목이었음.
+        const miniCandlesPromise =
+          needMini && env.RELAY_URL && env.RELAY_SECRET
+            ? kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" })
+                .then((r) => r.json())
+                .then((d) => (d.ok ? d.cache : {}))
+                .catch(() => ({}))
+            : Promise.resolve({});
+
+        const [data, watchlistRes, miniCandles] = await Promise.all([
           getLatest(env),
           env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all(),
+          miniCandlesPromise,
         ]);
         data.watchlist = watchlistRes.results;
-
-        // 관심종목 미니차트를 여기서 한 번에 받아와 응답에 포함시킴 - 클라이언트가 종목별로
-        // /api/mini-candles를 따로 부르는 왕복을 없애서 첫 로드 시 차트가 즉시 뜨게 함.
-        // 단, 15초마다 도는 재로드까지 매번 relay를 왕복하면 /api/latest 전체 응답이 그만큼
-        // 느려져서 다른 정보(가격 등) 갱신까지 덩달아 늦어짐 - 미니차트는 1분에 한 번만 바뀌는
-        // 데이터라 그럴 필요가 없음. 클라이언트가 최초 로드(?mini=1)일 때만 요청하고, 이후
-        // 재로드에서는 생략함(신규 관심종목은 기존 개별조회 폴백이 알아서 채움).
-        data.miniCandles = {};
-        if (data.watchlist.length && url.searchParams.get("mini") === "1" && env.RELAY_URL && env.RELAY_SECRET) {
-          try {
-            const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
-            const mcData = await mcRes.json();
-            if (mcData.ok) data.miniCandles = mcData.cache;
-          } catch (e) {
-            // 실패해도 클라이언트가 종목별 개별조회로 폴백하므로 문제없음
-          }
-        }
+        data.miniCandles = miniCandles;
 
         // 밴드 밖(오늘 5~15% 목록에 없는) 관심종목은 D1에 저장된 가장 최근 시세로 대체
         // (키움 API 재조회 없이, 이미 수집해둔 데이터만 사용)
