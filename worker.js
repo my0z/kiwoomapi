@@ -759,9 +759,7 @@ function openStockModal(item) {
 
 function setHeavyButtonsDisabled(disabled) {
   const patternBtn = document.getElementById('patternScanBtn');
-  const collectBtn = document.getElementById('collectBtn');
   if (patternBtn) patternBtn.disabled = disabled;
-  if (collectBtn) collectBtn.disabled = disabled;
 }
 
 // ---------- 실시간 WebSocket 관련 코드는 제거됨 ----------
@@ -1772,16 +1770,6 @@ async function load() {
   renderWatchlist(data.watchlist || []);
 }
 
-document.getElementById('reloadBtn').addEventListener('click', (e) => {
-  e.target.classList.add('spinning');
-  load().finally(() => setTimeout(() => e.target.classList.remove('spinning'), 600));
-});
-
-document.getElementById('fullReloadBtn').addEventListener('click', (e) => {
-  e.target.classList.add('spinning');
-  location.reload();
-});
-
 // ---------- 내 매매 기록 ----------
 // ---------- 관심종목(즐겨찾기) ----------
 let watchlistCodes = new Set();
@@ -2227,34 +2215,6 @@ document.getElementById('patternScanBtn').addEventListener('click', (e) => {
     .finally(() => {
       btn.disabled = false;
       btn.textContent = '스캔 시작';
-    });
-});
-
-document.getElementById('collectBtn').addEventListener('click', (e) => {
-  const btn = e.target;
-  btn.classList.add('spinning');
-  btn.disabled = true;
-  fetch('/api/run-now')
-    .then(res => {
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        throw new Error('서버가 JSON이 아닌 응답을 보냄 (일시적인 타임아웃/네트워크 문제일 가능성, 잠시 후 다시 시도해보세요)');
-      }
-      return res.json();
-    })
-    .then(data => {
-      if (data.saved !== undefined) {
-        return load().then(() => {
-          alert('시세 수집 완료: ' + data.saved + '종목 저장됨');
-        });
-      } else {
-        alert('수집 실패: ' + (data.error || JSON.stringify(data)));
-      }
-    })
-    .catch(err => alert('수집 요청 오류: ' + err.message))
-    .finally(() => {
-      btn.classList.remove('spinning');
-      btn.disabled = false;
     });
 });
 
@@ -2947,35 +2907,10 @@ function renderDashboard() {
   }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
-  #reloadBtn {
-    position:fixed; right:14px; top:calc(50% - 30px); transform:translateY(-50%);
-    width:50px; height:50px; border-radius:50%; border:none;
-    background:#ff6b6b; color:#111; font-size:22px; z-index:90;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
-  }
-  #reloadBtn.spinning { animation:spin 0.6s linear; }
-  @keyframes spin { from{ transform:translateY(-50%) rotate(0deg); } to{ transform:translateY(-50%) rotate(360deg); } }
-  #collectBtn:disabled, #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
-  #collectBtn {
-    position:fixed; right:14px; top:calc(50% + 30px); transform:translateY(-50%);
-    width:50px; height:50px; border-radius:50%; border:none;
-    background:#69db7c; color:#111; font-size:20px; z-index:90;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
-  }
-  #collectBtn.spinning { animation:spin 0.9s linear infinite; }
-  #fullReloadBtn {
-    position:fixed; right:14px; top:calc(50% + 90px); transform:translateY(-50%);
-    width:50px; height:50px; border-radius:50%; border:none;
-    background:#4d9fff; color:#111; font-size:20px; z-index:90;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer;
-  }
-  #fullReloadBtn.spinning { animation:spin 0.6s linear; }
+  #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
 </style>
 </head>
 <body>
-  <button id="reloadBtn" title="화면 새로고침">🔄</button>
-  <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
-  <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
   <h1 style="display:none;">🔥 급등주 스크리너</h1>
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
