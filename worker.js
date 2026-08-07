@@ -2393,8 +2393,52 @@ function pollRealtimeAll() {
     })
     .catch(() => {});
 }
-pollRealtimeAll();
-setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000); // 통합 폴링 2초 (relay 메모리 읽기라 부담 없음, 실제 수신 간격이 약 2초)
+
+// SSE(진짜 실시간 스트리밍)를 우선 시도 - relay가 값을 받는 즉시(최대 200ms 지연) push해줌.
+// 기존 2초 폴링보다 최대 10배 빠름. 연결 실패/중간에 끊기면 2초 폴링으로 자동 폴백해서
+// 화면이 멈추지 않게 함(폴백은 페이지 새로고침 전까지 유지 - 재연결 폭주 방지).
+let sseFailedPermanently = false;
+let realtimePollTimer = null;
+function startRealtimePolling() {
+  if (realtimePollTimer) return;
+  pollRealtimeAll();
+  realtimePollTimer = setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000);
+}
+function startRealtimeStream() {
+  if (sseFailedPermanently || !('EventSource' in window)) { startRealtimePolling(); return; }
+  const listParam = realtimeListCodes.slice(0, 180).join(',');
+  const es = new EventSource('/api/realtime-stream?list=' + encodeURIComponent(listParam));
+  let gotFirstMessage = false;
+  es.onmessage = (e) => {
+    gotFirstMessage = true;
+    try {
+      const data = JSON.parse(e.data);
+      renderMarketIndexBar(data.index);
+      renderConditionDock(data.condition);
+      applyRealtimeStocks(data.stocks);
+    } catch (err) {}
+  };
+  es.onerror = () => {
+    es.close();
+    if (!gotFirstMessage) {
+      // 연결 자체가 안 됐으면(구조 문제) 폴백으로 완전히 전환하고 재시도 안 함
+      sseFailedPermanently = true;
+      startRealtimePolling();
+    } else {
+      // 한 번이라도 받았다면 일시적 끊김일 수 있으니 3초 뒤 재연결 시도
+      setTimeout(startRealtimeStream, 3000);
+    }
+  };
+}
+startRealtimeStream();
+// SSE는 연결 시점의 종목 목록으로 구독이 고정되므로, 목록이 바뀔 수 있는 상황(조건검색 신규편입 등)에
+// 대응하기 위해 구독 갱신만 별도로 가볍게 유지 (실시간값 자체는 SSE로 이미 받고 있으므로 이 요청은
+// subscribe만 하고 응답은 버림 - 서버 부하 거의 없음).
+setInterval(() => {
+  if (document.hidden) return;
+  const listParam = realtimeListCodes.slice(0, 180).join(',');
+  fetch('/api/realtime-resubscribe?list=' + encodeURIComponent(listParam)).catch(() => {});
+}, 5000);
 
 // 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
 // cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
@@ -4972,6 +5016,62 @@ self.addEventListener('fetch', (e) => {
             lastEventAt: data.lastEventAt,
             history: data.history || [],
             events: data.events || [],
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // SSE 실시간 스트리밍 - relay가 웹소켓으로 값을 받는 즉시(최대 200ms 지연) push하는 걸
+      // 그대로 브라우저까지 릴레이함. 기존 2초 폴링(/api/realtime-all)을 대체하는 진짜 실시간 경로.
+      // Worker는 relay 응답 스트림을 그대로 전달만 하므로 CPU 소모 거의 없음(네트워크 대기는 CPU시간에
+      // 안 잡힘) - Free 플랜에서도 무리 없음.
+      // SSE 연결은 목록이 고정되므로, 구독 목록만 별도로 갱신하는 경량 라우트 (5초마다 클라이언트가 호출).
+      // subscribe 결과 자체를 기다리지 않고 바로 응답 - 이 라우트는 순수히 목록 갱신 트리거용.
+      if (url.pathname === "/api/realtime-resubscribe") {
+        try {
+          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+          const codes = wlRes.results.map((r) => r.code);
+          const listParam = url.searchParams.get("list") || "";
+          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
+          kiwoomRelayFetch(env, "/realtime/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ codes, listCodes }),
+          }).catch(() => {});
+          return Response.json({ ok: true });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/realtime-stream") {
+        if (!env.RELAY_URL || !env.RELAY_SECRET) {
+          return Response.json({ ok: false, error: "RELAY_URL / RELAY_SECRET 시크릿 미설정" }, { status: 500 });
+        }
+        try {
+          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+          const codes = wlRes.results.map((r) => r.code);
+          const listParam = url.searchParams.get("list") || "";
+          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
+          kiwoomRelayFetch(env, "/realtime/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ codes, listCodes }),
+          }).catch(() => {});
+
+          const relayRes = await fetch(`${env.RELAY_URL}/realtime/stream`, {
+            headers: { "X-Relay-Secret": env.RELAY_SECRET },
+          });
+          if (!relayRes.ok || !relayRes.body) {
+            return Response.json({ ok: false, error: "relay 스트림 연결 실패" }, { status: 502 });
+          }
+          return new Response(relayRes.body, {
+            headers: {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              "connection": "keep-alive",
+            },
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
