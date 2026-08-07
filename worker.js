@@ -4636,20 +4636,22 @@ self.addEventListener('fetch', (e) => {
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
 
           // relay(Oracle VM)가 관심종목 미니차트를 백그라운드로 미리 갱신해서 캐시해둠 - 그걸
-          // 우선 씀 (즉시 응답, 종목당 1.1초 순차대기 없음).
+          // 우선 씀 (즉시 응답, 종목당 1.1초 순차대기 없음). 단, relay는 장중(09:01~15:46)에만
+          // 갱신하므로 장마감 후 캐시미스는 "곧 채워짐"이 아니라 "영원히 안 채워짐"임 - 이땐 바로
+          // 직접조회 폴백으로 넘어가야 함 (장중에만 폴백을 미루는 pending 응답을 씀).
           try {
             const relayRes = await kiwoomRelayFetch(env, `/realtime/mini-candles?code=${code}`, { method: "GET" });
             const relayData = await relayRes.json();
             if (relayData.ok) {
               return Response.json({ ok: true, candles: relayData.candles, tradingDate: relayData.tradingDate });
             }
-            // relay 자체는 응답했지만 이 종목 캐시가 아직 없는 경우(막 추가됐거나 갱신주기 대기중) -
-            // 여기서 직접조회로 폴백하면 여러 종목이 동시에 미스날 때 키움 초당1건 제한과 충돌해서
-            // 오히려 실패가 늘어남. relay가 살아있다면 최대 1분 내로 캐시가 채워지므로 "준비중"으로
-            // 응답해서 클라이언트가 잠시 후 재시도하게 함.
-            return Response.json({ ok: false, error: "relay 캐시 준비중", pending: true });
+            if (isMarketHoursKST(new Date())) {
+              // 장중 캐시미스만 "곧 채워짐" 취급 - 동시다발적 직접조회로 인한 초당1건 제한 충돌 방지
+              return Response.json({ ok: false, error: "relay 캐시 준비중", pending: true });
+            }
+            // 장마감 후엔 아래로 계속 진행해서 직접조회 폴백
           } catch (e) {
-            // relay 요청 자체가 실패(다운/타임아웃)했을 때만 직접조회로 폴백
+            // relay 요청 자체가 실패(다운/타임아웃)했을 때도 아래 직접조회 폴백으로 진행
           }
 
           const token = await kiwoomIssueToken(env);
