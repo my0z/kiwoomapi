@@ -1527,7 +1527,11 @@ let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화
 let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
-  const res = await fetch('/api/latest');
+  // 관심종목 미니차트는 최초 로드(캐시가 비어있을 때)에만 relay에서 한 번에 받아옴.
+  // 이미 캐시가 채워진 이후(15초마다 도는 재로드)엔 뺴서 /api/latest 응답이 느려지지 않게 함 -
+  // 미니차트는 1분마다만 바뀌는 데이터라 매번 다시 받아올 필요가 없음.
+  const needMini = Object.keys(miniCandleCache).length === 0;
+  const res = await fetch('/api/latest' + (needMini ? '?mini=1' : ''));
   const data = await res.json();
 
   document.getElementById('ts').textContent = data.capturedAt
@@ -4191,10 +4195,13 @@ self.addEventListener('fetch', (e) => {
         data.watchlist = watchlistRes.results;
 
         // 관심종목 미니차트를 여기서 한 번에 받아와 응답에 포함시킴 - 클라이언트가 종목별로
-        // /api/mini-candles를 따로 부르는 왕복을 없애서 첫 로드 시 차트가 즉시 뜨게 함(가장 빠른 경로).
-        // relay가 없거나 실패해도 빈 값으로 두고 클라이언트의 기존 개별조회 폴백이 채워줌.
+        // /api/mini-candles를 따로 부르는 왕복을 없애서 첫 로드 시 차트가 즉시 뜨게 함.
+        // 단, 15초마다 도는 재로드까지 매번 relay를 왕복하면 /api/latest 전체 응답이 그만큼
+        // 느려져서 다른 정보(가격 등) 갱신까지 덩달아 늦어짐 - 미니차트는 1분에 한 번만 바뀌는
+        // 데이터라 그럴 필요가 없음. 클라이언트가 최초 로드(?mini=1)일 때만 요청하고, 이후
+        // 재로드에서는 생략함(신규 관심종목은 기존 개별조회 폴백이 알아서 채움).
         data.miniCandles = {};
-        if (data.watchlist.length && env.RELAY_URL && env.RELAY_SECRET) {
+        if (data.watchlist.length && url.searchParams.get("mini") === "1" && env.RELAY_URL && env.RELAY_SECRET) {
           try {
             const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
             const mcData = await mcRes.json();
