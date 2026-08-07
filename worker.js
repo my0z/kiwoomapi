@@ -4321,6 +4321,23 @@ self.addEventListener('fetch', (e) => {
           data.watchlistLastKnown = [];
         }
 
+        // 밴드에도 D1에도 값이 없는 "진짜 시세없음" 종목은 relay에 즉시조회를 시켜서 그 자리에서 채움
+        // (막 추가된 종목, 오늘 D1 기록이 아예 없는 종목 등). relay가 살아있을 때만 시도하고,
+        // 응답을 기다리되 실패해도 나머지 흐름엔 지장 없음 - 그래도 "시세 없음"으로 표시될 뿐.
+        const knownCodes = new Set(data.watchlistLastKnown.map((r) => r.code));
+        const stillMissingCodes = offBandCodes.filter((c) => !knownCodes.has(c));
+        if (stillMissingCodes.length > 0 && env.RELAY_URL && env.RELAY_SECRET) {
+          const filled = await Promise.all(
+            stillMissingCodes.map((code) =>
+              kiwoomRelayFetch(env, `/realtime/quote-now?code=${code}`, { method: "GET" })
+                .then((r) => r.json())
+                .then((d) => (d.ok ? { code, price: d.price, change_rate: d.rate, volume: d.volume } : null))
+                .catch(() => null)
+            )
+          );
+          data.watchlistLastKnown = data.watchlistLastKnown.concat(filled.filter(Boolean));
+        }
+
         // cron이 미리 체크해둔 손절/익절 도달 상태 (모달 안 열어도 바로 보이게)
         if (data.watchlist.length) {
           try {
