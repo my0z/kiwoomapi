@@ -1850,9 +1850,20 @@ function renderMiniCandles(candles, addedAt) {
   // 크로스헤어(현재 커서/터치 위치 세로선) - 미리 그려두고 숨겨놓은 뒤, 호버 시 x좌표만 갱신해서 보여줌.
   // 매 mousemove마다 새 엘리먼트를 만들지 않고 속성만 바꾸는 방식이라 가벼움.
   const crosshairHtml = '<line class="miniChartCrosshair" x1="0" y1="0" x2="0" y2="' + h + '" stroke="#fff" stroke-width="1" stroke-dasharray="2,2" opacity="0" pointer-events="none"/>';
+
+  // 현재가(마지막 캔들 종가)가 오늘 차트 구간의 최고가/최저가 대비 몇 % 위치인지 표시.
+  // 최고가 대비는 항상 0% 이하(고점에서 얼마나 빠졌는지), 최저가 대비는 항상 0% 이상(저점에서 얼마나 올랐는지).
+  const currentPrice = candles[candles.length - 1].close;
+  const fromHighPct = ((currentPrice - max) / max) * 100;
+  const fromLowPct = ((currentPrice - min) / min) * 100;
+  const rangeInfoHtml = '<div class="miniChartRangeInfo">' +
+    '<span>최고대비 <b class="down">' + fromHighPct.toFixed(1) + '%</b></span>' +
+    '<span>최저대비 <b class="up">+' + fromLowPct.toFixed(1) + '%</b></span>' +
+    '</div>';
+
   return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' +
     '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
-    bars + addedMarkerHtml + crosshairHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
+    bars + addedMarkerHtml + crosshairHtml + hitAreas + '</svg>' + timeLabelsHtml + rangeInfoHtml + '</div>';
 }
 
 // 관심종목 삭제는 낙관적 업데이트(서버 응답 기다리지 않고 화면 먼저 반영)라 실패해도 사용자가
@@ -2814,6 +2825,10 @@ function renderDashboard() {
     padding:3px 8px; font-size:11px; color:#eee; white-space:nowrap; pointer-events:none; z-index:5;
   }
   .miniChartHit { cursor:crosshair; }
+  .miniChartRangeInfo { display:flex; justify-content:space-between; font-size:10px; color:#888; padding:2px 6px 0; }
+  .miniChartRangeInfo b { font-weight:600; }
+  .miniChartRangeInfo b.up { color:#ff6b6b; }
+  .miniChartRangeInfo b.down { color:#4d9fff; }
   .liveDot { color:#69db7c; animation:blink 1.5s ease-in-out infinite; }
   @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.2; } }
   .chartWrap { overflow:hidden; touch-action:none; cursor:grab; border-radius:8px; background:#151515; }
