@@ -2294,7 +2294,6 @@ function autoAddConditionHits(history, condName) {
     watchlistCodes.add(h.code);
     watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: label }, ...watchlistItems];
     renderWatchlist(watchlistItems);
-    sendNotify('⚡ 신규 포착: ' + name, condName ? condName + ' 조건 충족' : '실시간 조건검색 편입');
     fetch('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2602,42 +2601,14 @@ function refreshRealtimeWatchlist() {
 // 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
 let notifyEnabled = false;
 function requestNotifyPermission() {
-  if (!('Notification' in window)) {
-    alert('이 브라우저는 알림 기능을 지원하지 않습니다.');
-    return;
-  }
-  if (Notification.permission === 'denied') {
-    alert('브라우저 설정에서 이 사이트의 알림 권한이 차단되어 있습니다.\n브라우저 주소창의 자물쇠(사이트 설정) 아이콘에서 알림을 허용으로 바꿔주세요.');
-    return;
-  }
-  if (Notification.permission === 'granted') {
-    // 이미 허용된 상태에서 다시 누르면 알림 켜기/끄기 토글 (권한 재요청은 브라우저가 무시함)
-    notifyEnabled = !notifyEnabled;
-    updateNotifyButton();
-    return;
-  }
-  const handleResult = (perm) => {
-    notifyEnabled = perm === 'granted';
-    updateNotifyButton();
-  };
-  try {
-    const p = Notification.requestPermission(handleResult);
-    if (p && typeof p.then === 'function') {
-      p.then(handleResult).catch(() => {});
-    }
-  } catch (e) {}
+  if (!('Notification' in window)) return;
+  Notification.requestPermission().then(perm => { notifyEnabled = perm === 'granted'; updateNotifyButton(); });
 }
 function updateNotifyButton() {
   const btn = document.getElementById('notifyToggleBtn');
   if (!btn) return;
-  btn.textContent = notifyEnabled ? '🔔' : '🔕';
-  btn.title = notifyEnabled ? '알림 켜짐 - 눌러서 끄기' : '알림 꺼짐 - 눌러서 켜기';
+  btn.textContent = notifyEnabled ? '🔔 알림 켜짐' : '🔕 알림 꺼짐';
   btn.classList.toggle('active', notifyEnabled);
-  const label = document.getElementById('notifyStatusLabel');
-  if (label) {
-    label.textContent = notifyEnabled ? '켜짐' : '꺼짐';
-    label.classList.toggle('active', notifyEnabled);
-  }
 }
 function sendNotify(title, body) {
   // 탭을 보고 있을 때는 화면 배지로 이미 보이니 중복 알림 안 함 - 백그라운드일 때만 브라우저 알림
@@ -2744,19 +2715,10 @@ function renderDashboard() {
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
   h1 { font-size:18px; margin:0 0 4px; }
   #notifyToggleBtn {
-    position:fixed; right:14px; top:60px; z-index:94;
-    width:48px; height:48px; border-radius:50%; background:#2a1414; color:#ff8787;
-    display:flex; align-items:center; justify-content:center; font-size:20px;
-    border:2px solid #4a2020; box-shadow:0 2px 8px rgba(0,0,0,0.4); cursor:pointer; opacity:0.95;
+    font-size:11px; background:#232323; color:#888; border:none; border-radius:8px;
+    padding:4px 8px; margin-left:8px; vertical-align:middle; cursor:pointer;
   }
-  #notifyToggleBtn.active { background:#0f2415; color:#69db7c; border-color:#1f4a2a; }
-  #notifyStatusLabel {
-    position:fixed; right:10px; top:110px; z-index:94;
-    font-size:10px; font-weight:600; color:#ff8787; background:#1c1c1c;
-    padding:2px 8px; border-radius:8px; text-align:center; width:44px;
-    box-shadow:0 2px 6px rgba(0,0,0,0.4);
-  }
-  #notifyStatusLabel.active { color:#69db7c; }
+  #notifyToggleBtn.active { background:#1c2a1c; color:#69db7c; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
   .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
@@ -3035,8 +2997,7 @@ function renderDashboard() {
   <button id="collectBtn" title="지금 시세 즉시 수집">⚡</button>
   <button id="fullReloadBtn" title="전체 페이지 리로드">🔁</button>
   <h1 style="display:none;">🔥 급등주 스크리너</h1>
-  <button id="notifyToggleBtn" onclick="requestNotifyPermission()" title="알림 꺼짐 - 눌러서 켜기">🔕</button>
-  <div id="notifyStatusLabel">꺼짐</div>
+  <button id="notifyToggleBtn" onclick="requestNotifyPermission()">🔕 알림 꺼짐</button>
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
