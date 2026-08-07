@@ -116,6 +116,18 @@ function isMarketHoursKST(date) {
   return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 46; // 09:01 ~ 15:46 (15:38~46은 놓친 종가 재시도용)
 }
 
+// 15:50 이후 전체 매매(신규 자동편입 + 익절/손절 자동삭제) 중지 - 데이터 조회/표시는 그대로 유지,
+// 실제 매매 관련 로직만 이 시간 이후 멈춤. isMarketHoursKST와 별개로 매매 전용 게이트.
+function isTradingActiveKST(date) {
+  const kst = new Date(
+    date.toLocaleString("en-US", { timeZone: "Asia/Seoul" })
+  );
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes < 15 * 60 + 50; // 09:01 ~ 15:50 미만
+}
+
 // 장마감(15:30) 직후, 그 시점 화면에 떠 있던 종목들을 하나씩 정확하게 재조회해서
 // 배치 수집(2분 간격이라 정각과 살짝 어긋날 수 있음)보다 정확한 최종 종가를 남김.
 // ka10027(배치) 대신 종목별 ka10007(개별 시세)이라 초당1건 제한 때문에 종목당 1.1초 걸림.
@@ -153,6 +165,7 @@ async function recordWatchlistExitPerformance(env, w, exitPrice, actualPnlPct) {
 }
 
 async function checkWatchlistRiskLevels(env) {
+  if (!isTradingActiveKST(new Date())) return { checked: 0, skipped: "15:50 이후 매매 중지" };
   const wlRes = await env.DB.prepare(`SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`).all();
   const items = wlRes.results;
   if (!items.length) return { checked: 0 };
@@ -4091,6 +4104,11 @@ self.addEventListener('fetch', (e) => {
           const { code, name, sourceBoard, addedState, touchOnly } = await request.json();
           if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
 
+          // 15:50 이후 신규 편입 중지 (기존 종목 순서 갱신용 touchOnly는 신규 매매가 아니므로 허용)
+          if (!touchOnly && !isTradingActiveKST(new Date())) {
+            return Response.json({ ok: false, error: "15:50 이후 신규 매매 중지" }, { status: 403 });
+          }
+
           // 재편입(이미 관심종목에 있는 종목이 조건검색에 다시 걸림) - 진입가/최초편입시각 건드리지 않고
           // added_at만 지금 시각으로 올려서 리스트 상단 유지 + added_state에 최신 사유 반영
           if (touchOnly) {
@@ -4178,6 +4196,10 @@ self.addEventListener('fetch', (e) => {
         try {
           const { code, pnlPct, name } = await request.json();
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
+          // 15:50 이후 익절/손절 자동삭제 중지
+          if (!isTradingActiveKST(new Date())) {
+            return Response.json({ ok: false, error: "15:50 이후 자동매매 중지" }, { status: 403 });
+          }
           // 삭제 전 필요한 필드 확보 - relay는 code/pnlPct/name만 보내므로 나머지는 여기서 조회
           const w = await env.DB.prepare(
             `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
