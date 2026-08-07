@@ -159,7 +159,8 @@ async function checkWatchlistRiskLevels(env) {
 
   const token = await kiwoomIssueToken(env);
   let checked = 0;
-  const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제
+  const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제 (손절)
+  const AUTO_TAKE_PROFIT_PNL_PCT = 1.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
   for (const w of items) {
     try {
       // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
@@ -174,16 +175,17 @@ async function checkWatchlistRiskLevels(env) {
       if (quote.price <= stopLoss) status = "stop_loss_hit";
       else if (quote.price >= takeProfit) status = "take_profit_hit";
 
-      // 손익률 -1.5% 이하 - 관심종목에서 바로 제거 (risk_status도 같이 정리)
+      // 손익률 -1.5% 이하(손절) 또는 +1.5% 이상(익절) - 관심종목에서 바로 제거 (risk_status도 같이 정리)
       if (w.entry_price && w.entry_price > 0) {
         const pnlPct = ((quote.price - w.entry_price) / w.entry_price) * 100;
-        if (pnlPct <= AUTO_REMOVE_PNL_PCT) {
+        if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
+          const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
           // 삭제되면 watchlist에서 사라져서 trackWatchlistPerformance가 못 보게 됨 -
-          // 손절 확정 손익을 먼저 기록해둬야 성과 통계가 "살아남은 것만" 반영하는 왜곡을 피함
+          // 확정 손익을 먼저 기록해둬야 성과 통계가 "살아남은 것만" 반영하는 왜곡을 피함
           await recordWatchlistExitPerformance(env, w, quote.price, pnlPct);
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
-          await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제 [cron]`);
+          await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[${reason}] [cron]`);
           checked++;
           continue;
         }
@@ -2487,11 +2489,12 @@ function loadWatchlistDailyStats() {
     .then(res => res.json())
     .then(data => {
       const tag = document.getElementById('autoRemovedTag');
-      if (!data.ok || (!data.added && !data.removed)) { tag.style.display = 'none'; return; }
+      if (!data.ok) { tag.style.display = 'none'; return; }
       const netWon = data.netWon || 0;
       const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
       tag.innerHTML =
         '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
+        ' (익절 ' + (data.removedProfit || 0) + ' / 손절 ' + (data.removedLoss || 0) + ')' +
         ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
         ' (익 +' + (data.profitWon || 0).toLocaleString() + ' / 손 ' + (data.lossWon || 0).toLocaleString() + ')';
       tag.style.display = 'inline';
@@ -4188,8 +4191,9 @@ self.addEventListener('fetch', (e) => {
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
           const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
-          await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제 [relay]`);
-          console.log(`relay 손절 자동삭제: ${code} (${pnlStr}%)`);
+          const reason = typeof pnlPct === "number" && pnlPct >= 1.5 ? "익절" : "손절";
+          await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제[${reason}] [relay]`);
+          console.log(`relay ${reason} 자동삭제: ${code} (${pnlStr}%)`);
           return Response.json({ ok: true });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -5006,16 +5010,20 @@ self.addEventListener('fetch', (e) => {
           const todayStartKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
           const todayStartUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
           const res = await env.DB.prepare(
-            `SELECT kind, COUNT(*) as cnt FROM system_events
-             WHERE kind IN ('watchlist_added', 'watchlist_auto_removed') AND created_at >= ?
-             GROUP BY kind`
+            `SELECT kind, message FROM system_events
+             WHERE kind IN ('watchlist_added', 'watchlist_auto_removed') AND created_at >= ?`
           )
             .bind(todayStartUtc)
             .all();
-          const byKind = {};
-          for (const r of res.results || []) byKind[r.kind] = r.cnt;
+          let added = 0, removedProfit = 0, removedLoss = 0;
+          for (const r of res.results || []) {
+            if (r.kind === "watchlist_added") { added++; continue; }
+            // 메시지에 [익절]/[손절] 태그가 있으면 그걸로 구분, 옛날 로그(태그 없음)는 손절로 간주
+            if (r.message && r.message.includes("[익절]")) removedProfit++;
+            else removedLoss++;
+          }
 
-          // 오늘 recorded_at으로 확정된 성과(정상 30/60분 경과분 + 손절삭제분) 기준 실현손익 금액.
+          // 오늘 recorded_at으로 확정된 성과(정상 30/60분 경과분 + 손절/익절 삭제분) 기준 실현손익 금액.
           // horizon 30/60 둘 다 있는 종목은 30분 것만 카운트해서 중복 집계 방지.
           const BUY_AMOUNT = 1000000;
           const perfRes = await env.DB.prepare(
@@ -5032,8 +5040,10 @@ self.addEventListener('fetch', (e) => {
 
           return Response.json({
             ok: true,
-            added: byKind.watchlist_added || 0,
-            removed: byKind.watchlist_auto_removed || 0,
+            added,
+            removed: removedProfit + removedLoss,
+            removedProfit,
+            removedLoss,
             profitWon: Math.round(profitWon),
             lossWon: Math.round(lossWon),
             netWon: Math.round(profitWon + lossWon),
