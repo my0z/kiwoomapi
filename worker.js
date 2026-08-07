@@ -160,7 +160,7 @@ async function checkWatchlistRiskLevels(env) {
   const token = await kiwoomIssueToken(env);
   let checked = 0;
   const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제 (손절)
-  const AUTO_TAKE_PROFIT_PNL_PCT = 1.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
+  const AUTO_TAKE_PROFIT_PNL_PCT = 2.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
   for (const w of items) {
     try {
       // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
@@ -4191,7 +4191,7 @@ self.addEventListener('fetch', (e) => {
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
           const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
-          const reason = typeof pnlPct === "number" && pnlPct >= 1.5 ? "익절" : "손절";
+          const reason = typeof pnlPct === "number" && pnlPct >= 2.5 ? "익절" : "손절";
           await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제[${reason}] [relay]`);
           console.log(`relay ${reason} 자동삭제: ${code} (${pnlStr}%)`);
           return Response.json({ ok: true });
