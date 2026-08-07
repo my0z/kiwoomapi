@@ -4468,6 +4468,19 @@ self.addEventListener('fetch', (e) => {
             // D1에 해당 종목 기록이 없으면 아래로 폴백해서 실시간 조회 시도
           }
 
+          // relay가 이미 웹소켓으로 들고 있는 실시간가를 우선 씀 (즉시 응답, 키움 TR 호출 없음).
+          // relay 미보유(구독 안 된 종목 등)일 때만 키움 직접조회로 폴백.
+          try {
+            const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
+            const relayData = await relayRes.json();
+            const q = relayData.stocks && relayData.stocks[code];
+            if (q && q.price) {
+              return Response.json({ ok: true, price: q.price, rate: q.rate, open: q.price, high: q.price, low: q.price, volume: q.volume || 0 });
+            }
+          } catch (e) {
+            // relay 실패시 아래 폴백으로 계속
+          }
+
           const token = await kiwoomIssueToken(env);
           const raw = await kiwoomQuote(env, token, code);
           return Response.json({ ok: true, ...parseKiwoomQuote(raw) });
@@ -4974,7 +4987,9 @@ self.addEventListener('fetch', (e) => {
           const listParam = url.searchParams.get("list") || "";
           const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
 
-          await kiwoomRelayFetch(env, "/realtime/subscribe", {
+          // 2초마다 반복되는 메인 폴링 경로라 여기 지연이 체감에 가장 큰 영향을 줌.
+          // subscribe 결과는 안 쓰므로 기다리지 않고 던지기만 함 -> relay 왕복 1회로 단축.
+          kiwoomRelayFetch(env, "/realtime/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ codes, listCodes }),
