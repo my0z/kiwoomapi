@@ -2438,12 +2438,23 @@ function startRealtimeStream() {
     }
   };
 }
+// ---------- 클라이언트 장시간 판단 (D1/relay 불필요 폴링 억제용) ----------
+// 장마감 후에도 탭을 계속 켜놨을 때 15초/30초/2분 주기 폴링들이 D1을 계속 두드리는 낭비를 막기 위해,
+// 장중이 아니면 각 타이머 콜백 자체를 스킵함(타이머는 유지, 실행만 건너뜀 - 장 시작하면 자동 재개).
+function isMarketHoursClient() {
+  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 50;
+}
+
 startRealtimeStream();
 // SSE는 연결 시점의 종목 목록으로 구독이 고정되므로, 목록이 바뀔 수 있는 상황(조건검색 신규편입 등)에
 // 대응하기 위해 구독 갱신만 별도로 가볍게 유지 (실시간값 자체는 SSE로 이미 받고 있으므로 이 요청은
 // subscribe만 하고 응답은 버림 - 서버 부하 거의 없음).
 setInterval(() => {
-  if (document.hidden) return;
+  if (document.hidden || !isMarketHoursClient()) return;
   const listParam = realtimeListCodes.slice(0, 180).join(',');
   fetch('/api/realtime-resubscribe?list=' + encodeURIComponent(listParam)).catch(() => {});
 }, 5000);
@@ -2497,7 +2508,7 @@ function loadSystemStatusBanner() {
     .catch(() => {});
 }
 loadSystemStatusBanner();
-setInterval(() => { if (!document.hidden) loadSystemStatusBanner(); }, 120000); // 2분마다
+setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadSystemStatusBanner(); }, 120000); // 2분마다
 
 function loadWatchlistDailyStats() {
   fetch('/api/watchlist-daily-stats')
@@ -2517,7 +2528,7 @@ function loadWatchlistDailyStats() {
     .catch(() => {});
 }
 loadWatchlistDailyStats();
-setInterval(() => { if (!document.hidden) loadWatchlistDailyStats(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
+setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadWatchlistDailyStats(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
 
 // 일별 실현손익 히스토리 - SVG 막대그래프, 외부 라이브러리 없이 자체 렌더링.
 // PC(hover)/모바일(tap) 둘 다 지원하도록 각 막대에 마우스/터치 이벤트를 이벤트 위임으로 붙임(.pnlBarHit).
@@ -2563,7 +2574,7 @@ function loadPnlHistoryChart() {
     .catch(() => {});
 }
 loadPnlHistoryChart();
-setInterval(() => { if (!document.hidden) loadPnlHistoryChart(); }, 120000); // 2분마다
+setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadPnlHistoryChart(); }, 120000); // 2분마다
 
 // 막대 hover(PC)/tap(모바일) 공통 처리 - 이벤트 위임이라 매 렌더링마다 리스너 재등록 불필요
 document.addEventListener('mouseover', (e) => {
@@ -2595,9 +2606,20 @@ function updateGoldenWindowBanner() {
 updateGoldenWindowBanner();
 setInterval(updateGoldenWindowBanner, 30000);
 
+// 장마감 후 D1 부하 방지용 클라이언트 장시간 판단 - 15:52까지는 정상 유지(15:50 일괄정리 결과가
+// 화면에 반영되는 걸 봐야 하므로), 그 이후부터 다음 장 시작 전까지 폴링 스킵.
+function isMarketHoursClientForMainRefresh() {
+  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 52;
+}
+
 load();
 let mainRefreshTimer = setInterval(() => {
   if (document.hidden) return; // 백그라운드면 새로고침 스킵
+  if (!isMarketHoursClientForMainRefresh()) return; // 장마감 후엔 데이터가 안 바뀌므로 스킵(D1 부하 방지)
   load();
 }, 15000); // 10초->15초 (momentum/연속상승 등 D1 지표는 cron이 2분마다만 갱신하므로 이보다 자주 당겨도 새 데이터가 없음 - 그만큼 아낀 여유를 실시간쪽에 씀)
 
