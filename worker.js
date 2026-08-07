@@ -2284,14 +2284,8 @@ function renderMarketIndexBar(index) {
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
   weakMarket = index.kospi.rate < 0 && index.kosdaq.rate < 0;
-  let html = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq);
-  // 해외지수/환율은 relay가 30초 주기로 별도 폴링해서 채우는 값이라 아직 안 채워졌을 수도 있음 -
-  // 있는 것만 표시(없으면 그 항목만 조용히 생략, 국내지수 표시엔 영향 없음).
-  if (index.dji) html += fmtIdx('다우', index.dji);
-  if (index.ixic) html += fmtIdx('나스닥', index.ixic);
-  if (index.spx) html += fmtIdx('S&P500', index.spx);
-  if (index.usdkrw) html += fmtIdx('원/달러', index.usdkrw);
-  bar.innerHTML = html + (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
+  bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
+    (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
   bar.style.display = 'flex';
 }
 
