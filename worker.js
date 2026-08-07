@@ -1799,7 +1799,8 @@ function renderMiniCandles(candles, addedAt) {
   const min = Math.min(...lows), max = Math.max(...highs);
   const range = (max - min) || 1;
   const candleW = (w - pad * 2) / candles.length;
-  const bars = candles.map((c, i) => {
+  let bars = '', hitAreas = '';
+  candles.forEach((c, i) => {
     const x = pad + i * candleW;
     const yOpen = h - pad - ((c.open - min) / range) * (h - pad * 2);
     const yClose = h - pad - ((c.close - min) / range) * (h - pad * 2);
@@ -1810,9 +1811,14 @@ function renderMiniCandles(candles, addedAt) {
     const bodyTop = Math.min(yOpen, yClose);
     const bodyH = Math.max(1, Math.abs(yClose - yOpen));
     const cx = x + candleW / 2;
-    return '<line x1="' + cx + '" y1="' + yHigh.toFixed(1) + '" x2="' + cx + '" y2="' + yLow.toFixed(1) + '" stroke="' + color + '" stroke-width="1"/>' +
+    bars += '<line x1="' + cx + '" y1="' + yHigh.toFixed(1) + '" x2="' + cx + '" y2="' + yLow.toFixed(1) + '" stroke="' + color + '" stroke-width="1"/>' +
       '<rect x="' + x.toFixed(1) + '" y="' + bodyTop.toFixed(1) + '" width="' + (candleW * 0.7).toFixed(1) + '" height="' + bodyH.toFixed(1) + '" fill="' + color + '"/>';
-  }).join('');
+    // 캔들 하나당 투명 히트영역을 전체 높이로 깔아서 몸통이 짧아도(거의 안 움직인 구간) 호버/터치가 잘 잡히게 함.
+    // data-tip에 시간/가격/거래량을 미리 문자열로 담아둠 - 이벤트 위임 핸들러가 그대로 꺼내 씀.
+    const tip = formatChartTime(c.time, '1') + '  ' + fmt(c.close) + '원  거래량 ' + fmt(c.volume || 0);
+    hitAreas += '<rect class="miniChartHit" data-tip="' + tip.replace(/"/g, '&quot;') + '" ' +
+      'x="' + x.toFixed(1) + '" y="0" width="' + candleW.toFixed(1) + '" height="' + h + '" fill="transparent"/>';
+  });
 
   // 즐겨찾기에 추가된 순간을 세로 점선으로 표시 (그 시각과 가장 가까운 캔들 위치를 찾아서)
   let addedMarkerHtml = '';
@@ -1840,7 +1846,9 @@ function renderMiniCandles(candles, addedAt) {
   const timeLabelsHtml = '<div class="chartTimeLabels">' +
     labelIdxs.map(idx => '<span>' + formatChartTime(candles[idx].time, '1') + '</span>').join('') +
     '</div>';
-  return '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + bars + addedMarkerHtml + '</svg>' + timeLabelsHtml;
+  return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' +
+    '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
+    bars + addedMarkerHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
 }
 
 function renderWatchlist(items) {
@@ -2248,8 +2256,14 @@ function renderMarketIndexBar(index) {
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
   weakMarket = index.kospi.rate < 0 && index.kosdaq.rate < 0;
-  bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
-    (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
+  let html = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq);
+  // 해외지수/환율은 relay가 30초 주기로 별도 폴링해서 채우는 값이라 아직 안 채워졌을 수도 있음 -
+  // 있는 것만 표시(없으면 그 항목만 조용히 생략, 국내지수 표시엔 영향 없음).
+  if (index.dji) html += fmtIdx('다우', index.dji);
+  if (index.ixic) html += fmtIdx('나스닥', index.ixic);
+  if (index.spx) html += fmtIdx('S&P500', index.spx);
+  if (index.usdkrw) html += fmtIdx('원/달러', index.usdkrw);
+  bar.innerHTML = html + (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
   bar.style.display = 'flex';
 }
 
@@ -2470,6 +2484,54 @@ document.addEventListener('click', (e) => {
   if (!bar) return;
   const tip = document.getElementById('pnlBarTip');
   if (tip) tip.textContent = bar.getAttribute('data-tip') || '';
+});
+
+// 관심종목 미니차트 캔들 hover(PC)/touch(모바일) - 커서/손가락이 지나가는 캔들의 시간·가격·거래량을
+// 차트 위 툴팁에 표시. 이벤트 위임이라 renderMiniCandles가 몇 번을 다시 그려도 리스너 재등록 불필요.
+function showMiniChartTip(hitEl) {
+  const wrap = hitEl.closest('.miniChartWrap');
+  if (!wrap) return;
+  const tip = wrap.querySelector('.miniChartTip');
+  if (!tip) return;
+  tip.textContent = hitEl.getAttribute('data-tip') || '';
+  tip.style.display = 'block';
+}
+function hideMiniChartTip(wrapEl) {
+  const tip = wrapEl && wrapEl.querySelector('.miniChartTip');
+  if (tip) tip.style.display = 'none';
+}
+document.addEventListener('mousemove', (e) => {
+  const hit = e.target.closest('.miniChartHit');
+  if (hit) { showMiniChartTip(hit); return; }
+  // 차트 영역 밖으로 나가면 툴팁 숨김(단, 다른 미니차트 위로 옮겨가는 중이면 그 차트가 바로 표시하므로 깜빡임 없음)
+  const wrap = e.target.closest('.miniChartWrap');
+  if (!wrap) {
+    document.querySelectorAll('.miniChartTip').forEach(t => t.style.display = 'none');
+  }
+});
+document.addEventListener('mouseleave', (e) => {
+  if (e.target.classList && e.target.classList.contains('miniChartWrap')) hideMiniChartTip(e.target);
+}, true);
+// 모바일 터치 - 손가락으로 눌러서 이동하며 값 확인 (스크롤과 충돌 방지를 위해 차트 영역 내 터치만 preventDefault)
+document.addEventListener('touchstart', (e) => {
+  const wrap = e.target.closest('.miniChartWrap');
+  if (!wrap) return;
+  const touch = e.touches[0];
+  const el = document.elementFromPoint(touch.clientX, touch.clientY);
+  const hit = el && el.closest('.miniChartHit');
+  if (hit) { showMiniChartTip(hit); e.preventDefault(); }
+}, { passive: false });
+document.addEventListener('touchmove', (e) => {
+  const wrap = e.target.closest('.miniChartWrap');
+  if (!wrap) return;
+  const touch = e.touches[0];
+  const el = document.elementFromPoint(touch.clientX, touch.clientY);
+  const hit = el && el.closest('.miniChartHit');
+  if (hit) { showMiniChartTip(hit); e.preventDefault(); }
+}, { passive: false });
+document.addEventListener('touchend', (e) => {
+  const wrap = e.target.closest('.miniChartWrap');
+  if (wrap) setTimeout(() => hideMiniChartTip(wrap), 1500); // 손 뗀 뒤 1.5초 보여주다가 사라짐
 });
 
 // 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
@@ -2710,6 +2772,13 @@ function renderDashboard() {
   .detailGrid b.up { color:#ff6b6b; }
   .chartRange { font-size:11px; color:#888; text-align:center; margin-top:4px; }
   .chartTimeLabels { display:flex; justify-content:space-between; font-size:10px; color:#666; padding:2px 6px 0; }
+  .miniChartWrap { position:relative; }
+  .miniChartTip {
+    position:absolute; top:2px; left:50%; transform:translateX(-50%);
+    background:rgba(20,20,20,0.92); border:1px solid #333; border-radius:6px;
+    padding:3px 8px; font-size:11px; color:#eee; white-space:nowrap; pointer-events:none; z-index:5;
+  }
+  .miniChartHit { cursor:crosshair; }
   .liveDot { color:#69db7c; animation:blink 1.5s ease-in-out infinite; }
   @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.2; } }
   .chartWrap { overflow:hidden; touch-action:none; cursor:grab; border-radius:8px; background:#151515; }
@@ -2844,8 +2913,9 @@ function renderDashboard() {
     font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
   }
   #marketIndexBar {
-    display:flex; gap:14px; font-size:12px; color:#aaa;
-    background:#1c1c1c; border-radius:10px; padding:8px 12px; margin-bottom:14px;
+    display:flex; flex-wrap:wrap; gap:14px; font-size:12px; color:#aaa;
+    background:#1c1c1c; border-radius:0; padding:8px 12px; margin-bottom:14px;
+    position:sticky; top:0; z-index:95; box-shadow:0 2px 6px rgba(0,0,0,0.5);
   }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
@@ -2857,7 +2927,7 @@ function renderDashboard() {
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
-  <div id="marketIndexBar" style="display:none; position:sticky; top:0; z-index:95;"></div>
+  <div id="marketIndexBar" style="display:none;"></div>
   <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
   <div id="cfUsagePanel" style="display:none;"></div>
 
@@ -3512,6 +3582,7 @@ function parseKiwoomChartOHLC(json) {
       high: abs(row.high_pric),
       low: abs(row.low_pric),
       close: abs(row.cur_prc ?? row.close_pric),
+      volume: abs(row.trde_qty ?? row.now_trde_qty),
       time: row.cntr_tm || "",
     }))
     .filter((r) => r.close > 0 && r.high > 0 && r.low > 0)
