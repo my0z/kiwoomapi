@@ -1851,6 +1851,24 @@ function renderMiniCandles(candles, addedAt) {
     bars + addedMarkerHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
 }
 
+// 관심종목 삭제는 낙관적 업데이트(서버 응답 기다리지 않고 화면 먼저 반영)라 실패해도 사용자가
+// 모를 수 있음(화면엔 지워졌는데 서버엔 남아있어서 다음 새로고침 때 도로 나타남) - 실패 시
+// 로컬 배열에 되돌리고 사용자에게 알려서 D1과 화면 상태가 어긋난 채로 방치되지 않게 함.
+function deleteWatchlistItem(code, removedItem, removedIndex) {
+  fetch('/api/watchlist?code=' + code, { method: 'DELETE' })
+    .then(res => {
+      if (!res.ok) throw new Error('삭제 실패 (' + res.status + ')');
+    })
+    .catch(() => {
+      if (removedItem && !watchlistItems.some(w => w.code === code)) {
+        const idx = Math.min(removedIndex, watchlistItems.length);
+        watchlistItems.splice(idx, 0, removedItem);
+        renderWatchlist(watchlistItems);
+      }
+      alert('관심종목 삭제에 실패했습니다. 네트워크를 확인하고 다시 시도해주세요.');
+    });
+}
+
 function renderWatchlist(items) {
   watchlistItems = items;
   watchlistCodes = new Set(items.map(w => w.code));
@@ -1952,10 +1970,12 @@ function renderWatchlist(items) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const code = btn.dataset.code;
+      const removedIndex = watchlistItems.findIndex(w => w.code === code);
+      const removedItem = removedIndex >= 0 ? watchlistItems[removedIndex] : null;
       watchlistItems = watchlistItems.filter(w => w.code !== code);
       renderWatchlist(watchlistItems); // 즉시 반영, 응답 안 기다림
       if (currentModalCode === code) updateStarButton(code, currentModalName);
-      fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
+      deleteWatchlistItem(code, removedItem, removedIndex);
     });
   });
 }
@@ -1998,10 +2018,12 @@ function updateStarButton(code, name, price) {
   starBtn.classList.toggle('active', isStarred);
   starBtn.onclick = () => {
     if (watchlistCodes.has(code)) {
+      const removedIndex = watchlistItems.findIndex(w => w.code === code);
+      const removedItem = removedIndex >= 0 ? watchlistItems[removedIndex] : null;
       watchlistItems = watchlistItems.filter(w => w.code !== code);
       renderWatchlist(watchlistItems); // 서버 응답 기다리지 않고 로컬에서 즉시 반영 (깜빡임 없음)
       updateStarButton(code, name, price);
-      fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
+      deleteWatchlistItem(code, removedItem, removedIndex);
     } else {
       // entry_price는 아직 미확정(null) — 화면엔 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
       const sourceBoard = currentModalSourceBoard;
@@ -2038,11 +2060,13 @@ document.body.addEventListener('click', (e) => {
   const addedState = star.dataset.badges || '';
 
   if (watchlistCodes.has(code)) {
+    const removedIndex = watchlistItems.findIndex(w => w.code === code);
+    const removedItem = removedIndex >= 0 ? watchlistItems[removedIndex] : null;
     watchlistItems = watchlistItems.filter(w => w.code !== code);
     star.classList.remove('active');
     star.textContent = '☆';
     renderWatchlist(watchlistItems); // 서버 재조회 없이 로컬에서 즉시 반영
-    fetch('/api/watchlist?code=' + code, { method: 'DELETE' }).catch(() => {});
+    deleteWatchlistItem(code, removedItem, removedIndex);
   } else {
     // entry_price는 아직 미확정(null) — 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
     watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString(), source_board: sourceBoard, added_state: addedState }, ...watchlistItems];
