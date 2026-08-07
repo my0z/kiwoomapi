@@ -1813,26 +1813,22 @@ let watchlistExitMap = {}; // { code: [이탈신호 사유들] } - 손절선 전
 
 // ---------- 관심종목 미니 캔들차트 (1분봉) ----------
 const miniCandleCache = {}; // { code: candles[] }
-let miniCandleQueueRunning = false;
 
 function queueMiniCandleFetches(codes) {
+  // 예전엔 Worker가 키움 TR을 직접 호출해서 종목당 1.1초 순차대기가 필요했지만,
+  // 지금은 relay(Oracle VM)가 미리 갱신해둔 캐시를 즉시 반환하므로 그 제약이 없어짐 -
+  // 순차 큐 대신 전부 동시 병렬요청 (관심종목 10개면 10배 이상 체감속도 개선).
   const toFetch = codes.filter(c => !miniCandleCache[c]);
-  if (!toFetch.length || miniCandleQueueRunning) return;
-  miniCandleQueueRunning = true;
-  let i = 0;
-  function next() {
-    if (i >= toFetch.length) { miniCandleQueueRunning = false; return; }
-    const code = toFetch[i++];
+  if (!toFetch.length) return;
+  toFetch.forEach(code => {
     fetch('/api/mini-candles?code=' + code)
       .then(res => res.json())
       .then(data => {
         miniCandleCache[code] = data.ok ? data.candles : [];
         updateMiniChartCell(code); // 이 종목 차트 셀만 갱신 (다른 행은 안 건드림)
       })
-      .catch(() => { miniCandleCache[code] = []; })
-      .finally(() => setTimeout(next, 1100)); // 키움 TR 초당1건 제한 준수
-  }
-  next();
+      .catch(() => { miniCandleCache[code] = []; });
+  });
 }
 
 function updateMiniChartCell(code) {
@@ -4574,6 +4570,19 @@ self.addEventListener('fetch', (e) => {
         try {
           const code = url.searchParams.get("code");
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
+
+          // relay(Oracle VM)가 관심종목 미니차트를 백그라운드로 미리 갱신해서 캐시해둠 - 그걸
+          // 우선 씀 (즉시 응답, 종목당 1.1초 순차대기 없음). relay 미보유/실패시에만 기존 방식으로 폴백.
+          try {
+            const relayRes = await kiwoomRelayFetch(env, `/realtime/mini-candles?code=${code}`, { method: "GET" });
+            const relayData = await relayRes.json();
+            if (relayData.ok) {
+              return Response.json({ ok: true, candles: relayData.candles, tradingDate: relayData.tradingDate });
+            }
+          } catch (e) {
+            // relay 요청 자체가 실패(다운/타임아웃)해도 아래 폴백으로 계속 진행
+          }
+
           const token = await kiwoomIssueToken(env);
           const raw = await kiwoomChart(env, token, code, "1");
           const parsed = parseKiwoomChartOHLC(raw);
@@ -5003,7 +5012,10 @@ self.addEventListener('fetch', (e) => {
           const listParam = url.searchParams.get("list") || "";
           const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
 
-          await kiwoomRelayFetch(env, "/realtime/subscribe", {
+          // subscribe는 결과를 안 쓰므로 기다리지 않고 던지기만 함(fire-and-forget) - 이전엔 매번
+          // 두 번의 relay 왕복(subscribe 완료 대기 + stocks 조회)이라 응답이 느렸는데, stocks 조회
+          // 하나만 기다리면 지연이 절반으로 줄어듦. 최초 로드 시 체감속도 개선의 핵심.
+          kiwoomRelayFetch(env, "/realtime/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ codes, listCodes }),
