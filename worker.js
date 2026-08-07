@@ -4172,6 +4172,34 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      // relay(오라클 VM) 전용 - relay가 ka10027(KOSPI/KOSDAQ 등락률상위)을 직접 조회/파싱해서
+      // 결과 배열만 여기로 보냄. Worker는 D1 insert만 수행(원래 collectAndStore가 하던 조회+대기를
+      // relay로 옮겨서 Worker CPU 시간 절약). 기존 cron의 collectAndStore는 이 라우트가 안정화되면
+      // scheduled()에서 비활성화하고 purgeOldRows만 별도 유지.
+      if (url.pathname === "/api/ingest/snapshots" && request.method === "POST") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
+        }
+        try {
+          const { items, capturedAt } = await request.json();
+          if (!Array.isArray(items) || !items.length) {
+            return Response.json({ ok: false, error: "items 비어있음" }, { status: 400 });
+          }
+          const ts = capturedAt || new Date().toISOString();
+          const stmt = env.DB.prepare(
+            `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          );
+          const batch = items.map((s) =>
+            stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, ts, s.cntrStr || 0, s.buyReq || 0, s.selReq || 0)
+          );
+          await env.DB.batch(batch);
+          return Response.json({ ok: true, saved: items.length, capturedAt: ts });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       // relay(오라클 VM) 전용 - 진입가 목록 조회. relay가 이미 웹소켓으로 들고 있는 실시간가와
       // 여기서 받은 entry_price를 비교해서 손익률 -1.5% 이하 여부를 relay 쪽에서 즉시 판단함
       // (2분 cron보다 훨씬 빠르게, 초 단위로 체크 가능).
@@ -4182,6 +4210,63 @@ self.addEventListener('fetch', (e) => {
         try {
           const res = await env.DB.prepare(`SELECT code, entry_price FROM watchlist WHERE entry_price > 0`).all();
           return Response.json({ ok: true, items: res.results });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // relay 전용 - 15:36 종가 재조회 대상 목록. 마지막 캡처 시각의 전종목 + 관심종목 우선순위.
+      // Worker 서브리퀘스트 한도(약 50개) 때문에 여러 틱에 나눠 재시도하던 걸 relay(한도 없음)로
+      // 이전하기 위한 조회 라우트 - collectFinalAccurateQuotes/retryFinalQuotePending의 relay판.
+      if (url.pathname === "/api/final-quote-targets" && request.method === "GET") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
+        }
+        try {
+          const timesRes = await env.DB.prepare(`SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`).all();
+          if (!timesRes.results.length) return Response.json({ ok: true, targets: [] });
+          const lastTime = timesRes.results[0].captured_at;
+          const codesRes = await env.DB.prepare(`SELECT DISTINCT code, name, market FROM snapshots WHERE captured_at = ?`).bind(lastTime).all();
+          let targets = codesRes.results;
+          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
+          const wlCodes = new Set(wlRes.results.map((r) => r.code));
+          if (wlCodes.size) {
+            targets = [...targets].sort((a, b) => (wlCodes.has(b.code) ? 1 : 0) - (wlCodes.has(a.code) ? 1 : 0));
+          }
+          return Response.json({ ok: true, targets, capturedAt: new Date().toISOString() });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // relay 전용 - 최종 종가 재조회 결과 일괄저장. relay가 서브리퀘스트 한도 없이 전종목을
+      // 순차조회(1.1초 간격) 끝낸 뒤 한 번에 전송. Worker는 D1 insert + 후속 일일 백테스트만 수행
+      // (순서 의존성 있는 백테스트를 relay 완료 시점에 맞춰 트리거하기 위해 여기서 실행).
+      if (url.pathname === "/api/ingest/final-quotes" && request.method === "POST") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
+        }
+        try {
+          const { rows, capturedAt, failedCodes } = await request.json();
+          if (!Array.isArray(rows) || !rows.length) {
+            return Response.json({ ok: false, error: "rows 비어있음" }, { status: 400 });
+          }
+          const ts = capturedAt || new Date().toISOString();
+          const stmt = env.DB.prepare(
+            `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`
+          );
+          const batch = rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, ts));
+          await env.DB.batch(batch);
+          if (Array.isArray(failedCodes) && failedCodes.length) {
+            await logSystemEvent(env, "final_quote_partial_failure", `relay 재조회 ${rows.length}종목 성공, ${failedCodes.length}종목 실패: ${failedCodes.slice(0, 15).join(", ")}`);
+          }
+          ctx.waitUntil(
+            runDailySignalBacktest(env).catch((e) => {
+              console.error("일일 신호 백테스트 실패:", e.message || e);
+            })
+          );
+          return Response.json({ ok: true, saved: rows.length, capturedAt: ts });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
@@ -5188,35 +5273,25 @@ self.addEventListener('fetch', (e) => {
   async scheduled(event, env, ctx) {
     const now = new Date();
     if (!isMarketHoursKST(now)) return;
-    const kst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
-    const minutes = kst.getHours() * 60 + kst.getMinutes();
-    // cron이 짝수분마다 도니까 15:35 정각은 못 맞고, 가장 가까운 15:36 틱에 한 번만 정확한 종가로 재조회
-    const isFinalCloseTick = minutes === 15 * 60 + 36;
-    // 15:36에 서브리퀘스트 한도 등으로 놓친 종목을 이어서 채우는 재시도 틱 (매 호출마다 한도가 리셋되므로 유효)
-    const isRetryTick = [15 * 60 + 38, 15 * 60 + 40, 15 * 60 + 42, 15 * 60 + 44, 15 * 60 + 46].includes(minutes);
-
+    // 15:36 종가 재조회(collectFinalAccurateQuotes)와 재시도틱(retryFinalQuotePending)은
+    // relay(Oracle VM)의 자체 15:36 KST 트리거 -> POST /api/ingest/final-quotes 로 완전히 이전됨.
+    // relay는 Worker 서브리퀘스트 한도가 없어 전종목을 한 번에 순차조회 가능 -> 여러 틱에 나눠
+    // 재시도할 필요 자체가 없어짐(retryFinalQuotePending 관련 로직 전부 제거).
     ctx.waitUntil(
       (async () => {
-        if (isFinalCloseTick) {
-          await collectFinalAccurateQuotes(env);
-          await runDailySignalBacktest(env).catch((e) => {
-            console.error("일일 신호 백테스트 실패:", e.message || e);
-          });
-        } else if (isRetryTick) {
-          await retryFinalQuotePending(env);
-        } else {
-          await collectAndStore(env);
-          await checkWatchlistRiskLevels(env).catch((e) => {
-            console.error("관심종목 리스크체크 실패:", e.message || e);
-          });
-          await trackWatchlistPerformance(env).catch((e) => {
-            console.error("관심종목 성과추적 실패:", e.message || e);
-          });
-          await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
-        }
+        await purgeOldRows(env).catch((e) => {
+          console.error("오래된 행 정리 실패:", e.message || e);
+        });
+        await checkWatchlistRiskLevels(env).catch((e) => {
+          console.error("관심종목 리스크체크 실패:", e.message || e);
+        });
+        await trackWatchlistPerformance(env).catch((e) => {
+          console.error("관심종목 성과추적 실패:", e.message || e);
+        });
+        await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
       })().catch((e) => {
-        console.error("scheduled 수집 실패:", e.message || e);
-        return logSystemEvent(env, "cron_failure", `${isFinalCloseTick ? "최종재조회" : isRetryTick ? "종가재시도" : "배치수집"} 실패: ${e.message || e}`);
+        console.error("scheduled 정리작업 실패:", e.message || e);
+        return logSystemEvent(env, "cron_failure", `정리작업 실패: ${e.message || e}`);
       })
     );
   },
