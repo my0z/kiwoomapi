@@ -1527,11 +1527,12 @@ let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화
 let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
-  // 관심종목 미니차트는 최초 로드(캐시가 비어있을 때)에만 relay에서 한 번에 받아옴.
-  // 이미 캐시가 채워진 이후(15초마다 도는 재로드)엔 뺴서 /api/latest 응답이 느려지지 않게 함 -
-  // 미니차트는 1분마다만 바뀌는 데이터라 매번 다시 받아올 필요가 없음.
-  const needMini = Object.keys(miniCandleCache).length === 0;
-  const res = await fetch('/api/latest' + (needMini ? '?mini=1' : ''));
+  // /api/latest는 미니차트를 절대 기다리지 않음 - relay가 느리거나(재시작 직후 워밍업 등) 응답이
+  // 늦어지면 그게 전체 페이지 로딩을 통째로 붙잡는 게 예전 방식의 문제였음. 이제 가격/종목명 등
+  // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
+  // 동시에 쏴서 "차트만 나중에 채워지는" 방식으로 감. 관심종목 자체는 이미 즉시 렌더링됨.
+  const miniPromise = fetch('/api/mini-candles-all').then(r => r.json()).catch(() => ({ ok: false }));
+  const res = await fetch('/api/latest');
   const data = await res.json();
 
   document.getElementById('ts').textContent = data.capturedAt
@@ -1639,15 +1640,23 @@ async function load() {
   });
   watchlistExitMap = {};
   (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
-  // /api/latest 응답에 이미 포함된 관심종목 미니차트를 먼저 캐시에 채워넣음 - 이러면
-  // renderWatchlist가 부르는 queueMiniCandleFetches는 대부분 "이미 있음"으로 스킵되고,
-  // 정말 relay에 캐시가 없던 종목만 개별조회 폴백을 탐(첫 로드부터 차트가 거의 즉시 뜸).
-  if (data.miniCandles) {
-    Object.keys(data.miniCandles).forEach(code => {
-      if (!(code in miniCandleCache)) miniCandleCache[code] = data.miniCandles[code].candles;
-    });
-  }
+  // 미니차트를 기다리지 않고 관심종목을 바로 그림 - 캐시가 없는 종목은 renderWatchlist 안의
+  // queueMiniCandleFetches가 "차트 로딩중" 상태로 먼저 표시한 뒤 개별조회로 채움.
   renderWatchlist(data.watchlist || []);
+  // 위에서 병렬로 쏜 mini-candles-all이 도착하면 아직 캐시에 없는 종목만 채우고 그 종목들만
+  // 다시 그림 - relay가 이미 이 요청과 무관하게 진행 중이던 개별조회를 낭비하지 않기 위해
+  // "아직 없는 것만" 채움(먼저 도착한 개별조회 결과를 덮어쓰지 않음).
+  miniPromise.then(mcData => {
+    if (!mcData || !mcData.ok || !mcData.cache) return;
+    let changed = false;
+    Object.keys(mcData.cache).forEach(code => {
+      if (!(code in miniCandleCache)) {
+        miniCandleCache[code] = mcData.cache[code].candles;
+        changed = true;
+        updateMiniChartCell(code);
+      }
+    });
+  });
 }
 
 // ---------- 내 매매 기록 ----------
@@ -4326,26 +4335,30 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
-      if (url.pathname === "/api/latest") {
-        const needMini = url.searchParams.get("mini") === "1";
-        // relay 미니차트 요청도 D1 조회들과 함께 병렬로 시작함 - 예전엔 D1 조회를 다 기다린
-        // "다음에" relay를 또 기다려서 (D1 소요시간 + relay 왕복시간)이 그대로 더해졌었음.
-        // 병렬로 바꾸면 전체 대기시간이 "둘 중 더 느린 쪽" 하나로 줄어듦 - 첫 로드 체감속도의 핵심 병목이었음.
-        const miniCandlesPromise =
-          needMini && env.RELAY_URL && env.RELAY_SECRET
-            ? kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" })
-                .then((r) => r.json())
-                .then((d) => (d.ok ? d.cache : {}))
-                .catch(() => ({}))
-            : Promise.resolve({});
+      // 관심종목 미니차트 전체 일괄조회 - /api/latest와 완전히 분리된 별도 라우트.
+      // 클라이언트가 이 둘을 동시에(병렬) 쏘고, /api/latest는 이 요청을 절대 기다리지 않음.
+      if (url.pathname === "/api/mini-candles-all") {
+        if (!env.RELAY_URL || !env.RELAY_SECRET) {
+          return Response.json({ ok: false, cache: {} });
+        }
+        try {
+          const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
+          const mcData = await mcRes.json();
+          return Response.json({ ok: !!mcData.ok, cache: mcData.cache || {} });
+        } catch (e) {
+          return Response.json({ ok: false, cache: {} });
+        }
+      }
 
-        const [data, watchlistRes, miniCandles] = await Promise.all([
+      if (url.pathname === "/api/latest") {
+        // 미니차트는 여기서 절대 기다리지 않음(완전히 분리된 /api/mini-candles-all이 전담) -
+        // relay 왕복이 조금이라도 늦어지면 가격/종목명 같은 핵심 데이터까지 통째로 지연되던
+        // 문제를 근본적으로 없애기 위해, 이 라우트는 D1 조회만 하고 무조건 빠르게 응답함.
+        const [data, watchlistRes] = await Promise.all([
           getLatest(env),
           env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all(),
-          miniCandlesPromise,
         ]);
         data.watchlist = watchlistRes.results;
-        data.miniCandles = miniCandles;
 
         // 밴드 밖(오늘 5~15% 목록에 없는) 관심종목은 D1에 저장된 가장 최근 시세로 대체
         // (키움 API 재조회 없이, 이미 수집해둔 데이터만 사용)
