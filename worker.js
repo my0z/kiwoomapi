@@ -303,6 +303,46 @@ async function logSystemEvent(env, kind, message) {
 }
 
 // ---------- Cron: 저장 ----------
+// 해외지수(다우/나스닥/S&P500/원달러 환율) - Yahoo Finance 공개 API, 인증 불필요.
+// KV 60초 캐싱: 2초마다 폴링되는 /api/realtime-all에서 매번 Yahoo를 왕복하면 과도하므로,
+// 해외지수는 국내처럼 초단위로 안 봐도 되는 성격이라 60초 캐시로 충분함.
+const GLOBAL_INDEX_SYMBOLS = { dow: "^DJI", nasdaq: "^IXIC", sp500: "^GSPC", usdkrw: "KRW=X" };
+async function fetchGlobalIndices(env) {
+  const CACHE_KEY = "global-indices-v1";
+  if (env.CACHE_KV) {
+    const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
+    if (cached) return cached;
+  }
+  const entries = await Promise.all(
+    Object.entries(GLOBAL_INDEX_SYMBOLS).map(async ([key, symbol]) => {
+      try {
+        const res = await fetch(
+          `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`,
+          { headers: { "User-Agent": "Mozilla/5.0" } }
+        );
+        if (!res.ok) return [key, null];
+        const json = await res.json();
+        const result = json?.chart?.result?.[0];
+        const meta = result?.meta;
+        if (!meta || meta.regularMarketPrice == null) return [key, null];
+        const price = meta.regularMarketPrice;
+        const prevClose = meta.chartPreviousClose ?? meta.previousClose;
+        const rate = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
+        return [key, { price, rate }];
+      } catch (e) {
+        return [key, null];
+      }
+    })
+  );
+  const out = Object.fromEntries(entries);
+  const payload = { ok: Object.values(out).some(Boolean), ...out };
+  if (env.CACHE_KV && payload.ok) {
+    // waitUntil은 이 함수 스코프에 ctx가 없어 호출부에서 처리 - 여기선 동기적으로 기다리지 않고 바로 반환
+    env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 }).catch(() => {});
+  }
+  return payload;
+}
+
 async function collectAndStore(env) {
   const now = new Date();
   const capturedAt = now.toISOString();
@@ -2355,7 +2395,7 @@ function renderConditionDock(cond) {
   });
 }
 
-function renderMarketIndexBar(index) {
+function renderMarketIndexBar(index, globalIndex) {
   if (!index || !index.kospi || !index.kosdaq) return;
   const bar = document.getElementById('marketIndexBar');
   const fmtIdx = (label, d) => {
@@ -2363,8 +2403,20 @@ function renderMarketIndexBar(index) {
     return '<span>' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
+  const fmtUsdKrw = (d) => {
+    const cls = d.rate >= 0 ? 'up' : 'down';
+    return '<span>USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
+      '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
+  };
   weakMarket = index.kospi.rate < 0 && index.kosdaq.rate < 0;
-  bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
+  let globalHtml = '';
+  if (globalIndex && globalIndex.ok) {
+    if (globalIndex.dow) globalHtml += fmtIdx('다우', globalIndex.dow);
+    if (globalIndex.nasdaq) globalHtml += fmtIdx('나스닥', globalIndex.nasdaq);
+    if (globalIndex.sp500) globalHtml += fmtIdx('S&P500', globalIndex.sp500);
+    if (globalIndex.usdkrw) globalHtml += fmtUsdKrw(globalIndex.usdkrw);
+  }
+  bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) + globalHtml +
     (index.stale ? '<span class="weakMarketNote">⏸ 마지막 값(장마감/휴장)</span>' : '') +
     (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
   bar.style.display = 'flex';
@@ -2406,7 +2458,7 @@ function pollRealtimeAll() {
     .then(res => res.json())
     .then(data => {
       if (!data.ok) return;
-      renderMarketIndexBar(data.index);
+      renderMarketIndexBar(data.index, data.globalIndex);
       renderConditionDock(data.condition);
       applyRealtimeStocks(data.stocks);
     })
@@ -5399,6 +5451,7 @@ self.addEventListener('fetch', (e) => {
 
           const res = await kiwoomRelayFetch(env, "/realtime/all", { method: "GET" });
           const data = await res.json();
+          const globalIndices = await fetchGlobalIndices(env).catch(() => ({ ok: false }));
 
           // 지수는 relay 웹소켓이 살아있을 때만 값이 옴 - 장마감/휴장 등으로 못 받으면
           // D1에 저장해둔 마지막 값으로 폴백함(화면에서 지수바 자체가 계속 숨겨지는 것 방지).
@@ -5462,6 +5515,7 @@ self.addEventListener('fetch', (e) => {
             wsConnected: data.wsConnected,
             wsLoggedIn: data.wsLoggedIn,
             index: indexOut,
+            globalIndex: globalIndices,
             stocks: data.stocks || {},
             condition: data.condition || { seq: null, name: null, codes: [], count: 0, history: [] },
           });
