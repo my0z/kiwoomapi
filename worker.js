@@ -209,12 +209,17 @@ async function checkWatchlistRiskLevels(env) {
         }
       }
 
+      // entry_price가 아직 없어 stopLoss/takeProfit을 계산 못한 틱에는 status/price만 갱신하고
+      // 손절/익절 라인은 기존에 계산해둔 마지막 값을 그대로 유지함(COALESCE) - entry_price가
+      // 나중에 채워지기 전까지 화면에서 라인이 사라졌다 나타났다 깜빡이는 것을 방지.
       await env.DB.prepare(
         `INSERT INTO watchlist_risk_status (code, status, price, stop_loss, take_profit, checked_at)
          VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(code) DO UPDATE SET
            status = excluded.status, price = excluded.price,
-           stop_loss = excluded.stop_loss, take_profit = excluded.take_profit, checked_at = excluded.checked_at`
+           stop_loss = COALESCE(excluded.stop_loss, watchlist_risk_status.stop_loss),
+           take_profit = COALESCE(excluded.take_profit, watchlist_risk_status.take_profit),
+           checked_at = excluded.checked_at`
       )
         .bind(w.code, status, quote.price, stopLoss, takeProfit, new Date().toISOString())
         .run();
@@ -2515,8 +2520,9 @@ function loadWatchlistDailyStats() {
       if (!data.ok) { tag.style.display = 'none'; return; }
       const netWon = data.netWon || 0;
       const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
+      const dateLabel = (data.statsDate && data.statsDate !== 'today') ? '(' + data.statsDate + ' 기준) ' : '';
       tag.innerHTML =
-        '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
+        dateLabel + '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
         ' (익절 ' + (data.removedProfit || 0) + ' / 손절 ' + (data.removedLoss || 0) + ')' +
         ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
         ' (익 +' + (data.profitWon || 0).toLocaleString() + ' / 손 ' + (data.lossWon || 0).toLocaleString() + ')';
@@ -5395,48 +5401,70 @@ self.addEventListener('fetch', (e) => {
       // 오늘 관심종목 추가/자동삭제 건수 - 관심종목 패널 헤더에 표시용
       if (url.pathname === "/api/watchlist-daily-stats") {
         try {
+          async function computeStatsFor(startUtc, endUtc) {
+            const res = await env.DB.prepare(
+              `SELECT kind, message FROM system_events
+               WHERE kind IN ('watchlist_added', 'watchlist_auto_removed') AND created_at >= ? AND created_at < ?`
+            )
+              .bind(startUtc, endUtc)
+              .all();
+            let added = 0, removedProfit = 0, removedLoss = 0;
+            for (const r of res.results || []) {
+              if (r.kind === "watchlist_added") { added++; continue; }
+              if (r.message && r.message.includes("[익절]")) removedProfit++;
+              else removedLoss++;
+            }
+            const BUY_AMOUNT = 1000000;
+            const perfRes = await env.DB.prepare(
+              `SELECT pnl_pct FROM watchlist_performance WHERE horizon_min = 30 AND recorded_at >= ? AND recorded_at < ?`
+            )
+              .bind(startUtc, endUtc)
+              .all();
+            let profitWon = 0, lossWon = 0;
+            for (const r of perfRes.results || []) {
+              const amount = BUY_AMOUNT * (r.pnl_pct / 100);
+              if (amount > 0) profitWon += amount;
+              else lossWon += amount;
+            }
+            return {
+              added, removed: removedProfit + removedLoss, removedProfit, removedLoss,
+              profitWon: Math.round(profitWon), lossWon: Math.round(lossWon), netWon: Math.round(profitWon + lossWon),
+            };
+          }
+
           const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
           const todayStartKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
           const todayStartUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
-          const res = await env.DB.prepare(
-            `SELECT kind, message FROM system_events
-             WHERE kind IN ('watchlist_added', 'watchlist_auto_removed') AND created_at >= ?`
-          )
-            .bind(todayStartUtc)
-            .all();
-          let added = 0, removedProfit = 0, removedLoss = 0;
-          for (const r of res.results || []) {
-            if (r.kind === "watchlist_added") { added++; continue; }
-            // 메시지에 [익절]/[손절] 태그가 있으면 그걸로 구분, 옛날 로그(태그 없음)는 손절로 간주
-            if (r.message && r.message.includes("[익절]")) removedProfit++;
-            else removedLoss++;
+          const farFutureUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000 + 2 * 24 * 60 * 60 * 1000).toISOString();
+
+          let stats = await computeStatsFor(todayStartUtc, farFutureUtc);
+          let usedDate = "today";
+
+          // 오늘 데이터가 전부 0(주말/휴장 등으로 아직 아무 변화도 없음)이면 가장 최근에
+          // 데이터가 있었던 날을 찾아서 그 날짜 통계를 대신 보여줌 - 화면이 통째로 0으로
+          // 비어보이는 것보다 마지막 알려진 상태를 보여주는 게 사용자에게 더 유용함.
+          const allZero = stats.added === 0 && stats.removed === 0 && stats.netWon === 0;
+          if (allZero) {
+            const lastEventRes = await env.DB.prepare(
+              `SELECT created_at FROM system_events
+               WHERE kind IN ('watchlist_added', 'watchlist_auto_removed')
+               ORDER BY created_at DESC LIMIT 1`
+            ).all();
+            const lastRow = (lastEventRes.results || [])[0];
+            if (lastRow && lastRow.created_at) {
+              const lastKst = new Date(new Date(lastRow.created_at).getTime() + 9 * 60 * 60 * 1000);
+              const lastDayStartKst = new Date(Date.UTC(lastKst.getUTCFullYear(), lastKst.getUTCMonth(), lastKst.getUTCDate()));
+              const lastDayStartUtc = new Date(lastDayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
+              const lastDayEndUtc = new Date(lastDayStartKst.getTime() - 9 * 60 * 60 * 1000 + 24 * 60 * 60 * 1000).toISOString();
+              const fallbackStats = await computeStatsFor(lastDayStartUtc, lastDayEndUtc);
+              if (fallbackStats.added > 0 || fallbackStats.removed > 0 || fallbackStats.netWon !== 0) {
+                stats = fallbackStats;
+                usedDate = lastDayStartKst.toISOString().slice(0, 10);
+              }
+            }
           }
 
-          // 오늘 recorded_at으로 확정된 성과(정상 30/60분 경과분 + 손절/익절 삭제분) 기준 실현손익 금액.
-          // horizon 30/60 둘 다 있는 종목은 30분 것만 카운트해서 중복 집계 방지.
-          const BUY_AMOUNT = 1000000;
-          const perfRes = await env.DB.prepare(
-            `SELECT pnl_pct FROM watchlist_performance WHERE horizon_min = 30 AND recorded_at >= ?`
-          )
-            .bind(todayStartUtc)
-            .all();
-          let profitWon = 0, lossWon = 0;
-          for (const r of perfRes.results || []) {
-            const amount = BUY_AMOUNT * (r.pnl_pct / 100);
-            if (amount > 0) profitWon += amount;
-            else lossWon += amount;
-          }
-
-          return Response.json({
-            ok: true,
-            added,
-            removed: removedProfit + removedLoss,
-            removedProfit,
-            removedLoss,
-            profitWon: Math.round(profitWon),
-            lossWon: Math.round(lossWon),
-            netWon: Math.round(profitWon + lossWon),
-          });
+          return Response.json({ ok: true, ...stats, statsDate: usedDate });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
