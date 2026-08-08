@@ -1959,7 +1959,12 @@ function renderWatchlist(items) {
     // (배치 데이터는 오늘자 마지막 5~15% 스냅샷일 뿐이라, 그 이후 밴드를 벗어나며 크게 움직이면 낡은 값일 수 있음)
     const currentPrice = liveQuote ? liveQuote.price : (live ? live.price : (lastKnown ? lastKnown.price : null));
     const currentRate = liveQuote ? liveQuote.rate : (live ? live.rate : (lastKnown ? lastKnown.change_rate : null));
-    const entryPrice = w.entry_price; // null(확정중)과 0(조회실패)을 구분하기 위해 그대로 둠
+    // 진입가가 0(신규 편입 당시 조회 실패로 아직 미확정)이고 현재가는 있으면, 현재가를
+    // 진입가로 대신 써서 "시세 없음"으로 방치되지 않게 함 (서버에도 같은 값이 곧 확정 저장됨).
+    let entryPrice = w.entry_price; // null(확정중)과 0(조회실패)을 구분하기 위해 그대로 둠
+    if (entryPrice === 0 && currentPrice !== null && currentPrice > 0) {
+      entryPrice = currentPrice;
+    }
     let pnl = null;
     if (currentPrice !== null && entryPrice > 0) {
       pnl = computeRealisticPnl(entryPrice, currentPrice, 1000000);
@@ -4436,6 +4441,28 @@ self.addEventListener('fetch', (e) => {
             fallbackFilled = fallbackRes.results || [];
           }
           const filled = relayFilled.filter(Boolean).concat(fallbackFilled);
+
+          // 시세는 채워졌는데 진입가가 아직 0(신규 편입 당시 조회 실패)인 종목은,
+          // 지금 채운 시세를 그대로 진입가로 확정 저장함 - "시세 없음"으로 방치하지 않고
+          // 앞으로도 계속 정상적인 진입가/수익률 계산이 되도록 함.
+          if (filled.length > 0) {
+            const zeroEntryRes = await env.DB.prepare(
+              `SELECT code FROM watchlist WHERE code IN (${filled.map(() => "?").join(",")}) AND (entry_price IS NULL OR entry_price = 0)`
+            )
+              .bind(...filled.map((f) => f.code))
+              .all()
+              .catch(() => ({ results: [] }));
+            const zeroEntryCodes = new Set((zeroEntryRes.results || []).map((r) => r.code));
+            if (zeroEntryCodes.size > 0) {
+              await Promise.all(
+                filled
+                  .filter((f) => zeroEntryCodes.has(f.code) && f.price > 0)
+                  .map((f) => env.DB.prepare(`UPDATE watchlist SET entry_price = ? WHERE code = ?`).bind(f.price, f.code).run())
+              );
+              if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
+            }
+          }
+
           return Response.json({ ok: true, filled });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
