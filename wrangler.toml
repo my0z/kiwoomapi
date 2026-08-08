@@ -27,6 +27,10 @@ deleted_classes = ["PriceStreamDO"]
 [ai]
 binding = "AI"
 
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "ebe3339736d648ff916fb37522dde9d7"
+
 [vars]
 # 민감하지 않은 값만 여기 둠. "true" = 모의투자, "false" = 실전투자
 KIWOOM_MOCK = "true"
@@ -53,4 +57,3 @@ invocation_logs = true
 enabled = false
 persist = true
 head_sampling_rate = 1
-
