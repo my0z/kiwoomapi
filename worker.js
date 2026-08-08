@@ -1528,15 +1528,11 @@ let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화
 let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
-  const __loadStart = performance.now();
   // 관심종목은 /api/latest(연속상승/눌림목/TOP5 등 무거운 계산 포함)와 별개로,
-  // 초경량 전용 엔드포인트에서 가장 먼저 가져와서 최우선으로 그림.
-  const __wlFetchStart = performance.now();
-  let __wlFetchEnd = null, __wlJsonEnd = null, __watchlistDone = null;
+  // 초경량 전용 엔드포인트(KV 60초 캐시)에서 가장 먼저 가져와서 최우선으로 그림.
   const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
-    .then(r => { __wlFetchEnd = performance.now(); return r.json(); })
+    .then(r => r.json())
     .then(wq => {
-      __wlJsonEnd = performance.now();
       if (wq.ok) {
         watchlistLastKnownMap = {};
         (wq.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
@@ -1549,21 +1545,6 @@ async function load() {
         watchlistExitMap = {};
         (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
         renderWatchlist(wq.watchlist || []);
-        __watchlistDone = performance.now();
-
-        // 화면에 직접 소요시간 표시 (모바일에서 개발자도구 없이도 확인 가능하도록)
-        const __timingEl = document.getElementById('loadTiming') || (() => {
-          const el = document.createElement('div');
-          el.id = 'loadTiming';
-          el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#000;color:#0f0;font-size:11px;padding:4px 8px;font-family:monospace;';
-          document.body.prepend(el);
-          return el;
-        })();
-        __timingEl.textContent =
-          '[관심종목 ' + (wq.watchlist || []).length + '개] KV:' + (wq.__kvDebug || '?') + ' | fetch: ' + (__wlFetchEnd - __wlFetchStart).toFixed(0) + 'ms | ' +
-          'json: ' + (__wlJsonEnd - __wlFetchEnd).toFixed(0) + 'ms | ' +
-          '렌더: ' + (__watchlistDone - __wlJsonEnd).toFixed(0) + 'ms | ' +
-          '총: ' + (__watchlistDone - __loadStart).toFixed(0) + 'ms';
 
         // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 별도 요청으로 채움
         if (Array.isArray(wq.watchlistMissingCodes) && wq.watchlistMissingCodes.length > 0) {
@@ -1591,18 +1572,8 @@ async function load() {
   // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
   // 동시에 쏴서 "차트만 나중에 채워지는" 방식으로 감. 관심종목 자체는 이미 즉시 렌더링됨.
   const miniPromise = fetch('/api/mini-candles-all')
-    .then(r => {
-      console.log('[미니차트 디버그] fetch status=', r.status, 'ok=', r.ok);
-      return r.json();
-    })
-    .then(json => {
-      console.log('[미니차트 디버그] json 파싱 성공, ok=', json.ok, 'cache키개수=', json.cache ? Object.keys(json.cache).length : 'cache없음');
-      return json;
-    })
-    .catch(err => {
-      console.log('[미니차트 디버그] fetch/파싱 실패:', err.message || err);
-      return { ok: false };
-    });
+    .then(r => r.json())
+    .catch(() => ({ ok: false }));
   const res = await fetch('/api/latest');
   const data = await res.json();
   await watchlistQuotesPromise; // 이미 끝나 있을 가능성이 높음(더 가벼운 쿼리라서) - 렌더 순서만 보장
@@ -1707,7 +1678,6 @@ async function load() {
   // 수십 개 동시요청이 쌓였던 게 체감 렉의 진짜 원인이었음. 이제 "정말 없는 것"만 나감.
   miniPromise.then(mcData => {
     const cache = (mcData && mcData.ok && mcData.cache) || {};
-    console.log('[미니차트 디버그] mcData.ok=', mcData && mcData.ok, 'cache종목수=', Object.keys(cache).length);
     Object.keys(cache).forEach(code => {
       if (!(code in miniCandleCache)) {
         miniCandleCache[code] = cache[code].candles;
@@ -1715,7 +1685,6 @@ async function load() {
       }
     });
     const stillMissing = (data.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
-    console.log('[미니차트 디버그] 관심종목수=', (data.watchlist || []).length, 'stillMissing수=', stillMissing.length, stillMissing);
     if (stillMissing.length) queueMiniCandleFetches(stillMissing);
   });
 }
@@ -4437,19 +4406,12 @@ self.addEventListener('fetch', (e) => {
         // 시세 자체(가격변동)는 최대 60초 캐시라 화면 자동새로고침 때 갱신됨 - 어차피
         // 주기(15초)보다 훨씬 짧아서 체감상 문제 없음.
         const CACHE_KEY = "watchlist-quotes-v1";
-        let __getFailReason = null;
         try {
           if (env.CACHE_KV) {
-            const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch((e) => {
-              __getFailReason = String(e.message || e).slice(0, 50);
-              return null;
-            });
+            const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
             if (cached) {
-              cached.__kvDebug = "히트";
               return Response.json(cached);
             }
-          } else {
-            __getFailReason = "바인딩없음";
           }
 
           const watchlistRes = await env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all();
@@ -4489,16 +4451,9 @@ self.addEventListener('fetch', (e) => {
             watchlistRisk,
             watchlistExitSignals: [],
           };
-          let __putStatus = "바인딩없음";
           if (env.CACHE_KV) {
-            try {
-              await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 });
-              __putStatus = "저장성공";
-            } catch (e) {
-              __putStatus = "저장실패:" + String(e.message || e).slice(0, 50);
-            }
+            ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 }).catch(() => {}));
           }
-          payload.__kvDebug = "미스(get:" + (__getFailReason || "정상없음") + ", put:" + __putStatus + ")";
           return Response.json(payload);
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
