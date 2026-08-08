@@ -2749,7 +2749,7 @@ function renderDashboard() {
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <style>
-  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 195px; }
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px 16px 80px; }
   h1 { font-size:18px; margin:0 0 4px; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
@@ -3100,10 +3100,10 @@ function renderDashboard() {
     </table>
   </div>
 
-  <div id="conditionDock" style="display:none;">
+  <div id="conditionDock" class="collapsed" style="display:none;">
     <div id="conditionDockHead">
       <span>⚡ 실시간 포착 <span id="conditionDockCount"></span></span>
-      <span id="conditionDockToggle">▼</span>
+      <span id="conditionDockToggle">▲</span>
     </div>
     <div id="conditionDockBody">
       <table id="conditionList"><tbody><tr><td class="empty">감시 중...</td></tr></tbody></table>
