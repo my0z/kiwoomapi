@@ -565,6 +565,28 @@ async function getLatest(env) {
 // ---------- 클라이언트 JS (/app.js로 서빙, HTML과 분리해서 diff/유지보수 쉽게) ----------
 function clientScript() {
   return `
+// 임시 디버그: 처리 안 된 JS 에러를 화면 상단에 빨간 배너로 직접 표시 (모바일 콘솔 확인 불가 대응용)
+window.addEventListener('error', function(e) {
+  const el = document.getElementById('jsErrorBanner') || (function() {
+    const d = document.createElement('div');
+    d.id = 'jsErrorBanner';
+    d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#c00;color:#fff;font-size:12px;padding:8px;white-space:pre-wrap;max-height:40vh;overflow:auto;';
+    document.body.prepend(d);
+    return d;
+  })();
+  el.textContent += '[에러] ' + e.message + ' (' + e.filename + ':' + e.lineno + ':' + e.colno + ')\\n';
+});
+window.addEventListener('unhandledrejection', function(e) {
+  const el = document.getElementById('jsErrorBanner') || (function() {
+    const d = document.createElement('div');
+    d.id = 'jsErrorBanner';
+    d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#c00;color:#fff;font-size:12px;padding:8px;white-space:pre-wrap;max-height:40vh;overflow:auto;';
+    document.body.prepend(d);
+    return d;
+  })();
+  el.textContent += '[프라미스에러] ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason)) + '\\n';
+});
+
 function fmt(n){ return Number(n).toLocaleString(); }
 // 외부 데이터(뉴스/DART/AI 결과)를 innerHTML에 넣기 전 이스케이프 - XSS 방어용.
 function escapeHtml(str) {
@@ -1589,9 +1611,17 @@ async function load() {
       }
       return wq;
     })
-    .catch(() => ({ ok: false }));
-
-  // /api/latest는 미니차트를 절대 기다리지 않음 - relay가 느리거나(재시작 직후 워밍업 등) 응답이
+    .catch(err => {
+      const el = document.getElementById('jsErrorBanner') || (function() {
+        const d = document.createElement('div');
+        d.id = 'jsErrorBanner';
+        d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#c00;color:#fff;font-size:12px;padding:8px;white-space:pre-wrap;max-height:40vh;overflow:auto;';
+        document.body.prepend(d);
+        return d;
+      })();
+      el.textContent += '[watchlistQuotes 에러] ' + (err && err.message ? err.message : String(err)) + '\\n' + (err && err.stack ? err.stack : '') + '\\n';
+      return { ok: false };
+    });
   // 늦어지면 그게 전체 페이지 로딩을 통째로 붙잡는 게 예전 방식의 문제였음. 이제 가격/종목명 등
   // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
   // 동시에 쏴서 "차트만 나중에 채워지는" 방식으로 감. 관심종목 자체는 이미 즉시 렌더링됨.
