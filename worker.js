@@ -2522,6 +2522,11 @@ function pollGlobalIndex() {
     .then(data => {
       if (data.ok) {
         lastGlobalIndex = data;
+        // SSE 연결 중엔 국내지수가 절대 안 오므로(relay가 체결값만 스트리밍), 여기서 대신 채움.
+        // 이미 더 최신인 실시간 값(lastKrIndex.stale이 없는 경우)이 있으면 덮어쓰지 않음.
+        if (data.krIndex && (!lastKrIndex || lastKrIndex.stale)) {
+          lastKrIndex = data.krIndex;
+        }
         renderMarketIndexBar(lastKrIndex, lastGlobalIndex);
       }
     })
@@ -5462,8 +5467,23 @@ self.addEventListener('fetch', (e) => {
       if (url.pathname === "/api/global-index") {
         // 해외지수 전용 - /api/realtime-all과 달리 relay subscribe를 건드리지 않음(빈 list로
         // 이 API를 불러도 화면 리스트 실시간 구독이 끊기지 않게 하기 위한 분리).
+        // 국내지수는 SSE 스트림엔 안 실려오므로(relay가 체결값만 보냄), 여기서 D1 폴백값을
+        // 같이 실어보내 SSE 전용 사용자도 지수바를 볼 수 있게 함.
         const globalIndices = await fetchGlobalIndices(env).catch(() => ({ ok: false }));
-        return Response.json(globalIndices);
+        let krIndex = null;
+        try {
+          const lastRow = await env.DB.prepare(
+            `SELECT * FROM kr_index_last_cache ORDER BY captured_at DESC LIMIT 1`
+          ).first();
+          if (lastRow) {
+            krIndex = {
+              kospi: { price: lastRow.kospi_price, rate: lastRow.kospi_rate },
+              kosdaq: { price: lastRow.kosdaq_price, rate: lastRow.kosdaq_rate },
+              stale: true,
+            };
+          }
+        } catch (e) { /* 테이블 없으면 그냥 null */ }
+        return Response.json({ ...globalIndices, krIndex });
       }
 
       if (url.pathname === "/api/realtime-all") {
