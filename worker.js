@@ -2380,7 +2380,22 @@ function applyRealtimeStocks(stocks) {
     updateListRowRealtime(code, s);
     updateRealtimeExitSignal(code, s);
     if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
+    updateMiniChartLastCandle(code, s.price);
   }
+}
+
+// 관심종목 미니차트의 마지막 캔들을 실시간 체결가로 즉시 갱신 - 60~150초 캐시된 캔들 데이터를
+// 매번 다시 받아오지 않고, 이미 그려진 캔들의 종가/고가/저가만 실시간으로 갱신해서 다시 그림.
+// 분봉이 넘어가는 시점 판단은 하지 않음(다음 캐시 갱신 때 relay가 새 분봉을 만들어 자연히 반영됨) -
+// 이 함수는 "현재 진행 중인 마지막 분봉"이 실시간으로 살아 움직이는 느낌만 주는 용도.
+function updateMiniChartLastCandle(code, price) {
+  const candles = miniCandleCache[code];
+  if (!candles || candles.length === 0) return;
+  const last = candles[candles.length - 1];
+  last.close = price;
+  if (price > last.high) last.high = price;
+  if (price < last.low) last.low = price;
+  updateMiniChartCell(code);
 }
 
 // 지수/실시간포착/관심종목시세 - 예전엔 API 3개를 따로(2~3초 간격씩) 폴링했는데, 전부 relay 메모리에서
