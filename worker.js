@@ -2606,21 +2606,6 @@ document.addEventListener('touchend', (e) => {
 });
 
 // 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
-function updateGoldenWindowBanner() {
-  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  const minutes = kst.getHours() * 60 + kst.getMinutes();
-  const banner = document.getElementById('goldenWindowBanner');
-  if (minutes >= 9 * 60 && minutes <= 9 * 60 + 30) {
-    banner.style.display = 'block';
-    banner.className = '';
-    banner.textContent = '⏰ 09:00~09:30 활발 시간대';
-  } else {
-    banner.style.display = 'none';
-  }
-}
-updateGoldenWindowBanner();
-setInterval(updateGoldenWindowBanner, 30000);
-
 load();
 let mainRefreshTimer = setInterval(() => {
   if (document.hidden) return; // 백그라운드면 새로고침 스킵
@@ -2985,10 +2970,6 @@ function renderDashboard() {
     padding:8px 10px; border-radius:8px; margin-top:6px; font-size:12px;
   }
   #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
-  #goldenWindowBanner {
-    background:linear-gradient(90deg,#ff6b6b,#ffa94d); color:#111; font-weight:600;
-    font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
-  }
   #marketIndexBar {
     display:flex; flex-wrap:wrap; gap:14px; font-size:12px; color:#aaa;
     background:#1c1c1c; border-radius:0; padding:8px 12px; margin-bottom:14px;
@@ -3009,7 +2990,6 @@ function renderDashboard() {
   <div id="cfUsagePanel" style="display:none;"></div>
 
   <div id="systemStatusBanner" style="display:none;"></div>
-  <div id="goldenWindowBanner" style="display:none;"></div>
 
   <div class="board">
     <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
