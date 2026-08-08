@@ -5489,23 +5489,33 @@ self.addEventListener('fetch', (e) => {
 
           // 지수는 relay 웹소켓이 살아있을 때만 값이 옴 - 장마감/휴장 등으로 못 받으면
           // D1에 저장해둔 마지막 값으로 폴백함(화면에서 지수바 자체가 계속 숨겨지는 것 방지).
-          await env.DB.prepare(
-            `CREATE TABLE IF NOT EXISTS market_index_cache (
-              captured_at TEXT PRIMARY KEY,
-              kospi_price REAL, kospi_rate REAL, kosdaq_price REAL, kosdaq_rate REAL
-            )`
-          ).run().catch(() => {});
-          // 테이블이 방금 만들어졌거나 완전히 비어있으면(오늘 이 캐싱이 처음 배포된 경우 등)
-          // 8/7(금) 마지막 장중 종가로 한 번 시드를 넣어둠 - relay가 재시작되며 메모리를 잃어도
-          // 화면에 지수바가 계속 숨겨지는 상황을 피하기 위함. 이후엔 실제 실시간 값으로 계속 갱신됨.
-          const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM market_index_cache`).first().catch(() => null);
-          if (countRow && countRow.c === 0) {
+          let dbDebug = null;
+          try {
             await env.DB.prepare(
-              `INSERT INTO market_index_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
-            )
-              .bind("2026-08-07T06:30:00.000Z", 6258.77, -0.60, 798.81, -0.36)
-              .run()
-              .catch(() => {});
+              `CREATE TABLE IF NOT EXISTS market_index_cache (
+                captured_at TEXT PRIMARY KEY,
+                kospi_price REAL, kospi_rate REAL, kosdaq_price REAL, kosdaq_rate REAL
+              )`
+            ).run();
+          } catch (e) {
+            dbDebug = "CREATE 실패: " + (e.message || e);
+          }
+          if (!dbDebug) {
+            try {
+              const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM market_index_cache`).first();
+              if (countRow && countRow.c === 0) {
+                await env.DB.prepare(
+                  `INSERT INTO market_index_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
+                )
+                  .bind("2026-08-07T06:30:00.000Z", 6258.77, -0.60, 798.81, -0.36)
+                  .run();
+                dbDebug = "시드 삽입함(count=0이었음)";
+              } else {
+                dbDebug = "count=" + (countRow ? countRow.c : "null응답");
+              }
+            } catch (e) {
+              dbDebug = "COUNT/INSERT 실패: " + (e.message || e);
+            }
           }
           let indexOut = data.index || { kospi: null, kosdaq: null };
           if (indexOut.kospi && indexOut.kosdaq) {
@@ -5550,6 +5560,7 @@ self.addEventListener('fetch', (e) => {
             wsLoggedIn: data.wsLoggedIn,
             index: indexOut,
             globalIndex: globalIndices,
+            dbDebug,
             stocks: data.stocks || {},
             condition: data.condition || { seq: null, name: null, codes: [], count: 0, history: [] },
           });
