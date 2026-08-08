@@ -1649,6 +1649,7 @@ async function load() {
   // 수십 개 동시요청이 쌓였던 게 체감 렉의 진짜 원인이었음. 이제 "정말 없는 것"만 나감.
   miniPromise.then(mcData => {
     const cache = (mcData && mcData.ok && mcData.cache) || {};
+    console.log('[미니차트 디버그] mcData.ok=', mcData && mcData.ok, 'cache종목수=', Object.keys(cache).length);
     Object.keys(cache).forEach(code => {
       if (!(code in miniCandleCache)) {
         miniCandleCache[code] = cache[code].candles;
@@ -1656,6 +1657,7 @@ async function load() {
       }
     });
     const stillMissing = (data.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
+    console.log('[미니차트 디버그] 관심종목수=', (data.watchlist || []).length, 'stillMissing수=', stillMissing.length, stillMissing);
     if (stillMissing.length) queueMiniCandleFetches(stillMissing);
   });
 }
