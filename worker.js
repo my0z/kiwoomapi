@@ -384,7 +384,7 @@ async function purgeOldRows(env) {
   const shortCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(`DELETE FROM pattern_scan_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM latest_extras_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
-  // market_index_cache는 이제 "장마감 시 보여줄 마지막 값" 폴백 용도로 씀(대량 이력 저장이 아님) -
+  // kr_index_last_cache는 이제 "장마감 시 보여줄 마지막 값" 폴백 용도로 씀(대량 이력 저장이 아님) -
   // 6시간 지났다고 지워버리면 폴백할 값 자체가 사라져서 지수바가 계속 숨겨지는 문제가 있었음.
   // 대신 아래 저장 시점에서 이 테이블 행 개수를 늘 소수로만 유지함(코드에서 직접 정리).
   // signal_backtest_history는 하루 1행이라 부담 적지만, 60일 넘은 건 정리
@@ -5492,7 +5492,7 @@ self.addEventListener('fetch', (e) => {
           let dbDebug = null;
           try {
             await env.DB.prepare(
-              `CREATE TABLE IF NOT EXISTS market_index_cache (
+              `CREATE TABLE IF NOT EXISTS kr_index_last_cache (
                 captured_at TEXT PRIMARY KEY,
                 kospi_price REAL, kospi_rate REAL, kosdaq_price REAL, kosdaq_rate REAL
               )`
@@ -5502,10 +5502,10 @@ self.addEventListener('fetch', (e) => {
           }
           if (!dbDebug) {
             try {
-              const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM market_index_cache`).first();
+              const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM kr_index_last_cache`).first();
               if (countRow && countRow.c === 0) {
                 await env.DB.prepare(
-                  `INSERT INTO market_index_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
+                  `INSERT INTO kr_index_last_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
                 )
                   .bind("2026-08-07T06:30:00.000Z", 6258.77, -0.60, 798.81, -0.36)
                   .run();
@@ -5521,14 +5521,14 @@ self.addEventListener('fetch', (e) => {
           if (indexOut.kospi && indexOut.kosdaq) {
             ctx.waitUntil(
               env.DB.prepare(
-                `INSERT INTO market_index_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
+                `INSERT INTO kr_index_last_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
               )
                 .bind(new Date().toISOString(), indexOut.kospi.price, indexOut.kospi.rate, indexOut.kosdaq.price, indexOut.kosdaq.rate)
                 .run()
                 .then(() =>
                   // 새 값이 성공적으로 들어간 뒤에만 6시간 넘은 옛 행 정리 - 이러면 정리 직후에도
                   // 항상 최소 1개(방금 넣은 값)는 남아있어서 폴백이 끊기는 일이 없음.
-                  env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`)
+                  env.DB.prepare(`DELETE FROM kr_index_last_cache WHERE captured_at < ?`)
                     .bind(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString())
                     .run()
                 )
@@ -5536,7 +5536,7 @@ self.addEventListener('fetch', (e) => {
             );
           } else {
             const lastRow = await env.DB.prepare(
-              `SELECT * FROM market_index_cache ORDER BY captured_at DESC LIMIT 1`
+              `SELECT * FROM kr_index_last_cache ORDER BY captured_at DESC LIMIT 1`
             )
               .first()
               .catch(() => null);
