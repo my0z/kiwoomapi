@@ -1640,22 +1640,22 @@ async function load() {
   });
   watchlistExitMap = {};
   (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
-  // 미니차트를 기다리지 않고 관심종목을 바로 그림 - 캐시가 없는 종목은 renderWatchlist 안의
-  // queueMiniCandleFetches가 "차트 로딩중" 상태로 먼저 표시한 뒤 개별조회로 채움.
+  // 미니차트를 기다리지 않고 관심종목을 바로 그림 - 캐시가 없는 종목은 "차트 로딩중" 상태로
+  // 먼저 표시된 뒤, 아래 miniPromise(일괄조회)가 도착하면 채워짐.
   renderWatchlist(data.watchlist || []);
-  // 위에서 병렬로 쏜 mini-candles-all이 도착하면 아직 캐시에 없는 종목만 채우고 그 종목들만
-  // 다시 그림 - relay가 이미 이 요청과 무관하게 진행 중이던 개별조회를 낭비하지 않기 위해
-  // "아직 없는 것만" 채움(먼저 도착한 개별조회 결과를 덮어쓰지 않음).
+  // 일괄조회 결과로 캐시를 채우고, 그래도 relay 쪽에도 캐시가 없던 종목(진짜 신규 편입 등)만
+  // 개별조회로 폴백함 - 예전엔 이 폴백이 관심종목 전체에 대해 무조건 돌아서 일괄조회와 겹치며
+  // 수십 개 동시요청이 쌓였던 게 체감 렉의 진짜 원인이었음. 이제 "정말 없는 것"만 나감.
   miniPromise.then(mcData => {
-    if (!mcData || !mcData.ok || !mcData.cache) return;
-    let changed = false;
-    Object.keys(mcData.cache).forEach(code => {
+    const cache = (mcData && mcData.ok && mcData.cache) || {};
+    Object.keys(cache).forEach(code => {
       if (!(code in miniCandleCache)) {
-        miniCandleCache[code] = mcData.cache[code].candles;
-        changed = true;
+        miniCandleCache[code] = cache[code].candles;
         updateMiniChartCell(code);
       }
     });
+    const stillMissing = (data.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
+    if (stillMissing.length) queueMiniCandleFetches(stillMissing);
   });
 }
 
@@ -2004,7 +2004,9 @@ function renderWatchlist(items) {
     });
   }
 
-  queueMiniCandleFetches(items.map(w => w.code));
+  // 미니차트는 여기서 개별조회하지 않음 - load()의 일괄조회(mini-candles-all) 하나가 전담.
+  // 예전엔 renderWatchlist가 다시 그려질 때마다(15초마다) 캐시 없는 종목 전부를 동시에
+  // fetch해서, 일괄조회와 겹치며 수십 개 동시요청이 쌓이는 게 체감 렉의 진짜 원인이었음.
   refreshRealtimeWatchlist(); // 실시간 시세 즉시 1회 (이후는 3초 타이머가 담당)
   tbody.querySelectorAll('.tradeDelBtn').forEach(btn => {
     btn.addEventListener('click', (e) => {
