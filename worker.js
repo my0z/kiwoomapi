@@ -1873,9 +1873,9 @@ function renderMiniCandles(candles, addedAt) {
   const closeX = Math.abs(highXPct - lowXPct) < 15;
   const rangeLabelsHtml =
     '<div class="miniChartRangeLabel down" style="left:' + highLeftPct.toFixed(1) + '%; top:' + (closeX ? '14px' : '1px') + ';">' +
-    fromHighPct.toFixed(1) + '%</div>' +
+    fmt(max) + '(' + fromHighPct.toFixed(1) + '%)</div>' +
     '<div class="miniChartRangeLabel up" style="left:' + lowLeftPct.toFixed(1) + '%; bottom:' + (closeX ? '12px' : '1px') + ';">' +
-    '+' + fromLowPct.toFixed(1) + '%</div>';
+    fmt(min) + '(+' + fromLowPct.toFixed(1) + '%)</div>';
 
   return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' + rangeLabelsHtml +
     '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
