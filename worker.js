@@ -344,9 +344,9 @@ async function purgeOldRows(env) {
   const shortCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(`DELETE FROM pattern_scan_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM latest_extras_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
-  // market_index_cache는 30초마다 행이 생기므로 더 짧게(6시간) 정리
-  const indexCutoff = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-  await env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`).bind(indexCutoff).run().catch(() => {});
+  // market_index_cache는 이제 "장마감 시 보여줄 마지막 값" 폴백 용도로 씀(대량 이력 저장이 아님) -
+  // 6시간 지났다고 지워버리면 폴백할 값 자체가 사라져서 지수바가 계속 숨겨지는 문제가 있었음.
+  // 대신 아래 저장 시점에서 이 테이블 행 개수를 늘 소수로만 유지함(코드에서 직접 정리).
   // signal_backtest_history는 하루 1행이라 부담 적지만, 60일 넘은 건 정리
   const historyCutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   await env.DB.prepare(`DELETE FROM signal_backtest_history WHERE date < ?`).bind(historyCutoff).run().catch(() => {});
@@ -5428,6 +5428,13 @@ self.addEventListener('fetch', (e) => {
               )
                 .bind(new Date().toISOString(), indexOut.kospi.price, indexOut.kospi.rate, indexOut.kosdaq.price, indexOut.kosdaq.rate)
                 .run()
+                .then(() =>
+                  // 새 값이 성공적으로 들어간 뒤에만 6시간 넘은 옛 행 정리 - 이러면 정리 직후에도
+                  // 항상 최소 1개(방금 넣은 값)는 남아있어서 폴백이 끊기는 일이 없음.
+                  env.DB.prepare(`DELETE FROM market_index_cache WHERE captured_at < ?`)
+                    .bind(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString())
+                    .run()
+                )
                 .catch(() => {})
             );
           } else {
