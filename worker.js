@@ -1528,6 +1528,7 @@ let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화
 let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
+  const __loadStart = performance.now();
   // /api/latest는 미니차트를 절대 기다리지 않음 - relay가 느리거나(재시작 직후 워밍업 등) 응답이
   // 늦어지면 그게 전체 페이지 로딩을 통째로 붙잡는 게 예전 방식의 문제였음. 이제 가격/종목명 등
   // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
@@ -1545,8 +1546,11 @@ async function load() {
       console.log('[미니차트 디버그] fetch/파싱 실패:', err.message || err);
       return { ok: false };
     });
+  const __fetchStart = performance.now();
   const res = await fetch('/api/latest');
+  const __fetchEnd = performance.now();
   const data = await res.json();
+  const __jsonEnd = performance.now();
 
   // 관심종목을 다른 모든 리스트(연속상승/눌림목/추천 등) 계산·렌더링보다 최우선으로 즉시 표시.
   // 사용자가 가장 먼저 보고 싶어하는 화면이라 다른 섹션 렌더링을 기다리지 않게 함.
@@ -1561,6 +1565,21 @@ async function load() {
   watchlistExitMap = {};
   (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
   renderWatchlist(data.watchlist || []);
+  const __watchlistDone = performance.now();
+
+  // 화면에 직접 소요시간 표시 (모바일에서 개발자도구 없이도 확인 가능하도록)
+  const __timingEl = document.getElementById('loadTiming') || (() => {
+    const el = document.createElement('div');
+    el.id = 'loadTiming';
+    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#000;color:#0f0;font-size:11px;padding:4px 8px;font-family:monospace;';
+    document.body.prepend(el);
+    return el;
+  })();
+  __timingEl.textContent =
+    'fetch시작~응답: ' + (__fetchEnd - __fetchStart).toFixed(0) + 'ms | ' +
+    'json파싱: ' + (__jsonEnd - __fetchEnd).toFixed(0) + 'ms | ' +
+    '관심종목렌더: ' + (__watchlistDone - __jsonEnd).toFixed(0) + 'ms | ' +
+    '총(페이지시작~관심종목뜸): ' + (__watchlistDone - __loadStart).toFixed(0) + 'ms';
 
   document.getElementById('ts').textContent = data.capturedAt
     ? '기준 시각: ' + new Date(data.capturedAt).toLocaleString('ko-KR')
