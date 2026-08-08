@@ -4397,23 +4397,46 @@ self.addEventListener('fetch', (e) => {
       if (url.pathname === "/api/watchlist-fill-missing" && request.method === "POST") {
         // /api/latest가 응답을 못 채운 관심종목(D1에도 시세없음)만 별도로 relay 즉시조회함.
         // /api/latest와 완전히 분리된 요청이라 이게 늦어도 관심종목 리스트 자체 표시엔 지장 없음.
+        // relay 즉시조회가 실패하면(장마감 시간대 등) D1에 있는 가장 최근 스냅샷으로 폴백함 -
+        // "시세 없음"으로 방치하는 것보다 마지막으로 알려진 값을 보여주는 게 더 유용함.
         try {
           const { codes } = await request.json();
           if (!Array.isArray(codes) || codes.length === 0) {
             return Response.json({ ok: true, filled: [] });
           }
-          if (!env.RELAY_URL || !env.RELAY_SECRET) {
-            return Response.json({ ok: true, filled: [] });
+          let relayFilled = [];
+          if (env.RELAY_URL && env.RELAY_SECRET) {
+            relayFilled = await Promise.all(
+              codes.map((code) =>
+                kiwoomRelayFetch(env, `/realtime/quote-now?code=${code}`, { method: "GET" })
+                  .then((r) => r.json())
+                  .then((d) => (d.ok ? { code, price: d.price, change_rate: d.rate, volume: d.volume } : null))
+                  .catch(() => null)
+              )
+            );
+          } else {
+            relayFilled = codes.map(() => null);
           }
-          const filled = await Promise.all(
-            codes.map((code) =>
-              kiwoomRelayFetch(env, `/realtime/quote-now?code=${code}`, { method: "GET" })
-                .then((r) => r.json())
-                .then((d) => (d.ok ? { code, price: d.price, change_rate: d.rate, volume: d.volume } : null))
-                .catch(() => null)
+          const stillMissing = codes.filter((c, i) => !relayFilled[i]);
+          let fallbackFilled = [];
+          if (stillMissing.length > 0) {
+            const placeholders = stillMissing.map(() => "?").join(",");
+            const fallbackRes = await env.DB.prepare(
+              `SELECT s.code, s.price, s.change_rate, s.volume
+               FROM snapshots s
+               INNER JOIN (
+                 SELECT code, MAX(captured_at) AS max_captured
+                 FROM snapshots WHERE code IN (${placeholders})
+                 GROUP BY code
+               ) m ON s.code = m.code AND s.captured_at = m.max_captured`
             )
-          );
-          return Response.json({ ok: true, filled: filled.filter(Boolean) });
+              .bind(...stillMissing)
+              .all()
+              .catch(() => ({ results: [] }));
+            fallbackFilled = fallbackRes.results || [];
+          }
+          const filled = relayFilled.filter(Boolean).concat(fallbackFilled);
+          return Response.json({ ok: true, filled });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
