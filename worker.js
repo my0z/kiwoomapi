@@ -4431,8 +4431,10 @@ self.addEventListener('fetch', (e) => {
       if (url.pathname === "/api/watchlist-quotes") {
         // 관심종목 시세만 초경량으로 반환 - /api/latest의 연속상승/눌림목/TOP5 등 무거운 계산을
         // 전혀 거치지 않아서 최초 페이지 로딩 시 관심종목이 가장 먼저 뜨게 하는 용도.
-        // KV에 5초 TTL로 캐싱 - D1 왕복(800ms대)을 KV 읽기(수십ms대)로 대체.
-        // 5초라 종목 추가/삭제/시세갱신이 최대 5초 지연될 수 있지만, 화면 자동새로고침
+        // KV에 60초 TTL로 캐싱 - D1 왕복(800ms대)을 KV 읽기(수십ms대)로 대체.
+        // (Cloudflare KV는 expirationTtl 최소값이 60초라 더 짧게 못 잡음)
+        // 종목 추가/삭제 시엔 아래에서 캐시를 즉시 delete하므로 실제 반영은 지연 없음.
+        // 시세 자체(가격변동)는 최대 60초 캐시라 화면 자동새로고침 때 갱신됨 - 어차피
         // 주기(15초)보다 훨씬 짧아서 체감상 문제 없음.
         const CACHE_KEY = "watchlist-quotes-v1";
         let __getFailReason = null;
@@ -4454,7 +4456,7 @@ self.addEventListener('fetch', (e) => {
           const watchlist = watchlistRes.results;
           if (watchlist.length === 0) {
             const empty = { ok: true, watchlist: [], watchlistLastKnown: [], watchlistMissingCodes: [], watchlistRisk: [], watchlistExitSignals: [] };
-            if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(empty), { expirationTtl: 5 }).catch(() => {}));
+            if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(empty), { expirationTtl: 60 }).catch(() => {}));
             return Response.json(empty);
           }
           const codes = watchlist.map((w) => w.code);
@@ -4490,7 +4492,7 @@ self.addEventListener('fetch', (e) => {
           let __putStatus = "바인딩없음";
           if (env.CACHE_KV) {
             try {
-              await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 5 });
+              await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 });
               __putStatus = "저장성공";
             } catch (e) {
               __putStatus = "저장실패:" + String(e.message || e).slice(0, 50);
