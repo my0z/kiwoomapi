@@ -1560,7 +1560,7 @@ async function load() {
           return el;
         })();
         __timingEl.textContent =
-          '[관심종목] fetch: ' + (__wlFetchEnd - __wlFetchStart).toFixed(0) + 'ms | ' +
+          '[관심종목 ' + (wq.watchlist || []).length + '개] fetch: ' + (__wlFetchEnd - __wlFetchStart).toFixed(0) + 'ms | ' +
           'json: ' + (__wlJsonEnd - __wlFetchEnd).toFixed(0) + 'ms | ' +
           '렌더: ' + (__watchlistDone - __wlJsonEnd).toFixed(0) + 'ms | ' +
           '총: ' + (__watchlistDone - __loadStart).toFixed(0) + 'ms';
