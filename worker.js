@@ -1532,9 +1532,35 @@ async function load() {
   // 늦어지면 그게 전체 페이지 로딩을 통째로 붙잡는 게 예전 방식의 문제였음. 이제 가격/종목명 등
   // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
   // 동시에 쏴서 "차트만 나중에 채워지는" 방식으로 감. 관심종목 자체는 이미 즉시 렌더링됨.
-  const miniPromise = fetch('/api/mini-candles-all').then(r => r.json()).catch(() => ({ ok: false }));
+  const miniPromise = fetch('/api/mini-candles-all')
+    .then(r => {
+      console.log('[미니차트 디버그] fetch status=', r.status, 'ok=', r.ok);
+      return r.json();
+    })
+    .then(json => {
+      console.log('[미니차트 디버그] json 파싱 성공, ok=', json.ok, 'cache키개수=', json.cache ? Object.keys(json.cache).length : 'cache없음');
+      return json;
+    })
+    .catch(err => {
+      console.log('[미니차트 디버그] fetch/파싱 실패:', err.message || err);
+      return { ok: false };
+    });
   const res = await fetch('/api/latest');
   const data = await res.json();
+
+  // 관심종목을 다른 모든 리스트(연속상승/눌림목/추천 등) 계산·렌더링보다 최우선으로 즉시 표시.
+  // 사용자가 가장 먼저 보고 싶어하는 화면이라 다른 섹션 렌더링을 기다리지 않게 함.
+  watchlistLastKnownMap = {};
+  (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
+  watchlistRiskMap = {};
+  watchlistRiskLevelMap = {};
+  (data.watchlistRisk || []).forEach(r => {
+    watchlistRiskMap[r.code] = r.status;
+    watchlistRiskLevelMap[r.code] = { stopLoss: r.stop_loss, takeProfit: r.take_profit };
+  });
+  watchlistExitMap = {};
+  (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
+  renderWatchlist(data.watchlist || []);
 
   document.getElementById('ts').textContent = data.capturedAt
     ? '기준 시각: ' + new Date(data.capturedAt).toLocaleString('ko-KR')
@@ -1631,19 +1657,6 @@ async function load() {
   pushCodes(latestList);
   realtimeListCodes = priorityCodes.slice(0, 180);
 
-  watchlistLastKnownMap = {};
-  (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
-  watchlistRiskMap = {};
-  watchlistRiskLevelMap = {}; // { code: { stopLoss, takeProfit } } - 손절/익절 라인 인라인 표시용
-  (data.watchlistRisk || []).forEach(r => {
-    watchlistRiskMap[r.code] = r.status;
-    watchlistRiskLevelMap[r.code] = { stopLoss: r.stop_loss, takeProfit: r.take_profit };
-  });
-  watchlistExitMap = {};
-  (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
-  // 미니차트를 기다리지 않고 관심종목을 바로 그림 - 캐시가 없는 종목은 "차트 로딩중" 상태로
-  // 먼저 표시된 뒤, 아래 miniPromise(일괄조회)가 도착하면 채워짐.
-  renderWatchlist(data.watchlist || []);
   // 일괄조회 결과로 캐시를 채우고, 그래도 relay 쪽에도 캐시가 없던 종목(진짜 신규 편입 등)만
   // 개별조회로 폴백함 - 예전엔 이 폴백이 관심종목 전체에 대해 무조건 돌아서 일괄조회와 겹치며
   // 수십 개 동시요청이 쌓였던 게 체감 렉의 진짜 원인이었음. 이제 "정말 없는 것"만 나감.
