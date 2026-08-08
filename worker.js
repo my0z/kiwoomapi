@@ -1230,6 +1230,8 @@ function computeTopPicks(latest, streak5Codes) {
 // 코스피/코스닥 둘 다 마이너스면 true - renderMarketIndexBar()가 채우고 추천점수 감점에 사용
 // (computeRecommendations보다 먼저 선언되어야 TDZ 에러가 안 남)
 let weakMarket = false;
+let lastGlobalIndex = null; // 해외지수(다우/나스닥/S&P500/원달러) 마지막 값 - SSE/폴링 공용
+let lastKrIndex = null; // 국내지수(코스피/코스닥) 마지막 값 - 해외지수만 갱신될 때도 같이 그리기 위함
 
 function computeRecommendations(latest, pullbackCodes) {
   // 14:30 이후는 마감까지 시간이 짧아 물렸을 때 회복 기회가 부족 - 신규 진입 후보 점수를 전반적으로 낮춤
@@ -2464,7 +2466,9 @@ function pollRealtimeAll() {
     .then(res => res.json())
     .then(data => {
       if (!data.ok) return;
-      renderMarketIndexBar(data.index, data.globalIndex);
+      if (data.index && data.index.kospi) lastKrIndex = data.index;
+      if (data.globalIndex) lastGlobalIndex = data.globalIndex;
+      renderMarketIndexBar(data.index || lastKrIndex, lastGlobalIndex);
       renderConditionDock(data.condition);
       applyRealtimeStocks(data.stocks);
     })
@@ -2491,7 +2495,8 @@ function startRealtimeStream() {
     if (document.hidden) return; // 백그라운드 탭에서는 불필요한 DOM 갱신 스킵 (연결 자체는 유지)
     try {
       const data = JSON.parse(e.data);
-      renderMarketIndexBar(data.index);
+      if (data.index && data.index.kospi) lastKrIndex = data.index;
+      renderMarketIndexBar(data.index || lastKrIndex, lastGlobalIndex);
       renderConditionDock(data.condition);
       applyRealtimeStocks(data.stocks);
     } catch (err) {}
@@ -2508,6 +2513,22 @@ function startRealtimeStream() {
     }
   };
 }
+
+// 해외지수(다우/나스닥/S&P500/원달러) - SSE는 relay가 국내 실시간체결만 보내므로 별도로 60초마다
+// 가져옴. SSE/폴링 둘 다에서 재사용할 수 있게 마지막 값을 변수에 저장해둠.
+function pollGlobalIndex() {
+  fetch('/api/global-index')
+    .then(res => res.json())
+    .then(data => {
+      if (data.ok) {
+        lastGlobalIndex = data;
+        renderMarketIndexBar(lastKrIndex, lastGlobalIndex);
+      }
+    })
+    .catch(() => {});
+}
+pollGlobalIndex();
+setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
 // ---------- 클라이언트 장시간 판단 (D1/relay 불필요 폴링 억제용) ----------
 // 장마감 후에도 탭을 계속 켜놨을 때 15초/30초/2분 주기 폴링들이 D1을 계속 두드리는 낭비를 막기 위해,
 // 장중이 아니면 각 타이머 콜백 자체를 스킵함(타이머는 유지, 실행만 건너뜀 - 장 시작하면 자동 재개).
@@ -5436,6 +5457,13 @@ self.addEventListener('fetch', (e) => {
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
+      }
+
+      if (url.pathname === "/api/global-index") {
+        // 해외지수 전용 - /api/realtime-all과 달리 relay subscribe를 건드리지 않음(빈 list로
+        // 이 API를 불러도 화면 리스트 실시간 구독이 끊기지 않게 하기 위한 분리).
+        const globalIndices = await fetchGlobalIndices(env).catch(() => ({ ok: false }));
+        return Response.json(globalIndices);
       }
 
       if (url.pathname === "/api/realtime-all") {
