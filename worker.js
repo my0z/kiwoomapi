@@ -2474,7 +2474,8 @@ document.getElementById('conditionDockHead').addEventListener('click', () => {
 // Cloudflare 사용량 바로가기 - GraphQL API 인증이 계속 막혀서(계정 권한 이슈),
 // 커스텀 패널 대신 Cloudflare가 이미 잘 보여주는 실제 대시보드로 바로 이동하는 링크로 대체함.
 // 평소엔 숨겨두고 탭하면 펼쳐짐.
-document.getElementById('cfUsageToggle').addEventListener('click', () => {
+document.getElementById('cfUsageToggle').addEventListener('click', (e) => {
+  e.stopPropagation();
   const panel = document.getElementById('cfUsagePanel');
   if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
   panel.style.display = 'block';
@@ -2482,6 +2483,13 @@ document.getElementById('cfUsageToggle').addEventListener('click', () => {
     '<div style="color:#eee; font-weight:600; margin-bottom:6px;">Cloudflare 사용량 바로가기</div>' +
     '<a href="https://dash.cloudflare.com/709dcc6af36c8ee7b6d3d99e7a9fe422/workers/services/view/kiwoomapi/production" target="_blank" rel="noopener" class="cfUsageLink">📈 Workers 요청/CPU 사용량</a>' +
     '<a href="https://dash.cloudflare.com/709dcc6af36c8ee7b6d3d99e7a9fe422/workers/d1" target="_blank" rel="noopener" class="cfUsageLink">🗄️ D1 데이터베이스 사용량</a>';
+});
+// 패널 바깥 아무 곳이나 탭하면 닫힘 (패널 자체 클릭은 예외 처리)
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('cfUsagePanel');
+  if (panel.style.display === 'block' && !panel.contains(e.target)) {
+    panel.style.display = 'none';
+  }
 });
 
 function loadSystemStatusBanner() {
