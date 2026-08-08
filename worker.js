@@ -1581,6 +1581,24 @@ async function load() {
     '관심종목렌더: ' + (__watchlistDone - __jsonEnd).toFixed(0) + 'ms | ' +
     '총(페이지시작~관심종목뜸): ' + (__watchlistDone - __loadStart).toFixed(0) + 'ms';
 
+  // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 /api/latest를 기다리지 않고
+  // 별도 요청으로 채움 - 이 요청이 늦어도 위의 관심종목 리스트 표시엔 전혀 지장 없음.
+  if (Array.isArray(data.watchlistMissingCodes) && data.watchlistMissingCodes.length > 0) {
+    fetch('/api/watchlist-fill-missing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ codes: data.watchlistMissingCodes })
+    })
+      .then(r => r.json())
+      .then(json => {
+        if (json.ok && json.filled && json.filled.length > 0) {
+          json.filled.forEach(f => { watchlistLastKnownMap[f.code] = f; });
+          renderWatchlist(data.watchlist || []);
+        }
+      })
+      .catch(() => {});
+  }
+
   document.getElementById('ts').textContent = data.capturedAt
     ? '기준 시각: ' + new Date(data.capturedAt).toLocaleString('ko-KR')
     : '아직 저장된 데이터가 없습니다';
@@ -4374,6 +4392,31 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
+      if (url.pathname === "/api/watchlist-fill-missing" && request.method === "POST") {
+        // /api/latest가 응답을 못 채운 관심종목(D1에도 시세없음)만 별도로 relay 즉시조회함.
+        // /api/latest와 완전히 분리된 요청이라 이게 늦어도 관심종목 리스트 자체 표시엔 지장 없음.
+        try {
+          const { codes } = await request.json();
+          if (!Array.isArray(codes) || codes.length === 0) {
+            return Response.json({ ok: true, filled: [] });
+          }
+          if (!env.RELAY_URL || !env.RELAY_SECRET) {
+            return Response.json({ ok: true, filled: [] });
+          }
+          const filled = await Promise.all(
+            codes.map((code) =>
+              kiwoomRelayFetch(env, `/realtime/quote-now?code=${code}`, { method: "GET" })
+                .then((r) => r.json())
+                .then((d) => (d.ok ? { code, price: d.price, change_rate: d.rate, volume: d.volume } : null))
+                .catch(() => null)
+            )
+          );
+          return Response.json({ ok: true, filled: filled.filter(Boolean) });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/latest") {
         // 미니차트는 여기서 절대 기다리지 않음(완전히 분리된 /api/mini-candles-all이 전담) -
         // relay 왕복이 조금이라도 늦어지면 가격/종목명 같은 핵심 데이터까지 통째로 지연되던
@@ -4406,22 +4449,12 @@ self.addEventListener('fetch', (e) => {
           data.watchlistLastKnown = [];
         }
 
-        // 밴드에도 D1에도 값이 없는 "진짜 시세없음" 종목은 relay에 즉시조회를 시켜서 그 자리에서 채움
-        // (막 추가된 종목, 오늘 D1 기록이 아예 없는 종목 등). relay가 살아있을 때만 시도하고,
-        // 응답을 기다리되 실패해도 나머지 흐름엔 지장 없음 - 그래도 "시세 없음"으로 표시될 뿐.
+        // 밴드에도 D1에도 값이 없는 종목은 여기서 즉시조회하지 않음 - relay 왕복(종목당 1.1초+)이
+        // /api/latest 응답 전체를 붙잡아 관심종목 표시가 수 초씩 늦어지는 원인이었음.
+        // 대신 "시세없음" 상태로 즉시 응답하고, 클라이언트가 /api/watchlist-fill-missing을
+        // 별도 병렬 요청으로 쏴서 채움 (미니차트와 동일한 패턴).
         const knownCodes = new Set(data.watchlistLastKnown.map((r) => r.code));
-        const stillMissingCodes = offBandCodes.filter((c) => !knownCodes.has(c));
-        if (stillMissingCodes.length > 0 && env.RELAY_URL && env.RELAY_SECRET) {
-          const filled = await Promise.all(
-            stillMissingCodes.map((code) =>
-              kiwoomRelayFetch(env, `/realtime/quote-now?code=${code}`, { method: "GET" })
-                .then((r) => r.json())
-                .then((d) => (d.ok ? { code, price: d.price, change_rate: d.rate, volume: d.volume } : null))
-                .catch(() => null)
-            )
-          );
-          data.watchlistLastKnown = data.watchlistLastKnown.concat(filled.filter(Boolean));
-        }
+        data.watchlistMissingCodes = offBandCodes.filter((c) => !knownCodes.has(c));
 
         // cron이 미리 체크해둔 손절/익절 도달 상태 (모달 안 열어도 바로 보이게)
         if (data.watchlist.length) {
