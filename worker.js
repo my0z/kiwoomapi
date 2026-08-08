@@ -3129,10 +3129,12 @@ function renderDashboard() {
   }
   #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
   #marketIndexBar {
-    display:flex; flex-wrap:wrap; gap:14px; font-size:12px; color:#aaa;
+    display:flex; flex-wrap:nowrap; gap:16px; font-size:12px; color:#aaa;
     background:#1c1c1c; border-radius:0; padding:8px 12px; margin-bottom:14px;
     position:sticky; top:0; z-index:95; box-shadow:0 2px 6px rgba(0,0,0,0.5);
+    overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap;
   }
+  #marketIndexBar span { flex-shrink:0; }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
   #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
