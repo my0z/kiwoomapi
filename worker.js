@@ -5393,6 +5393,18 @@ self.addEventListener('fetch', (e) => {
               kospi_price REAL, kospi_rate REAL, kosdaq_price REAL, kosdaq_rate REAL
             )`
           ).run().catch(() => {});
+          // 테이블이 방금 만들어졌거나 완전히 비어있으면(오늘 이 캐싱이 처음 배포된 경우 등)
+          // 8/7(금) 마지막 장중 종가로 한 번 시드를 넣어둠 - relay가 재시작되며 메모리를 잃어도
+          // 화면에 지수바가 계속 숨겨지는 상황을 피하기 위함. 이후엔 실제 실시간 값으로 계속 갱신됨.
+          const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM market_index_cache`).first().catch(() => null);
+          if (countRow && countRow.c === 0) {
+            await env.DB.prepare(
+              `INSERT INTO market_index_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
+            )
+              .bind("2026-08-07T06:30:00.000Z", 6258.77, -0.60, 798.81, -0.36)
+              .run()
+              .catch(() => {});
+          }
           let indexOut = data.index || { kospi: null, kosdaq: null };
           if (indexOut.kospi && indexOut.kosdaq) {
             ctx.waitUntil(
