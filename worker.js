@@ -1529,6 +1529,63 @@ let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - rend
 
 async function load() {
   const __loadStart = performance.now();
+  // 관심종목은 /api/latest(연속상승/눌림목/TOP5 등 무거운 계산 포함)와 별개로,
+  // 초경량 전용 엔드포인트에서 가장 먼저 가져와서 최우선으로 그림.
+  const __wlFetchStart = performance.now();
+  let __wlFetchEnd = null, __wlJsonEnd = null, __watchlistDone = null;
+  const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
+    .then(r => { __wlFetchEnd = performance.now(); return r.json(); })
+    .then(wq => {
+      __wlJsonEnd = performance.now();
+      if (wq.ok) {
+        watchlistLastKnownMap = {};
+        (wq.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
+        watchlistRiskMap = {};
+        watchlistRiskLevelMap = {};
+        (wq.watchlistRisk || []).forEach(r => {
+          watchlistRiskMap[r.code] = r.status;
+          watchlistRiskLevelMap[r.code] = { stopLoss: r.stop_loss, takeProfit: r.take_profit };
+        });
+        watchlistExitMap = {};
+        (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
+        renderWatchlist(wq.watchlist || []);
+        __watchlistDone = performance.now();
+
+        // 화면에 직접 소요시간 표시 (모바일에서 개발자도구 없이도 확인 가능하도록)
+        const __timingEl = document.getElementById('loadTiming') || (() => {
+          const el = document.createElement('div');
+          el.id = 'loadTiming';
+          el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#000;color:#0f0;font-size:11px;padding:4px 8px;font-family:monospace;';
+          document.body.prepend(el);
+          return el;
+        })();
+        __timingEl.textContent =
+          '[관심종목] fetch: ' + (__wlFetchEnd - __wlFetchStart).toFixed(0) + 'ms | ' +
+          'json: ' + (__wlJsonEnd - __wlFetchEnd).toFixed(0) + 'ms | ' +
+          '렌더: ' + (__watchlistDone - __wlJsonEnd).toFixed(0) + 'ms | ' +
+          '총: ' + (__watchlistDone - __loadStart).toFixed(0) + 'ms';
+
+        // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 별도 요청으로 채움
+        if (Array.isArray(wq.watchlistMissingCodes) && wq.watchlistMissingCodes.length > 0) {
+          fetch('/api/watchlist-fill-missing', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ codes: wq.watchlistMissingCodes })
+          })
+            .then(r => r.json())
+            .then(json => {
+              if (json.ok && json.filled && json.filled.length > 0) {
+                json.filled.forEach(f => { watchlistLastKnownMap[f.code] = f; });
+                renderWatchlist(wq.watchlist || []);
+              }
+            })
+            .catch(() => {});
+        }
+      }
+      return wq;
+    })
+    .catch(() => ({ ok: false }));
+
   // /api/latest는 미니차트를 절대 기다리지 않음 - relay가 느리거나(재시작 직후 워밍업 등) 응답이
   // 늦어지면 그게 전체 페이지 로딩을 통째로 붙잡는 게 예전 방식의 문제였음. 이제 가격/종목명 등
   // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
@@ -1546,58 +1603,9 @@ async function load() {
       console.log('[미니차트 디버그] fetch/파싱 실패:', err.message || err);
       return { ok: false };
     });
-  const __fetchStart = performance.now();
   const res = await fetch('/api/latest');
-  const __fetchEnd = performance.now();
   const data = await res.json();
-  const __jsonEnd = performance.now();
-
-  // 관심종목을 다른 모든 리스트(연속상승/눌림목/추천 등) 계산·렌더링보다 최우선으로 즉시 표시.
-  // 사용자가 가장 먼저 보고 싶어하는 화면이라 다른 섹션 렌더링을 기다리지 않게 함.
-  watchlistLastKnownMap = {};
-  (data.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
-  watchlistRiskMap = {};
-  watchlistRiskLevelMap = {};
-  (data.watchlistRisk || []).forEach(r => {
-    watchlistRiskMap[r.code] = r.status;
-    watchlistRiskLevelMap[r.code] = { stopLoss: r.stop_loss, takeProfit: r.take_profit };
-  });
-  watchlistExitMap = {};
-  (data.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
-  renderWatchlist(data.watchlist || []);
-  const __watchlistDone = performance.now();
-
-  // 화면에 직접 소요시간 표시 (모바일에서 개발자도구 없이도 확인 가능하도록)
-  const __timingEl = document.getElementById('loadTiming') || (() => {
-    const el = document.createElement('div');
-    el.id = 'loadTiming';
-    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#000;color:#0f0;font-size:11px;padding:4px 8px;font-family:monospace;';
-    document.body.prepend(el);
-    return el;
-  })();
-  __timingEl.textContent =
-    'fetch시작~응답: ' + (__fetchEnd - __fetchStart).toFixed(0) + 'ms | ' +
-    'json파싱: ' + (__jsonEnd - __fetchEnd).toFixed(0) + 'ms | ' +
-    '관심종목렌더: ' + (__watchlistDone - __jsonEnd).toFixed(0) + 'ms | ' +
-    '총(페이지시작~관심종목뜸): ' + (__watchlistDone - __loadStart).toFixed(0) + 'ms';
-
-  // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 /api/latest를 기다리지 않고
-  // 별도 요청으로 채움 - 이 요청이 늦어도 위의 관심종목 리스트 표시엔 전혀 지장 없음.
-  if (Array.isArray(data.watchlistMissingCodes) && data.watchlistMissingCodes.length > 0) {
-    fetch('/api/watchlist-fill-missing', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ codes: data.watchlistMissingCodes })
-    })
-      .then(r => r.json())
-      .then(json => {
-        if (json.ok && json.filled && json.filled.length > 0) {
-          json.filled.forEach(f => { watchlistLastKnownMap[f.code] = f; });
-          renderWatchlist(data.watchlist || []);
-        }
-      })
-      .catch(() => {});
-  }
+  await watchlistQuotesPromise; // 이미 끝나 있을 가능성이 높음(더 가벼운 쿼리라서) - 렌더 순서만 보장
 
   document.getElementById('ts').textContent = data.capturedAt
     ? '기준 시각: ' + new Date(data.capturedAt).toLocaleString('ko-KR')
@@ -4412,6 +4420,50 @@ self.addEventListener('fetch', (e) => {
             )
           );
           return Response.json({ ok: true, filled: filled.filter(Boolean) });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/watchlist-quotes") {
+        // 관심종목 시세만 초경량으로 반환 - /api/latest의 연속상승/눌림목/TOP5 등 무거운 계산을
+        // 전혀 거치지 않아서 최초 페이지 로딩 시 관심종목이 가장 먼저 뜨게 하는 용도.
+        try {
+          const watchlistRes = await env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all();
+          const watchlist = watchlistRes.results;
+          if (watchlist.length === 0) {
+            return Response.json({ ok: true, watchlist: [], watchlistLastKnown: [], watchlistMissingCodes: [], watchlistRisk: [], watchlistExitSignals: [] });
+          }
+          const codes = watchlist.map((w) => w.code);
+          const placeholders = codes.map(() => "?").join(",");
+          const lastKnownRes = await env.DB.prepare(
+            `SELECT s.code, s.price, s.change_rate, s.volume
+             FROM snapshots s
+             INNER JOIN (
+               SELECT code, MAX(captured_at) AS max_captured
+               FROM snapshots WHERE code IN (${placeholders})
+               GROUP BY code
+             ) m ON s.code = m.code AND s.captured_at = m.max_captured`
+          )
+            .bind(...codes)
+            .all();
+          const knownCodes = new Set(lastKnownRes.results.map((r) => r.code));
+          const missingCodes = codes.filter((c) => !knownCodes.has(c));
+
+          let watchlistRisk = [];
+          try {
+            const riskRes = await env.DB.prepare(`SELECT code, status, price, stop_loss, take_profit FROM watchlist_risk_status`).all();
+            watchlistRisk = riskRes.results;
+          } catch (e) { /* 테이블 아직 없을 수 있음 */ }
+
+          return Response.json({
+            ok: true,
+            watchlist,
+            watchlistLastKnown: lastKnownRes.results,
+            watchlistMissingCodes: missingCodes,
+            watchlistRisk,
+            watchlistExitSignals: [],
+          });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
