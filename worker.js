@@ -4324,13 +4324,20 @@ self.addEventListener('fetch', (e) => {
       // 클라이언트가 이 둘을 동시에(병렬) 쏘고, /api/latest는 이 요청을 절대 기다리지 않음.
       if (url.pathname === "/api/mini-candles-all") {
         if (!env.RELAY_URL || !env.RELAY_SECRET) {
+          console.error("mini-candles-all: RELAY_URL/SECRET 없음");
           return Response.json({ ok: false, cache: {} });
         }
         try {
           const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
+          if (!mcRes.ok) {
+            const bodyText = await mcRes.text().catch(() => "");
+            console.error("mini-candles-all: relay 응답 실패 status=" + mcRes.status + " body=" + bodyText.slice(0, 300));
+            return Response.json({ ok: false, cache: {} });
+          }
           const mcData = await mcRes.json();
           return Response.json({ ok: !!mcData.ok, cache: mcData.cache || {} });
         } catch (e) {
+          console.error("mini-candles-all: 예외 발생 - " + (e.message || e));
           return Response.json({ ok: false, cache: {} });
         }
       }
