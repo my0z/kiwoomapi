@@ -2396,7 +2396,9 @@ function renderConditionDock(cond) {
 }
 
 function renderMarketIndexBar(index, globalIndex) {
-  if (!index || !index.kospi || !index.kosdaq) return;
+  const hasKr = index && index.kospi && index.kosdaq;
+  const hasGlobal = globalIndex && globalIndex.ok;
+  if (!hasKr && !hasGlobal) return;
   const bar = document.getElementById('marketIndexBar');
   const fmtIdx = (label, d) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
@@ -2408,16 +2410,20 @@ function renderMarketIndexBar(index, globalIndex) {
     return '<span>USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
-  weakMarket = index.kospi.rate < 0 && index.kosdaq.rate < 0;
+  weakMarket = hasKr && index.kospi.rate < 0 && index.kosdaq.rate < 0;
+  let krHtml = '';
+  if (hasKr) {
+    krHtml = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
+      (index.stale ? '<span class="weakMarketNote">⏸ 마지막 값(장마감/휴장)</span>' : '');
+  }
   let globalHtml = '';
-  if (globalIndex && globalIndex.ok) {
+  if (hasGlobal) {
     if (globalIndex.dow) globalHtml += fmtIdx('다우', globalIndex.dow);
     if (globalIndex.nasdaq) globalHtml += fmtIdx('나스닥', globalIndex.nasdaq);
     if (globalIndex.sp500) globalHtml += fmtIdx('S&P500', globalIndex.sp500);
     if (globalIndex.usdkrw) globalHtml += fmtUsdKrw(globalIndex.usdkrw);
   }
-  bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) + globalHtml +
-    (index.stale ? '<span class="weakMarketNote">⏸ 마지막 값(장마감/휴장)</span>' : '') +
+  bar.innerHTML = krHtml + globalHtml +
     (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
   bar.style.display = 'flex';
 }
