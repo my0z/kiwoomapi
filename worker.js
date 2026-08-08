@@ -182,11 +182,16 @@ async function checkWatchlistRiskLevels(env) {
       const atr = computeATR(ohlc, 14);
       if (!atr) continue; // ATR 계산 불가 - 아래 finally에서 대기는 그대로 실행됨
       const quote = parseKiwoomQuote(quoteRaw);
-      const stopLoss = Math.round(quote.price - atr * 1.5);
-      const takeProfit = Math.round(quote.price + atr * 2);
-      let status = "safe";
-      if (quote.price <= stopLoss) status = "stop_loss_hit";
-      else if (quote.price >= takeProfit) status = "take_profit_hit";
+      // ATR 손절/익절 라인은 진입가(entry_price) 기준으로 계산해야 함.
+      // 예전엔 "현재가 ± ATR"로 계산한 뒤 같은 현재가와 비교해서 항상 false가 되는
+      // 자기참조 버그가 있었음(진입가가 없으면 ATR 라인 자체를 계산하지 않음).
+      let stopLoss = null, takeProfit = null, status = "safe";
+      if (w.entry_price && w.entry_price > 0) {
+        stopLoss = Math.round(w.entry_price - atr * 1.5);
+        takeProfit = Math.round(w.entry_price + atr * 2);
+        if (quote.price <= stopLoss) status = "stop_loss_hit";
+        else if (quote.price >= takeProfit) status = "take_profit_hit";
+      }
 
       // 손익률 -1.5% 이하(손절) 또는 +1.5% 이상(익절) - 관심종목에서 바로 제거 (risk_status도 같이 정리)
       if (w.entry_price && w.entry_price > 0) {
@@ -561,6 +566,25 @@ async function getLatest(env) {
 function clientScript() {
   return `
 function fmt(n){ return Number(n).toLocaleString(); }
+// 외부 데이터(뉴스/DART/AI 결과)를 innerHTML에 넣기 전 이스케이프 - XSS 방어용.
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+// href에 들어갈 URL이 http(s)가 아니면(javascript: 등) 빈 문자열로 막음.
+function safeUrl(url) {
+  if (!url) return '';
+  try {
+    const u = String(url).trim();
+    if (/^https?:\/\//i.test(u)) return u;
+  } catch (e) {}
+  return '';
+}
 
 // ---------- 종목 클릭 모달 ----------
 const modalOverlay = document.getElementById('modalOverlay');
@@ -768,10 +792,10 @@ function renderNewsLinks(name, code) {
       }
       summaryEl.innerHTML = data.items.map(item => {
         const tagClass = item.sentiment === '호재' ? 'sentimentUp' : item.sentiment === '악재' ? 'sentimentDown' : 'sentimentNeutral';
-        const tagHtml = item.sentiment ? '<span class="sentimentTag ' + tagClass + '">' + item.sentiment + '</span>' : '';
-        return '<a class="newsItem" href="' + item.link + '" target="_blank" rel="noopener">' +
-          '<div class="newsItemTitle">' + tagHtml + ' ' + item.title + '</div>' +
-          '<div class="newsItemDesc">' + item.description + '</div>' +
+        const tagHtml = item.sentiment ? '<span class="sentimentTag ' + tagClass + '">' + escapeHtml(item.sentiment) + '</span>' : '';
+        return '<a class="newsItem" href="' + safeUrl(item.link) + '" target="_blank" rel="noopener">' +
+          '<div class="newsItemTitle">' + tagHtml + ' ' + escapeHtml(item.title) + '</div>' +
+          '<div class="newsItemDesc">' + escapeHtml(item.description) + '</div>' +
         '</a>';
       }).join('');
     })
@@ -784,9 +808,9 @@ function renderNewsLinks(name, code) {
     .then(data => {
       if (!data.ok || !data.items || !data.items.length) return;
       dartEl.innerHTML = data.items.map(item =>
-        '<a class="newsItem dartItem" href="' + item.link + '" target="_blank" rel="noopener">' +
-          '<div class="newsItemTitle">📋 ' + item.title + '</div>' +
-          '<div class="newsItemDesc">' + item.date + '</div>' +
+        '<a class="newsItem dartItem" href="' + safeUrl(item.link) + '" target="_blank" rel="noopener">' +
+          '<div class="newsItemTitle">📋 ' + escapeHtml(item.title) + '</div>' +
+          '<div class="newsItemDesc">' + escapeHtml(item.date) + '</div>' +
         '</a>'
       ).join('');
     })
@@ -811,7 +835,7 @@ function showAiAnalysis(item) {
         return;
       }
       modalDetail.innerHTML =
-        '<div class="aiAnalysisCard">' + data.analysis + '</div>' +
+        '<div class="aiAnalysisCard">' + escapeHtml(data.analysis).replace(/\n/g, '<br>') + '</div>' +
         '<div class="aiAnalysisNote">⚠️ AI가 생성한 참고용 요약이며, 매매 추천이 아닙니다. 데이터 누락·오류 가능성 있음.</div>';
     })
     .catch(err => {
@@ -4868,11 +4892,17 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/debug") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
+        }
         const result = await debugFetch(env);
         return Response.json(result);
       }
 
       if (url.pathname === "/api/debug-quote") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
+        }
         try {
           const code = url.searchParams.get("code") || "005930";
           const token = await kiwoomIssueToken(env);
@@ -4884,6 +4914,9 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/debug-chart") {
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
+        }
         try {
           const code = url.searchParams.get("code") || "005930";
           const period = url.searchParams.get("period") || "5";
@@ -5510,7 +5543,11 @@ self.addEventListener('fetch', (e) => {
       }
 
       if (url.pathname === "/api/run-now") {
-        // 수동 테스트용 (배포 직후 cron 기다리지 않고 바로 확인)
+        // 수동 테스트용 (배포 직후 cron 기다리지 않고 바로 확인) - 실제 키움 조회+D1 저장을
+        // 트리거하는 작업이라 외부에서 무단 반복 호출되지 않도록 관리자 인증 필요.
+        if (!checkAdminKeyHeaderOnly(request, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
+        }
         const result = await collectAndStore(env);
         return Response.json(result);
       }
@@ -5519,9 +5556,10 @@ self.addEventListener('fetch', (e) => {
         headers: { "content-type": "text/html; charset=UTF-8" },
       });
     } catch (e) {
-      // 처리 안 된 예외를 Cloudflare의 1101 에러 페이지 대신 그대로 노출
+      // 내부 stack/구조는 외부에 노출하지 않고 서버 로그에만 남김
+      console.error("처리 안 된 예외:", e.message || e, e.stack || "");
       return Response.json(
-        { ok: false, error: String(e.message || e), stack: String(e.stack || "") },
+        { ok: false, error: "Internal Server Error" },
         { status: 500 }
       );
     }
