@@ -4380,6 +4380,16 @@ self.addEventListener('fetch', (e) => {
       // 관심종목 미니차트 전체 일괄조회 - /api/latest와 완전히 분리된 별도 라우트.
       // 클라이언트가 이 둘을 동시에(병렬) 쏘고, /api/latest는 이 요청을 절대 기다리지 않음.
       if (url.pathname === "/api/mini-candles-all") {
+        // KV 60초 캐싱 - relay(오라클 VM) 왕복을 없애서 여러 사용자/여러 새로고침이 겹쳐도
+        // 매번 relay를 다시 왕복하지 않게 함. relay 쪽 미니캔들 캐시 자체도 분단위로만 갱신되므로
+        // 60초 캐시로도 신선도 손실이 거의 없음.
+        const MC_CACHE_KEY = "mini-candles-all-v1";
+        if (env.CACHE_KV) {
+          const cached = await env.CACHE_KV.get(MC_CACHE_KEY, "json").catch(() => null);
+          if (cached) {
+            return Response.json(cached);
+          }
+        }
         if (!env.RELAY_URL || !env.RELAY_SECRET) {
           console.error("mini-candles-all: RELAY_URL/SECRET 없음");
           return Response.json({ ok: false, cache: {} });
@@ -4392,7 +4402,11 @@ self.addEventListener('fetch', (e) => {
             return Response.json({ ok: false, cache: {} });
           }
           const mcData = await mcRes.json();
-          return Response.json({ ok: !!mcData.ok, cache: mcData.cache || {} });
+          const payload = { ok: !!mcData.ok, cache: mcData.cache || {} };
+          if (env.CACHE_KV && payload.ok) {
+            ctx.waitUntil(env.CACHE_KV.put(MC_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 }).catch(() => {}));
+          }
+          return Response.json(payload);
         } catch (e) {
           console.error("mini-candles-all: 예외 발생 - " + (e.message || e));
           return Response.json({ ok: false, cache: {} });
