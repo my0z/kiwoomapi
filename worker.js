@@ -2365,6 +2365,7 @@ function renderMarketIndexBar(index) {
   };
   weakMarket = index.kospi.rate < 0 && index.kosdaq.rate < 0;
   bar.innerHTML = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
+    (index.stale ? '<span class="weakMarketNote">⏸ 마지막 값(장마감/휴장)</span>' : '') +
     (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
   bar.style.display = 'flex';
 }
@@ -5384,6 +5385,39 @@ self.addEventListener('fetch', (e) => {
           const res = await kiwoomRelayFetch(env, "/realtime/all", { method: "GET" });
           const data = await res.json();
 
+          // 지수는 relay 웹소켓이 살아있을 때만 값이 옴 - 장마감/휴장 등으로 못 받으면
+          // D1에 저장해둔 마지막 값으로 폴백함(화면에서 지수바 자체가 계속 숨겨지는 것 방지).
+          await env.DB.prepare(
+            `CREATE TABLE IF NOT EXISTS market_index_cache (
+              captured_at TEXT PRIMARY KEY,
+              kospi_price REAL, kospi_rate REAL, kosdaq_price REAL, kosdaq_rate REAL
+            )`
+          ).run().catch(() => {});
+          let indexOut = data.index || { kospi: null, kosdaq: null };
+          if (indexOut.kospi && indexOut.kosdaq) {
+            ctx.waitUntil(
+              env.DB.prepare(
+                `INSERT INTO market_index_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
+              )
+                .bind(new Date().toISOString(), indexOut.kospi.price, indexOut.kospi.rate, indexOut.kosdaq.price, indexOut.kosdaq.rate)
+                .run()
+                .catch(() => {})
+            );
+          } else {
+            const lastRow = await env.DB.prepare(
+              `SELECT * FROM market_index_cache ORDER BY captured_at DESC LIMIT 1`
+            )
+              .first()
+              .catch(() => null);
+            if (lastRow) {
+              indexOut = {
+                kospi: { price: lastRow.kospi_price, rate: lastRow.kospi_rate },
+                kosdaq: { price: lastRow.kosdaq_price, rate: lastRow.kosdaq_rate },
+                stale: true,
+              };
+            }
+          }
+
           // 관심종목만 30초 촘촘 기록 (응답을 막지 않도록 기다리지 않고 백그라운드로 실행)
           if (codes.length && data.stocks) {
             ctx.waitUntil(maybeWriteFineWatchlistSnapshot(env, codes, data.stocks));
@@ -5393,7 +5427,7 @@ self.addEventListener('fetch', (e) => {
             ok: true,
             wsConnected: data.wsConnected,
             wsLoggedIn: data.wsLoggedIn,
-            index: data.index || { kospi: null, kosdaq: null },
+            index: indexOut,
             stocks: data.stocks || {},
             condition: data.condition || { seq: null, name: null, codes: [], count: 0, history: [] },
           });
