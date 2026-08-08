@@ -2733,8 +2733,13 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) load(); // 화면 복귀 시 즉시 최신화
 });
 
+// 서비스워커는 사용하지 않음 - 실시간 시세 앱에 오프라인 캐싱은 불필요하고,
+// 예전에 등록된 서비스워커가 새 배포를 가로막는 문제가 있었음(캐시된 예전 페이지 계속 서빙).
+// 혹시 과거에 등록된 서비스워커가 남아있다면 자동으로 해제.
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  navigator.serviceWorker.getRegistrations().then(regs => {
+    regs.forEach(reg => reg.unregister());
+  }).catch(() => {});
 }
 
 // 홈 화면에 설치되어 standalone/fullscreen으로 실행 중일 때만 시스템 내비게이션 바 숨김 재시도
