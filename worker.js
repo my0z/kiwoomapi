@@ -2402,6 +2402,7 @@ function renderMarketIndexBar(index, globalIndex) {
   const hasGlobal = globalIndex && globalIndex.ok;
   if (!hasKr && !hasGlobal) return;
   const bar = document.getElementById('marketIndexBar');
+  const track = document.getElementById('marketIndexBarTrack');
   const fmtIdx = (label, d) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
     return '<span>' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
@@ -2425,8 +2426,10 @@ function renderMarketIndexBar(index, globalIndex) {
     if (globalIndex.sp500) globalHtml += fmtIdx('S&P500', globalIndex.sp500);
     if (globalIndex.usdkrw) globalHtml += fmtUsdKrw(globalIndex.usdkrw);
   }
-  bar.innerHTML = krHtml + globalHtml +
+  const oneSet = krHtml + globalHtml +
     (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
+  // 내용을 2번 이어붙이고 -50% 지점까지만 이동시키면(CSS keyframes) 이음새 없이 계속 흐르는 것처럼 보임.
+  track.innerHTML = oneSet + oneSet;
   bar.style.display = 'flex';
 }
 
@@ -2480,19 +2483,28 @@ function pollRealtimeAll() {
 // 화면이 멈추지 않게 함(폴백은 페이지 새로고침 전까지 유지 - 재연결 폭주 방지).
 let sseFailedPermanently = false;
 let realtimePollTimer = null;
+let currentEventSource = null; // 화면 hidden/visible 전환 시 완전히 끊고 재연결하기 위해 전역 참조 보관
+function stopRealtimePolling() {
+  if (realtimePollTimer) { clearInterval(realtimePollTimer); realtimePollTimer = null; }
+}
 function startRealtimePolling() {
   if (realtimePollTimer) return;
   pollRealtimeAll();
   realtimePollTimer = setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000);
 }
+function stopRealtimeStream() {
+  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+  stopRealtimePolling();
+}
 function startRealtimeStream() {
   if (sseFailedPermanently || !('EventSource' in window)) { startRealtimePolling(); return; }
   const listParam = realtimeListCodes.slice(0, 180).join(',');
   const es = new EventSource('/api/realtime-stream?list=' + encodeURIComponent(listParam));
+  currentEventSource = es;
   let gotFirstMessage = false;
   es.onmessage = (e) => {
     gotFirstMessage = true;
-    if (document.hidden) return; // 백그라운드 탭에서는 불필요한 DOM 갱신 스킵 (연결 자체는 유지)
+    if (document.hidden) return; // 화면이 꺼지면 stopRealtimeStream()이 연결 자체를 끊으므로 이 경로는 사실상 안 탐
     try {
       const data = JSON.parse(e.data);
       if (data.index && data.index.kospi) lastKrIndex = data.index;
@@ -2502,7 +2514,9 @@ function startRealtimeStream() {
     } catch (err) {}
   };
   es.onerror = () => {
+    if (currentEventSource !== es) return; // 이미 stopRealtimeStream()으로 정리된 연결의 뒤늦은 에러 콜백 무시
     es.close();
+    currentEventSource = null;
     if (!gotFirstMessage) {
       // 연결 자체가 안 됐으면(구조 문제) 폴백으로 완전히 전환하고 재시도 안 함
       sseFailedPermanently = true;
@@ -2522,12 +2536,14 @@ function pollGlobalIndex() {
     .then(data => {
       if (data.ok) {
         lastGlobalIndex = data;
-        // SSE 연결 중엔 국내지수가 절대 안 오므로(relay가 체결값만 스트리밍), 여기서 대신 채움.
-        // 이미 더 최신인 실시간 값(lastKrIndex.stale이 없는 경우)이 있으면 덮어쓰지 않음.
         if (data.krIndex && (!lastKrIndex || lastKrIndex.stale)) {
           lastKrIndex = data.krIndex;
         }
-        renderMarketIndexBar(lastKrIndex, lastGlobalIndex);
+        try {
+          renderMarketIndexBar(lastKrIndex, lastGlobalIndex);
+        } catch (e) {
+          console.error('[지수바 렌더 에러]', e.message || e);
+        }
       }
     })
     .catch(() => {});
@@ -2829,7 +2845,13 @@ function updateListRowRealtime(code, s) {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) load(); // 화면 복귀 시 즉시 최신화
+  if (document.hidden) {
+    stopRealtimeStream(); // 화면 꺼지면 실시간 연결(SSE/폴링) 완전히 끊음 - 배터리/데이터 절약
+  } else {
+    load(); // 화면 복귀 시 즉시 최신화
+    sseFailedPermanently = false; // 이전에 폴백 전환됐었어도 복귀 시 SSE부터 다시 시도
+    startRealtimeStream();
+  }
 });
 
 // 서비스워커는 사용하지 않음 - 실시간 시세 앱에 오프라인 캐싱은 불필요하고,
@@ -3129,10 +3151,19 @@ function renderDashboard() {
   }
   #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
   #marketIndexBar {
-    display:flex; flex-wrap:nowrap; gap:16px; font-size:12px; color:#aaa;
-    background:#1c1c1c; border-radius:0; padding:8px 12px; margin-bottom:14px;
+    display:flex; flex-wrap:nowrap; font-size:12px; color:#aaa;
+    background:#1c1c1c; border-radius:0; padding:8px 0; margin-bottom:14px;
     position:sticky; top:0; z-index:95; box-shadow:0 2px 6px rgba(0,0,0,0.5);
-    overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap;
+    overflow:hidden; white-space:nowrap;
+  }
+  #marketIndexBarTrack {
+    display:flex; flex-wrap:nowrap; gap:16px; padding:0 12px;
+    animation: marketTickerScroll 30s linear infinite;
+  }
+  #marketIndexBar:hover #marketIndexBarTrack { animation-play-state: paused; }
+  @keyframes marketTickerScroll {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
   }
   #marketIndexBar span { flex-shrink:0; }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
@@ -3145,7 +3176,7 @@ function renderDashboard() {
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
-  <div id="marketIndexBar" style="display:none;"></div>
+  <div id="marketIndexBar" style="display:none;"><div id="marketIndexBarTrack"></div></div>
   <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
   <div id="cfUsagePanel" style="display:none;"></div>
 
