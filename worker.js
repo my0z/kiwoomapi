@@ -566,25 +566,6 @@ async function getLatest(env) {
 function clientScript() {
   return `
 function fmt(n){ return Number(n).toLocaleString(); }
-// 외부 데이터(뉴스/DART/AI 결과)를 innerHTML에 넣기 전 이스케이프 - XSS 방어용.
-function escapeHtml(str) {
-  if (str === null || str === undefined) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-// href에 들어갈 URL이 http(s)가 아니면(javascript: 등) 빈 문자열로 막음.
-function safeUrl(url) {
-  if (!url) return '';
-  try {
-    const u = String(url).trim();
-    if (/^https?:\/\//i.test(u)) return u;
-  } catch (e) {}
-  return '';
-}
 
 // ---------- 종목 클릭 모달 ----------
 const modalOverlay = document.getElementById('modalOverlay');
@@ -792,10 +773,10 @@ function renderNewsLinks(name, code) {
       }
       summaryEl.innerHTML = data.items.map(item => {
         const tagClass = item.sentiment === '호재' ? 'sentimentUp' : item.sentiment === '악재' ? 'sentimentDown' : 'sentimentNeutral';
-        const tagHtml = item.sentiment ? '<span class="sentimentTag ' + tagClass + '">' + escapeHtml(item.sentiment) + '</span>' : '';
-        return '<a class="newsItem" href="' + safeUrl(item.link) + '" target="_blank" rel="noopener">' +
-          '<div class="newsItemTitle">' + tagHtml + ' ' + escapeHtml(item.title) + '</div>' +
-          '<div class="newsItemDesc">' + escapeHtml(item.description) + '</div>' +
+        const tagHtml = item.sentiment ? '<span class="sentimentTag ' + tagClass + '">' + item.sentiment + '</span>' : '';
+        return '<a class="newsItem" href="' + item.link + '" target="_blank" rel="noopener">' +
+          '<div class="newsItemTitle">' + tagHtml + ' ' + item.title + '</div>' +
+          '<div class="newsItemDesc">' + item.description + '</div>' +
         '</a>';
       }).join('');
     })
@@ -808,9 +789,9 @@ function renderNewsLinks(name, code) {
     .then(data => {
       if (!data.ok || !data.items || !data.items.length) return;
       dartEl.innerHTML = data.items.map(item =>
-        '<a class="newsItem dartItem" href="' + safeUrl(item.link) + '" target="_blank" rel="noopener">' +
-          '<div class="newsItemTitle">📋 ' + escapeHtml(item.title) + '</div>' +
-          '<div class="newsItemDesc">' + escapeHtml(item.date) + '</div>' +
+        '<a class="newsItem dartItem" href="' + item.link + '" target="_blank" rel="noopener">' +
+          '<div class="newsItemTitle">📋 ' + item.title + '</div>' +
+          '<div class="newsItemDesc">' + item.date + '</div>' +
         '</a>'
       ).join('');
     })
@@ -835,7 +816,7 @@ function showAiAnalysis(item) {
         return;
       }
       modalDetail.innerHTML =
-        '<div class="aiAnalysisCard">' + escapeHtml(data.analysis).replace(/\n/g, '<br>') + '</div>' +
+        '<div class="aiAnalysisCard">' + data.analysis + '</div>' +
         '<div class="aiAnalysisNote">⚠️ AI가 생성한 참고용 요약이며, 매매 추천이 아닙니다. 데이터 누락·오류 가능성 있음.</div>';
     })
     .catch(err => {
