@@ -1538,6 +1538,11 @@ let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화
 let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
+  // 미니차트 전체 조회를 관심종목 조회와 동시에 시작 - 어느 쪽이 먼저 끝나든 서로 안 기다림.
+  const miniPromise = fetch('/api/mini-candles-all')
+    .then(r => r.json())
+    .catch(() => ({ ok: false }));
+
   // 관심종목은 /api/latest(연속상승/눌림목/TOP5 등 무거운 계산 포함)와 별개로,
   // 초경량 전용 엔드포인트(KV 60초 캐시)에서 가장 먼저 가져와서 최우선으로 그림.
   const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
@@ -1572,15 +1577,24 @@ async function load() {
             })
             .catch(() => {});
         }
+
+        // 미니차트도 /api/latest를 기다리지 않고 관심종목 목록이 확보되는 즉시 채움 -
+        // 예전엔 /api/latest(무거운 쿼리) 완료까지 기다렸다가 미니차트를 채워서, mini-candles-all이
+        // 이미 도착해 있어도 화면 반영이 그만큼 늦어지는 게 체감 지연의 원인이었음.
+        miniPromise.then(mcData => {
+          const cache = (mcData && mcData.ok && mcData.cache) || {};
+          Object.keys(cache).forEach(code => {
+            if (!(code in miniCandleCache)) {
+              miniCandleCache[code] = cache[code].candles;
+              updateMiniChartCell(code);
+            }
+          });
+          const stillMissing = (wq.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
+          if (stillMissing.length) queueMiniCandleFetches(stillMissing);
+        });
       }
       return wq;
     })
-    .catch(() => ({ ok: false }));
-  // 늦어지면 그게 전체 페이지 로딩을 통째로 붙잡는 게 예전 방식의 문제였음. 이제 가격/종목명 등
-  // 핵심 데이터는 항상 즉시 뜨고, 미니차트 전체(mini-candles-all)는 완전히 별도의 병렬 요청으로
-  // 동시에 쏴서 "차트만 나중에 채워지는" 방식으로 감. 관심종목 자체는 이미 즉시 렌더링됨.
-  const miniPromise = fetch('/api/mini-candles-all')
-    .then(r => r.json())
     .catch(() => ({ ok: false }));
   const res = await fetch('/api/latest');
   const data = await res.json();
@@ -1680,21 +1694,6 @@ async function load() {
   pushCodes(topPicks);
   pushCodes(latestList);
   realtimeListCodes = priorityCodes.slice(0, 180);
-
-  // 일괄조회 결과로 캐시를 채우고, 그래도 relay 쪽에도 캐시가 없던 종목(진짜 신규 편입 등)만
-  // 개별조회로 폴백함 - 예전엔 이 폴백이 관심종목 전체에 대해 무조건 돌아서 일괄조회와 겹치며
-  // 수십 개 동시요청이 쌓였던 게 체감 렉의 진짜 원인이었음. 이제 "정말 없는 것"만 나감.
-  miniPromise.then(mcData => {
-    const cache = (mcData && mcData.ok && mcData.cache) || {};
-    Object.keys(cache).forEach(code => {
-      if (!(code in miniCandleCache)) {
-        miniCandleCache[code] = cache[code].candles;
-        updateMiniChartCell(code);
-      }
-    });
-    const stillMissing = (data.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
-    if (stillMissing.length) queueMiniCandleFetches(stillMissing);
-  });
 }
 
 // ---------- 내 매매 기록 ----------
@@ -4404,7 +4403,7 @@ self.addEventListener('fetch', (e) => {
           const mcData = await mcRes.json();
           const payload = { ok: !!mcData.ok, cache: mcData.cache || {} };
           if (env.CACHE_KV && payload.ok) {
-            ctx.waitUntil(env.CACHE_KV.put(MC_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 }).catch(() => {}));
+            ctx.waitUntil(env.CACHE_KV.put(MC_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 150 }).catch(() => {}));
           }
           return Response.json(payload);
         } catch (e) {
@@ -5668,6 +5667,25 @@ self.addEventListener('fetch', (e) => {
           console.error("관심종목 성과추적 실패:", e.message || e);
         });
         await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
+        // 미니차트 KV 캐시 미리 갱신 - 사용자가 페이지를 열 때 KV 미스로 relay를 왕복하는
+        // 일이 없게, 2분마다 이 cron이 미리 relay에서 받아와 KV에 넣어둠.
+        if (env.RELAY_URL && env.RELAY_SECRET && env.CACHE_KV) {
+          try {
+            const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
+            if (mcRes.ok) {
+              const mcData = await mcRes.json();
+              if (mcData.ok) {
+                await env.CACHE_KV.put(
+                  "mini-candles-all-v1",
+                  JSON.stringify({ ok: true, cache: mcData.cache || {} }),
+                  { expirationTtl: 150 }
+                );
+              }
+            }
+          } catch (e) {
+            console.error("미니캔들 KV 프리웜 실패:", e.message || e);
+          }
+        }
       })().catch((e) => {
         console.error("scheduled 정리작업 실패:", e.message || e);
         return logSystemEvent(env, "cron_failure", `정리작업 실패: ${e.message || e}`);
