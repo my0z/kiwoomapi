@@ -4435,10 +4435,11 @@ self.addEventListener('fetch', (e) => {
         // 5초라 종목 추가/삭제/시세갱신이 최대 5초 지연될 수 있지만, 화면 자동새로고침
         // 주기(15초)보다 훨씬 짧아서 체감상 문제 없음.
         const CACHE_KEY = "watchlist-quotes-v1";
+        let __getFailReason = null;
         try {
           if (env.CACHE_KV) {
             const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch((e) => {
-              console.error("[KV디버그] get 실패:", e.message || e);
+              __getFailReason = String(e.message || e).slice(0, 50);
               return null;
             });
             if (cached) {
@@ -4446,7 +4447,7 @@ self.addEventListener('fetch', (e) => {
               return Response.json(cached);
             }
           } else {
-            console.error("[KV디버그] env.CACHE_KV 바인딩이 존재하지 않음");
+            __getFailReason = "바인딩없음";
           }
 
           const watchlistRes = await env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all();
@@ -4485,13 +4486,17 @@ self.addEventListener('fetch', (e) => {
             watchlistMissingCodes: missingCodes,
             watchlistRisk,
             watchlistExitSignals: [],
-            __kvDebug: env.CACHE_KV ? "미스(새로계산+저장)" : "바인딩없음",
           };
+          let __putStatus = "바인딩없음";
           if (env.CACHE_KV) {
-            ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 5 }).catch((e) => {
-              console.error("[KV디버그] put 실패:", e.message || e);
-            }));
+            try {
+              await env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 5 });
+              __putStatus = "저장성공";
+            } catch (e) {
+              __putStatus = "저장실패:" + String(e.message || e).slice(0, 50);
+            }
           }
+          payload.__kvDebug = "미스(get:" + (__getFailReason || "정상없음") + ", put:" + __putStatus + ")";
           return Response.json(payload);
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
