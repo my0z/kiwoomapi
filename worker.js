@@ -2429,7 +2429,7 @@ function renderMarketIndexBar(index, globalIndex) {
   const oneSet = krHtml + globalHtml;
   // 내용을 2번 이어붙이고 -50% 지점까지만 이동시키면(CSS keyframes) 이음새 없이 계속 흐르는 것처럼 보임.
   track.innerHTML = oneSet + oneSet;
-  bar.style.display = 'flex';
+  bar.style.visibility = 'visible';
 }
 
 function applyRealtimeStocks(stocks) {
@@ -3231,7 +3231,7 @@ function renderDashboard() {
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
-  <div id="marketIndexBar" style="display:none;"><div id="marketIndexBarTrack"></div></div>
+  <div id="marketIndexBar" style="visibility:hidden; height:47px;"><div id="marketIndexBarTrack"></div></div>
   <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
   <div id="cfUsagePanel" style="display:none;"></div>
 
