@@ -1913,7 +1913,7 @@ function isoToKstYYYYMMDDHHMMSS(iso) {
 }
 
 function renderMiniCandles(candles, addedAt) {
-  if (!candles || candles.length < 2) return '<span class="empty">차트 로딩중(오늘 09:00~)</span>';
+  if (!candles || candles.length < 2) return '<div class="miniChartSkeleton"></div>';
   const w = 220, h = 70, pad = 2;
   const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
   const min = Math.min(...lows), max = Math.max(...highs);
@@ -3145,6 +3145,9 @@ function renderDashboard() {
   .riskBadgeUp { color:#ff6b6b; }
   .riskBadgeExit { color:#ffa94d; }
   .miniChartRow td { border-bottom:1px solid #2a2a2a; padding:0 4px 8px; }
+  .miniChartSkeleton { height:70px; background:#1a1a1a; border-radius:4px; }
+  .miniChartWrap { animation: miniChartFadeIn 0.15s ease-out; }
+  @keyframes miniChartFadeIn { from { opacity:0.3; } to { opacity:1; } }
   .miniChartRow { background:transparent; }
   .modalBtn {
     display:block; width:100%; box-sizing:border-box; text-align:center;
