@@ -3263,12 +3263,12 @@ function renderDashboard() {
   }
   #marketIndexBar span { flex-shrink:0; }
   #marketIndexBarTrack .tickerItem {
-    display:inline-block; transform: scale(1); transform-origin: center;
-    transition: transform 0.25s ease-out, background 0.25s ease-out;
+    display:inline-block; font-size:1em;
+    transition: font-size 0.25s ease-out, background 0.25s ease-out;
     padding:3px 7px; border-radius:6px;
   }
   #marketIndexBarTrack .tickerItem.centered {
-    transform: scale(1.4); position:relative; z-index:2;
+    font-size:1.4em; position:relative; z-index:2;
     background:rgba(255,255,255,0.14);
   }
   #marketIndexBar b { color:#ffffff; }
