@@ -2417,7 +2417,7 @@ function renderMarketIndexBar(index, globalIndex) {
   let krHtml = '';
   if (hasKr) {
     krHtml = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
-      (index.stale ? '<span class="weakMarketNote">⏸ 마지막 값(장마감/휴장)</span>' : '');
+      '';
   }
   let globalHtml = '';
   if (hasGlobal) {
@@ -2563,7 +2563,7 @@ setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
   };
   const scheduleResume = () => {
     clearTimeout(resumeTimer);
-    resumeTimer = setTimeout(() => track.classList.remove('paused'), 1500);
+    resumeTimer = setTimeout(() => track.classList.remove('paused'), 200);
   };
   bar.addEventListener('touchstart', pause, { passive: true });
   bar.addEventListener('touchend', scheduleResume, { passive: true });
