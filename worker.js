@@ -2429,8 +2429,7 @@ function renderMarketIndexBar(index, globalIndex) {
     if (globalIndex.sp500) globalHtml += fmtIdx('S&P500', globalIndex.sp500);
     if (globalIndex.usdkrw) globalHtml += fmtUsdKrw(globalIndex.usdkrw);
   }
-  const oneSet = krHtml + globalHtml +
-    (weakMarket ? '<span class="weakMarketNote">⚠️ 시장 약세 - 급등주 신호 신뢰도 하락</span>' : '');
+  const oneSet = krHtml + globalHtml;
   // 내용을 2번 이어붙이고 -50% 지점까지만 이동시키면(CSS keyframes) 이음새 없이 계속 흐르는 것처럼 보임.
   track.innerHTML = oneSet + oneSet;
   bar.style.display = 'flex';
@@ -3196,7 +3195,7 @@ function renderDashboard() {
   #marketIndexBarTrack.paused .tickerItem { animation-play-state: paused; }
   @keyframes tickerPulse {
     0%, 80%, 100% { transform: scale(1); }
-    90% { transform: scale(1.18); }
+    90% { transform: scale(1.36); }
   }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
