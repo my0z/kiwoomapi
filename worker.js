@@ -1845,6 +1845,10 @@ function updateMiniChartCell(code) {
 
 // 관심종목 실시간 시세 캐시 - refreshRealtimeWatchlist()가 relay 웹소켓 값으로 채움
 const liveQuoteCache = {}; // { code: { price, rate, fetchedAt } }
+const liveSignalCache = {}; // { code: { cntrStr, isTodayHigh, bidTurnedPositive, buyReqSpike, sellReqThinning } }
+// relay가 이제 체결(0B)뿐 아니라 호가잔량(0D)도 구독해서, 배치(2분 cron)로만 계산하던
+// isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 relay 쪽에서 틱마다 즉시 계산해서
+// stocks 페이로드에 실어보냄 - 진짜 실시간 신호를 그대로 캐시해두고 자동편입 필터 등에서 씀.
 
 function updateWatchlistPriceCells(code) {
   const tr = document.querySelector('#watchlist tr.watchlistRow[data-code="' + code + '"]');
@@ -2351,12 +2355,14 @@ function autoAddConditionHits(history, condName) {
     autoAddedCondCodes.add(h.code + ':' + h.time);
     if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
     // "실시간포착" 보드가 실거래 손실의 대부분(2026-08-09 performance-report: 117건 중 81패, -604,970원)을
-    // 차지한 원인이 필터 없는 무조건 자동편입이었음. 당일신고가(백테스트 edge -0.075로 가장 일관된 악재
-    // 신호)를 지금 막 찍은 상태인데 수급유입 신호(매수전환/매수잔량급증/매도잔량급감)가 하나도 없으면
-    // 추격매수 위험이 크다고 판단해서 자동편입만 거름(정보 자체는 byCodeMap에 아직 없을 수도 있어 -
-    // 이 경우엔 판단 근거가 없으니 보수적으로 그냥 담음).
-    const cInfo = byCodeMap[h.code];
-    if (cInfo && cInfo.isTodayHigh && !cInfo.bidTurnedPositive && !cInfo.buyReqSpike && !cInfo.sellReqThinning) continue;
+    // 차지한 원인이 필터 없는 무조건 자동편입이었음. relay가 이제 체결(0B)뿐 아니라 호가잔량(0D)도
+    // 구독해서 isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 틱마다 즉시 계산해서
+    // 내려주므로(2분 cron 배치가 아니라 진짜 실시간) - 당일신고가(백테스트 edge -0.075로 가장 일관된
+    // 악재 신호)인데 수급유입 신호가 하나도 없으면 추격매수 위험이 크다고 판단해서 자동편입만 거름.
+    // 편입 직후 몇백ms~몇 초는 relay 구독이 아직 안 붙어 데이터가 없을 수 있는데, 이 경우엔 판단
+    // 근거가 없으니 보수적으로 그냥 담음(막지 않음).
+    const liveSig = liveSignalCache[h.code];
+    if (liveSig && liveSig.isTodayHigh && !liveSig.bidTurnedPositive && !liveSig.buyReqSpike && !liveSig.sellReqThinning) continue;
 
     const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
     watchlistCodes.add(h.code);
@@ -2499,7 +2505,16 @@ function applyRealtimeStocks(stocks) {
   if (!stocks) return;
   for (const code of Object.keys(stocks)) {
     const s = stocks[code];
-    if (!s || !s.price) continue;
+    if (!s) continue;
+    // 가격이 아직 없어도(0D 호가 틱만 먼저 도착한 경우) 신호 자체는 캐시해둠 - 자동편입 필터 등에서 씀
+    liveSignalCache[code] = {
+      cntrStr: typeof s.cntrStr === 'number' ? s.cntrStr : (liveSignalCache[code] && liveSignalCache[code].cntrStr),
+      isTodayHigh: typeof s.isTodayHigh === 'boolean' ? s.isTodayHigh : (liveSignalCache[code] && liveSignalCache[code].isTodayHigh),
+      bidTurnedPositive: !!s.bidTurnedPositive,
+      buyReqSpike: !!s.buyReqSpike,
+      sellReqThinning: !!s.sellReqThinning,
+    };
+    if (!s.price) continue;
     liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
     updateWatchlistPriceCells(code);
     updateListRowRealtime(code, s);
