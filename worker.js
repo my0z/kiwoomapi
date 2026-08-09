@@ -3247,7 +3247,7 @@ function renderDashboard() {
     display:flex; flex-wrap:nowrap; font-size:13px; color:#ffffff; font-weight:700;
     background:linear-gradient(180deg,#181d27,#0b0d12); border-radius:0; padding:0; margin-bottom:14px;
     position:sticky; top:0; z-index:95; box-shadow:0 2px 10px rgba(0,0,0,0.7);
-    overflow:hidden; height:47px; align-items:center; white-space:nowrap;
+    overflow:hidden; height:34px; align-items:center; white-space:nowrap;
     border-bottom:2px solid #333c4d;
   }
   #marketIndexBarTrack {
@@ -3284,7 +3284,7 @@ function renderDashboard() {
   <span id="ts" style="display:none;"></span>
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
-  <div id="marketIndexBar" style="visibility:hidden; height:47px;"><div id="marketIndexBarTrack"></div></div>
+  <div id="marketIndexBar" style="visibility:hidden; height:34px;"><div id="marketIndexBarTrack"></div></div>
   <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
   <div id="cfUsagePanel" style="display:none;"></div>
 
