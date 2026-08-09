@@ -2550,6 +2550,25 @@ function pollGlobalIndex() {
 }
 pollGlobalIndex();
 setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
+
+// 지수 티커를 터치로 스크롤하는 동안엔 자동 애니메이션을 멈춰서 두 움직임이 서로 싸우지 않게 함.
+// 손을 뗀 뒤 1.5초간 추가 조작이 없으면 자동으로 다시 흐르기 시작.
+(() => {
+  const bar = document.getElementById('marketIndexBar');
+  const track = document.getElementById('marketIndexBarTrack');
+  let resumeTimer = null;
+  const pause = () => {
+    track.classList.add('paused');
+    clearTimeout(resumeTimer);
+  };
+  const scheduleResume = () => {
+    clearTimeout(resumeTimer);
+    resumeTimer = setTimeout(() => track.classList.remove('paused'), 1500);
+  };
+  bar.addEventListener('touchstart', pause, { passive: true });
+  bar.addEventListener('touchend', scheduleResume, { passive: true });
+  bar.addEventListener('scroll', () => { pause(); scheduleResume(); }, { passive: true });
+})();
 // ---------- 클라이언트 장시간 판단 (D1/relay 불필요 폴링 억제용) ----------
 // 장마감 후에도 탭을 계속 켜놨을 때 15초/30초/2분 주기 폴링들이 D1을 계속 두드리는 낭비를 막기 위해,
 // 장중이 아니면 각 타이머 콜백 자체를 스킵함(타이머는 유지, 실행만 건너뜀 - 장 시작하면 자동 재개).
@@ -3154,13 +3173,14 @@ function renderDashboard() {
     display:flex; flex-wrap:nowrap; font-size:12px; color:#aaa;
     background:#1c1c1c; border-radius:0; padding:8px 0; margin-bottom:14px;
     position:sticky; top:0; z-index:95; box-shadow:0 2px 6px rgba(0,0,0,0.5);
-    overflow:hidden; white-space:nowrap;
+    overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap;
   }
   #marketIndexBarTrack {
-    display:flex; flex-wrap:nowrap; gap:16px; padding:0 12px;
+    display:flex; flex-wrap:nowrap; gap:16px; padding:0 12px; width:max-content;
     animation: marketTickerScroll 30s linear infinite;
   }
-  #marketIndexBar:hover #marketIndexBarTrack { animation-play-state: paused; }
+  #marketIndexBar:hover #marketIndexBarTrack,
+  #marketIndexBarTrack.paused { animation-play-state: paused; }
   @keyframes marketTickerScroll {
     from { transform: translateX(0); }
     to { transform: translateX(-50%); }
