@@ -3191,10 +3191,11 @@ function renderDashboard() {
   }
   #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
   #marketIndexBar {
-    display:flex; flex-wrap:nowrap; font-size:12px; color:#aaa;
-    background:#1c1c1c; border-radius:0; padding:8px 0; margin-bottom:14px;
-    position:sticky; top:0; z-index:95; box-shadow:0 2px 6px rgba(0,0,0,0.5);
+    display:flex; flex-wrap:nowrap; font-size:13px; color:#e8e8e8; font-weight:600;
+    background:#101318; border-radius:0; padding:9px 0; margin-bottom:14px;
+    position:sticky; top:0; z-index:95; box-shadow:0 2px 8px rgba(0,0,0,0.6);
     overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap;
+    border-bottom:1px solid #2a2f3a;
   }
   #marketIndexBarTrack {
     display:flex; flex-wrap:nowrap; gap:16px; padding:0 12px; width:max-content;
@@ -3210,11 +3211,16 @@ function renderDashboard() {
   #marketIndexBar span { flex-shrink:0; }
   #marketIndexBarTrack .tickerItem {
     display:inline-block; transform: scale(1); transform-origin: center;
-    transition: transform 0.25s ease-out;
+    transition: transform 0.25s ease-out, background 0.25s ease-out;
+    padding:3px 6px; border-radius:6px;
   }
   #marketIndexBarTrack .tickerItem.centered {
     transform: scale(1.7); position:relative; z-index:2;
+    background:rgba(255,255,255,0.08);
   }
+  #marketIndexBar b { color:#fff; }
+  #marketIndexBar .up { color:#ff5c5c; font-weight:700; }
+  #marketIndexBar .down { color:#4da3ff; font-weight:700; }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
   #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
