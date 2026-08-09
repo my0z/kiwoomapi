@@ -2677,7 +2677,7 @@ function loadWatchlistDailyStats() {
     .then(res => res.json())
     .then(data => {
       const tag = document.getElementById('autoRemovedTag');
-      if (!data.ok) { tag.style.display = 'none'; return; }
+      if (!data.ok) { tag.style.visibility = 'hidden'; return; }
       const netWon = data.netWon || 0;
       const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
       const dateLabel = (data.statsDate && data.statsDate !== 'today') ? '(' + data.statsDate + ' 기준) ' : '';
@@ -2686,7 +2686,7 @@ function loadWatchlistDailyStats() {
         ' (<span style="color:#e03131">익절 ' + (data.removedProfit || 0) + '</span> / <span style="color:#1971c2">손절 ' + (data.removedLoss || 0) + '</span>)' +
         ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
         ' (<span style="color:#e03131">익 +' + (data.profitWon || 0).toLocaleString() + '</span> / <span style="color:#1971c2">손 ' + (data.lossWon || 0).toLocaleString() + '</span>)';
-      tag.style.display = 'inline';
+      tag.style.visibility = 'visible';
     })
     .catch(() => {});
 }
@@ -3192,13 +3192,13 @@ function renderDashboard() {
   #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
   #marketIndexBar {
     display:flex; flex-wrap:nowrap; font-size:13px; color:#ffffff; font-weight:700;
-    background:linear-gradient(180deg,#181d27,#0b0d12); border-radius:0; padding:10px 0; margin-bottom:14px;
+    background:linear-gradient(180deg,#181d27,#0b0d12); border-radius:0; padding:0; margin-bottom:14px;
     position:sticky; top:0; z-index:95; box-shadow:0 2px 10px rgba(0,0,0,0.7);
-    overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap;
+    overflow:hidden; height:47px; align-items:center; white-space:nowrap;
     border-bottom:2px solid #333c4d;
   }
   #marketIndexBarTrack {
-    display:flex; flex-wrap:nowrap; gap:16px; padding:0 12px; width:max-content;
+    display:flex; flex-wrap:nowrap; align-items:center; gap:16px; padding:0 12px; width:max-content;
     animation: marketTickerScroll 30s linear infinite;
     animation-delay: 2s;
   }
@@ -3215,7 +3215,7 @@ function renderDashboard() {
     padding:3px 7px; border-radius:6px;
   }
   #marketIndexBarTrack .tickerItem.centered {
-    transform: scale(1.7); position:relative; z-index:2;
+    transform: scale(1.4); position:relative; z-index:2;
     background:rgba(255,255,255,0.14);
   }
   #marketIndexBar b { color:#ffffff; }
@@ -3238,7 +3238,7 @@ function renderDashboard() {
   <div id="systemStatusBanner" style="display:none;"></div>
 
   <div class="board">
-    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="display:none;"></span></h2>
+    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="visibility:hidden;"></span></h2>
     <div class="sortToggle">
       <button class="sortBtn active" id="wlSortByAdded">추가순</button>
       <button class="sortBtn" id="wlSortByPnlDesc">수익률 높은순</button>
