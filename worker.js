@@ -2400,14 +2400,6 @@ function renderConditionDock(cond) {
 function renderMarketIndexBar(index, globalIndex) {
   const hasKr = index && index.kospi && index.kosdaq;
   const hasGlobal = globalIndex && globalIndex.ok;
-  const dbgEl = document.getElementById('idxDebug') || (() => {
-    const d = document.createElement('div');
-    d.id = 'idxDebug';
-    d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:999999;background:#000;color:#0f0;font-size:10px;padding:4px;white-space:pre-wrap;';
-    document.body.appendChild(d);
-    return d;
-  })();
-  dbgEl.textContent = 'hasKr=' + hasKr + ' hasGlobal=' + hasGlobal + ' index=' + JSON.stringify(index);
   if (!hasKr && !hasGlobal) return;
   const bar = document.getElementById('marketIndexBar');
   const track = document.getElementById('marketIndexBarTrack');
@@ -2479,7 +2471,7 @@ function pollRealtimeAll() {
       if (!data.ok) return;
       if (data.index && data.index.kospi) lastKrIndex = data.index;
       if (data.globalIndex) lastGlobalIndex = data.globalIndex;
-      renderMarketIndexBar(data.index || lastKrIndex, lastGlobalIndex);
+      renderMarketIndexBar((data.index && data.index.kospi) ? data.index : lastKrIndex, lastGlobalIndex);
       renderConditionDock(data.condition);
       applyRealtimeStocks(data.stocks);
     })
@@ -2516,7 +2508,7 @@ function startRealtimeStream() {
     try {
       const data = JSON.parse(e.data);
       if (data.index && data.index.kospi) lastKrIndex = data.index;
-      renderMarketIndexBar(data.index || lastKrIndex, lastGlobalIndex);
+      renderMarketIndexBar((data.index && data.index.kospi) ? data.index : lastKrIndex, lastGlobalIndex);
       renderConditionDock(data.condition);
       applyRealtimeStocks(data.stocks);
     } catch (err) {}
@@ -2544,11 +2536,9 @@ function pollGlobalIndex() {
     .then(data => {
       if (data.ok) {
         lastGlobalIndex = data;
-        console.log('[디버그] pollGlobalIndex 이전 lastKrIndex=', JSON.stringify(lastKrIndex), 'data.krIndex=', JSON.stringify(data.krIndex));
         if (data.krIndex && (!lastKrIndex || lastKrIndex.stale)) {
           lastKrIndex = data.krIndex;
         }
-        console.log('[디버그] pollGlobalIndex 이후 lastKrIndex=', JSON.stringify(lastKrIndex));
         try {
           renderMarketIndexBar(lastKrIndex, lastGlobalIndex);
         } catch (e) {
