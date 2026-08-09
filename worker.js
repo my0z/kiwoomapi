@@ -1591,7 +1591,7 @@ async function load() {
   // 초경량 전용 엔드포인트(KV 60초 캐시)에서 가장 먼저 가져와서 최우선으로 그림.
   const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
     .then(r => r.json())
-    .then(wq => {
+    .then(async wq => {
       if (wq.ok) {
         watchlistLastKnownMap = {};
         (wq.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
@@ -1604,9 +1604,13 @@ async function load() {
         watchlistExitMap = {};
         (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
 
-        // 미니차트 응답이 이미 도착해 있으면(둘 다 KV 캐시라 흔히 그럼) 최초 렌더 전에
-        // 캐시를 채워서 텍스트+차트가 같이 나오게 함. 아직 안 왔으면 기다리지 않고 기존처럼
-        // 텍스트부터 바로 그리고, 차트는 도착하는 대로 5개씩 순서대로 별도로 채움(폴백).
+        // 미니차트가 이미 도착했으면 즉시 합쳐서 그리고, 아직이면 최대 120ms만 짧게 기다림
+        // (보통 KV 캐시 응답은 이 안에 옴 - 텍스트와 차트가 같이 뜨는 걸 최대한 늘림).
+        // 120ms를 넘기면 더 기다리지 않고 텍스트부터 바로 그려서, relay 왕복으로 미니차트가
+        // 느려지는 순간에도 관심종목 표시 자체가 무한정 늦어지지 않게 함(폴백은 아래에서 처리).
+        if (!miniDataArrived) {
+          await Promise.race([miniPromise, new Promise(resolve => setTimeout(resolve, 120))]);
+        }
         if (miniDataArrived && miniDataArrived.ok && miniDataArrived.cache) {
           Object.keys(miniDataArrived.cache).forEach(code => {
             if (!(code in miniCandleCache)) miniCandleCache[code] = miniDataArrived.cache[code].candles;
@@ -4648,7 +4652,7 @@ self.addEventListener('fetch', (e) => {
           const mcData = await mcRes.json();
           const payload = { ok: !!mcData.ok, cache: mcData.cache || {} };
           if (env.CACHE_KV && payload.ok) {
-            ctx.waitUntil(env.CACHE_KV.put(MC_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 150 }).catch(() => {}));
+            ctx.waitUntil(env.CACHE_KV.put(MC_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 200 }).catch(() => {}));
           }
           return Response.json(payload);
         } catch (e) {
@@ -6010,7 +6014,7 @@ self.addEventListener('fetch', (e) => {
                 await env.CACHE_KV.put(
                   "mini-candles-all-v1",
                   JSON.stringify({ ok: true, cache: mcData.cache || {} }),
-                  { expirationTtl: 150 }
+                  { expirationTtl: 200 }
                 );
               }
             }
