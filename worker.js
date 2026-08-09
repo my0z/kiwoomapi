@@ -3238,7 +3238,8 @@ function renderDashboard() {
   <div id="systemStatusBanner" style="display:none;"></div>
 
   <div class="board">
-    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span> <span id="autoRemovedTag" class="intervalTag" style="visibility:hidden;"></span></h2>
+    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
+    <div id="autoRemovedTag" class="intervalTag" style="visibility:hidden; display:block; margin-top:4px; min-height:2.6em; line-height:1.3em;"></div>
     <div class="sortToggle">
       <button class="sortBtn active" id="wlSortByAdded">추가순</button>
       <button class="sortBtn" id="wlSortByPnlDesc">수익률 높은순</button>
