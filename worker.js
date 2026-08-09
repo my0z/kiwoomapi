@@ -306,7 +306,7 @@ async function logSystemEvent(env, kind, message) {
 // 해외지수(다우/나스닥/S&P500/원달러 환율) - Yahoo Finance 공개 API, 인증 불필요.
 // KV 60초 캐싱: 2초마다 폴링되는 /api/realtime-all에서 매번 Yahoo를 왕복하면 과도하므로,
 // 해외지수는 국내처럼 초단위로 안 봐도 되는 성격이라 60초 캐시로 충분함.
-const GLOBAL_INDEX_SYMBOLS = { dow: "^DJI", nasdaq: "^IXIC", sp500: "^GSPC", usdkrw: "KRW=X" };
+const GLOBAL_INDEX_SYMBOLS = { dow: "^DJI", nasdaq: "^IXIC", sp500: "^GSPC", usdkrw: "KRW=X", eurkrw: "EURKRW=X", jpykrw: "JPYKRW=X", cnykrw: "CNYKRW=X" };
 async function fetchGlobalIndices(env) {
   const CACHE_KEY = "global-indices-v1";
   if (env.CACHE_KV) {
@@ -2460,11 +2460,13 @@ function renderMarketIndexBar(index, globalIndex) {
     return '<span class="tickerItem">' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
-  const fmtUsdKrw = (d) => {
+  const fmtFx = (label, d, multiplier, decimals) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
-    return '<span class="tickerItem">USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
+    const price = multiplier ? d.price * multiplier : d.price;
+    return '<span class="tickerItem">' + label + ' <b>' + price.toFixed(decimals) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
+  const fmtUsdKrw = (d) => fmtFx('USD/KRW', d, 1, 1);
   weakMarket = hasKr && index.kospi.rate < 0 && index.kosdaq.rate < 0;
   let krHtml = '';
   if (hasKr) {
@@ -2477,6 +2479,9 @@ function renderMarketIndexBar(index, globalIndex) {
     if (globalIndex.nasdaq) globalHtml += fmtIdx('나스닥', globalIndex.nasdaq);
     if (globalIndex.sp500) globalHtml += fmtIdx('S&P500', globalIndex.sp500);
     if (globalIndex.usdkrw) globalHtml += fmtUsdKrw(globalIndex.usdkrw);
+    if (globalIndex.eurkrw) globalHtml += fmtFx('EUR/KRW', globalIndex.eurkrw, 1, 1);
+    if (globalIndex.jpykrw) globalHtml += fmtFx('JPY/KRW(100엔)', globalIndex.jpykrw, 100, 1);
+    if (globalIndex.cnykrw) globalHtml += fmtFx('CNY/KRW', globalIndex.cnykrw, 1, 1);
   }
   const oneSet = krHtml + globalHtml;
   // 내용을 2번 이어붙이고 -50% 지점까지만 이동시키면(CSS keyframes) 이음새 없이 계속 흐르는 것처럼 보임.
