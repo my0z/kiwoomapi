@@ -1581,8 +1581,10 @@ let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - rend
 
 async function load() {
   // 미니차트 전체 조회를 관심종목 조회와 동시에 시작 - 어느 쪽이 먼저 끝나든 서로 안 기다림.
+  let miniDataArrived = null; // 도착하면 여기에 채워짐 (아직이면 null)
   const miniPromise = fetch('/api/mini-candles-all')
     .then(r => r.json())
+    .then(mcData => { miniDataArrived = mcData; return mcData; })
     .catch(() => ({ ok: false }));
 
   // 관심종목은 /api/latest(연속상승/눌림목/TOP5 등 무거운 계산 포함)와 별개로,
@@ -1601,6 +1603,15 @@ async function load() {
         });
         watchlistExitMap = {};
         (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
+
+        // 미니차트 응답이 이미 도착해 있으면(둘 다 KV 캐시라 흔히 그럼) 최초 렌더 전에
+        // 캐시를 채워서 텍스트+차트가 같이 나오게 함. 아직 안 왔으면 기다리지 않고 기존처럼
+        // 텍스트부터 바로 그리고, 차트는 도착하는 대로 5개씩 순서대로 별도로 채움(폴백).
+        if (miniDataArrived && miniDataArrived.ok && miniDataArrived.cache) {
+          Object.keys(miniDataArrived.cache).forEach(code => {
+            if (!(code in miniCandleCache)) miniCandleCache[code] = miniDataArrived.cache[code].candles;
+          });
+        }
         renderWatchlist(wq.watchlist || []);
 
         // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 별도 요청으로 채움
