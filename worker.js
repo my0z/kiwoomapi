@@ -2683,9 +2683,9 @@ function loadWatchlistDailyStats() {
       const dateLabel = (data.statsDate && data.statsDate !== 'today') ? '(' + data.statsDate + ' 기준) ' : '';
       tag.innerHTML =
         dateLabel + '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
-        ' (익절 ' + (data.removedProfit || 0) + ' / 손절 ' + (data.removedLoss || 0) + ')' +
+        ' (<span style="color:#e03131">익절 ' + (data.removedProfit || 0) + '</span> / <span style="color:#1971c2">손절 ' + (data.removedLoss || 0) + '</span>)' +
         ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
-        ' (익 +' + (data.profitWon || 0).toLocaleString() + ' / 손 ' + (data.lossWon || 0).toLocaleString() + ')';
+        ' (<span style="color:#e03131">익 +' + (data.profitWon || 0).toLocaleString() + '</span> / <span style="color:#1971c2">손 ' + (data.lossWon || 0).toLocaleString() + '</span>)';
       tag.style.display = 'inline';
     })
     .catch(() => {});
