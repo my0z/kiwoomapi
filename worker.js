@@ -1580,9 +1580,7 @@ let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화
 let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
 
 async function load() {
-  // 관심종목 텍스트(가격/수익률)와 미니차트가 따로따로 뜨는 걸 없애기 위해, 두 요청을
-  // 동시에 시작하되 둘 다 도착할 때까지 기다린 뒤 미니캔들 캐시를 먼저 채우고 나서
-  // renderWatchlist를 한 번만 호출함 - 텍스트와 차트가 항상 같이 나타남.
+  // 미니차트 전체 조회를 관심종목 조회와 동시에 시작 - 어느 쪽이 먼저 끝나든 서로 안 기다림.
   const miniPromise = fetch('/api/mini-candles-all')
     .then(r => r.json())
     .catch(() => ({ ok: false }));
@@ -1591,7 +1589,7 @@ async function load() {
   // 초경량 전용 엔드포인트(KV 60초 캐시)에서 가장 먼저 가져와서 최우선으로 그림.
   const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
     .then(r => r.json())
-    .then(async wq => {
+    .then(wq => {
       if (wq.ok) {
         watchlistLastKnownMap = {};
         (wq.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
@@ -1603,15 +1601,6 @@ async function load() {
         });
         watchlistExitMap = {};
         (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
-
-        // 미니차트 응답을 기다렸다가(보통 KV 캐시라 수십ms 수준) 캐시를 먼저 채운 뒤 렌더 -
-        // renderWatchlist가 처음 그릴 때부터 이미 차트가 채워진 상태로 나오게 됨.
-        const mcData = await miniPromise;
-        const cache = (mcData && mcData.ok && mcData.cache) || {};
-        Object.keys(cache).forEach(code => {
-          if (!(code in miniCandleCache)) miniCandleCache[code] = cache[code].candles;
-        });
-
         renderWatchlist(wq.watchlist || []);
 
         // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 별도 요청으로 채움
@@ -1631,13 +1620,45 @@ async function load() {
             .catch(() => {});
         }
 
-        // mini-candles-all에 아직 없던 종목(막 추가돼서 relay 캐시에도 없는 경우)만 별도로 채움
-        const stillMissing = (wq.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
-        if (stillMissing.length) queueMiniCandleFetches(stillMissing);
-      }
-      return wq;
-    })
-    .catch(() => ({ ok: false }));
+        // 미니차트도 /api/latest를 기다리지 않고 관심종목 목록이 확보되는 즉시 채움 -
+        // 예전엔 /api/latest(무거운 쿼리) 완료까지 기다렸다가 미니차트를 채워서, mini-candles-all이
+        // 이미 도착해 있어도 화면 반영이 그만큼 늦어지는 게 체감 지연의 원인이었음.
+        miniPromise.then(mcData => {
+          const cache = (mcData && mcData.ok && mcData.cache) || {};
+          Object.keys(cache).forEach(code => {
+            if (!(code in miniCandleCache)) {
+              miniCandleCache[code] = cache[code].candles;
+            }
+          });
+          const applyUpdates = () => {
+            const rowMap = new Map();
+            document.querySelectorAll('#watchlist tr.miniChartRow').forEach(tr => {
+              rowMap.set(tr.getAttribute('data-code'), tr);
+            });
+            const renderOne = (code) => {
+              const tr = rowMap.get(code);
+              if (!tr || !(code in miniCandleCache)) return;
+              const td = tr.querySelector('td');
+              const w = watchlistItems.find(x => x.code === code);
+              td.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
+            };
+            // 관심종목 등록 순서(1~5번, 6~10번...) 그대로 5개씩 끊어서 프레임마다 렌더 -
+            // 종목을 대량으로 담아도 위에서부터 순식간에 차례로 채워지는 걸 눈으로 볼 수 있음.
+            const orderedCodes = (wq.watchlist || []).map(w => w.code);
+            const MINI_CHUNK = 5;
+            let idx = 0;
+            const renderNextMiniChunk = () => {
+              const next = orderedCodes.slice(idx, idx + MINI_CHUNK);
+              next.forEach(renderOne);
+              idx += MINI_CHUNK;
+              if (idx < orderedCodes.length) requestAnimationFrame(renderNextMiniChunk);
+            };
+            renderNextMiniChunk();
+          };
+          requestAnimationFrame(applyUpdates);
+          const stillMissing = (wq.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
+          if (stillMissing.length) queueMiniCandleFetches(stillMissing);
+        });
       }
       return wq;
     })
