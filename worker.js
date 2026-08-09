@@ -2403,14 +2403,17 @@ function renderMarketIndexBar(index, globalIndex) {
   if (!hasKr && !hasGlobal) return;
   const bar = document.getElementById('marketIndexBar');
   const track = document.getElementById('marketIndexBarTrack');
+  let tickerItemIdx = 0;
   const fmtIdx = (label, d) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
-    return '<span>' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
+    const delay = (tickerItemIdx++ * 1.2).toFixed(1);
+    return '<span class="tickerItem" style="animation-delay:' + delay + 's">' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
   const fmtUsdKrw = (d) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
-    return '<span>USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
+    const delay = (tickerItemIdx++ * 1.2).toFixed(1);
+    return '<span class="tickerItem" style="animation-delay:' + delay + 's">USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
   weakMarket = hasKr && index.kospi.rate < 0 && index.kosdaq.rate < 0;
@@ -2563,7 +2566,7 @@ setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
   };
   const scheduleResume = () => {
     clearTimeout(resumeTimer);
-    resumeTimer = setTimeout(() => track.classList.remove('paused'), 200);
+    resumeTimer = setTimeout(() => track.classList.remove('paused'), 0);
   };
   bar.addEventListener('touchstart', pause, { passive: true });
   bar.addEventListener('touchend', scheduleResume, { passive: true });
@@ -3178,6 +3181,7 @@ function renderDashboard() {
   #marketIndexBarTrack {
     display:flex; flex-wrap:nowrap; gap:16px; padding:0 12px; width:max-content;
     animation: marketTickerScroll 30s linear infinite;
+    animation-delay: 2s;
   }
   #marketIndexBar:hover #marketIndexBarTrack,
   #marketIndexBarTrack.paused { animation-play-state: paused; }
@@ -3186,6 +3190,14 @@ function renderDashboard() {
     to { transform: translateX(-50%); }
   }
   #marketIndexBar span { flex-shrink:0; }
+  #marketIndexBarTrack .tickerItem {
+    display:inline-block; animation: tickerPulse 6s ease-in-out infinite;
+  }
+  #marketIndexBarTrack.paused .tickerItem { animation-play-state: paused; }
+  @keyframes tickerPulse {
+    0%, 80%, 100% { transform: scale(1); }
+    90% { transform: scale(1.18); }
+  }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
   #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
