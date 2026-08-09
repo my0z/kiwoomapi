@@ -2586,7 +2586,7 @@ function startRealtimeStream() {
 
 // 해외지수(다우/나스닥/S&P500/원달러) - SSE는 relay가 국내 실시간체결만 보내므로 별도로 60초마다
 // 가져옴. SSE/폴링 둘 다에서 재사용할 수 있게 마지막 값을 변수에 저장해둠.
-function pollGlobalIndex() {
+function pollGlobalIndex(isRetry) {
   fetch('/api/global-index')
     .then(res => res.json())
     .then(data => {
@@ -2600,9 +2600,15 @@ function pollGlobalIndex() {
         } catch (e) {
           console.error('[지수바 렌더 에러]', e.message || e);
         }
+      } else if (!isRetry) {
+        // 응답은 왔지만 ok:false - 일시적 오류일 수 있으니 5초 뒤 한 번만 재시도
+        setTimeout(() => pollGlobalIndex(true), 5000);
       }
     })
-    .catch(() => {});
+    .catch(() => {
+      // 네트워크 실패도 동일하게 5초 뒤 한 번만 재시도 - 다음 60초 정기폴링까지 끊긴 채로 방치되지 않게 함
+      if (!isRetry) setTimeout(() => pollGlobalIndex(true), 5000);
+    });
 }
 pollGlobalIndex();
 setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
@@ -2946,6 +2952,7 @@ document.addEventListener('visibilitychange', () => {
     stopRealtimeStream(); // 화면 꺼지면 실시간 연결(SSE/폴링) 완전히 끊음 - 배터리/데이터 절약
   } else {
     load(); // 화면 복귀 시 즉시 최신화
+    pollGlobalIndex(); // 해외지수/환율도 60초 정기폴링을 기다리지 않고 즉시 갱신
     sseFailedPermanently = false; // 이전에 폴백 전환됐었어도 복귀 시 SSE부터 다시 시도
     startRealtimeStream();
   }
