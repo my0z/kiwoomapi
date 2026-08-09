@@ -3146,8 +3146,6 @@ function renderDashboard() {
   .riskBadgeExit { color:#ffa94d; }
   .miniChartRow td { border-bottom:1px solid #2a2a2a; padding:0 4px 8px; }
   .miniChartSkeleton { height:70px; background:#1a1a1a; border-radius:4px; }
-  .miniChartWrap { animation: miniChartFadeIn 0.06s ease-out; }
-  @keyframes miniChartFadeIn { from { opacity:0.3; } to { opacity:1; } }
   .miniChartRow { background:transparent; }
   .modalBtn {
     display:block; width:100%; box-sizing:border-box; text-align:center;
