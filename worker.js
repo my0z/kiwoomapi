@@ -1212,7 +1212,6 @@ function computeTopPicks(latest, streak5Codes) {
   return [...latest]
     .map(r => {
       let score = (r.signalScore || 0) * 10 + (r.momentumScore || 0) * 5 + (streak5Codes.has(r.code) ? 3 : 0);
-      if ((r.price || 0) < 2000) score -= 3; // 천원대 동전주는 작전주/불안정 위험 높다고 알려짐
       return { ...r, topScore: score };
     })
     .sort((a, b) => b.topScore - a.topScore)
@@ -1249,40 +1248,41 @@ function computeRecommendations(latest, pullbackCodes) {
       const olderDelta = mom.length ? mom[mom.length - 1].delta : recentDelta; // 가장 오래된 구간(약10분전)
       const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지 (배지 표시용으로만 씀, 아래 참고)
 
-      // ---- 2026-08-05 backtest-signals(ticks=300) 실측 기준 가중치 ----
+      // ---- 2026-08-09 backtest-signals(ticks=758, 4일치 누적) + performance-report(실거래 표본150) 재검증 ----
       // (edgeVsBaseline: 그 신호가 있었을 때 다음 틱 평균 등락이 전체 평균보다 얼마나 높았는지)
-      //   bidTurnedPositive +0.036(표본4630) / buyReqSpike +0.024(표본6409) -> 실제 효과 있음, 가중치 유지·상향
-      //   accelerating -0.016(표본30207) / cntrStrRising -0.011(표본29817)
-      //   isTodayHigh -0.064(표본9322) / pullbackLike -0.040(표본9235) -> 오히려 역효과라 가중치 제거
-      //   volumeSpike는 표본 17개뿐이라(30 미만) 판단 보류, 기존 가중치 유지
-      // 하루치 데이터라 확정은 아님 - ticks 늘려서 며칠 더 쌓인 뒤 재검증 필요.
-      // 2026-08-06 performance-report: 추천종목TOP10 표본20 avgPnlPct -0.837%/승률45% - overall(50.9%)보다 계속 나쁨.
-      // recentDelta*8은 백테스트 미검증 신호인데 가중치가 제일 커서(0.5%차이=4점) 검증된 수급신호를 압도하고 있었음.
-      // recentDelta 비중 축소 + 검증된 수급신호(bidTurnedPositive/buyReqSpike) 비중 상향으로 균형 조정.
+      //   bidTurnedPositive +0.051(표본9669) / buyReqSpike +0.040(표본14179) -> 여전히 유효, 유지
+      //   sellReqThinning +0.051(표본7741) -> bidTurnedPositive와 사실상 동급 효과인데 그동안 1.5로 저평가돼있었음, 대폭 상향
+      //   comboBuySignal +0.065(표본4107) -> 단일신호보다 뚜렷이 강함, 상향
+      //   isTodayHigh -0.075(표본13454, 8/8일 전부 일관되게 마이너스) -> 그동안 recoScore에 전혀 반영 안 되고 있던 게 확인됨(누락 버그).
+      //     실거래(performance-report)에서도 avgPnlPct -1.676%/승률29.4%(표본17)로 정확히 일치 - 명확한 악재 신호라 처음으로 감점 추가
+      //   isGoldenTime: 최근 3일(08/06,08/08,08/09) 연속 -0.18~-0.21로 강한 역효과 - 기존 +1.5 가점을 제거
+      //   volumeConfirmed: 표본이 758틱 기준 69로 늘었는데 -0.043로 역전(과거 표본12개는 우연히 +였던 것) -> 신뢰 불가, 가점 제거
+      //   repeatDays===2(2일째등장) 실거래 avgPnlPct +0.736%/승률66.7%(표본18) -> 지금까지 점수에 전혀 안 쓰이던 유효신호, 소폭 가점 추가
+      //   동전주(가격<2000) 감점은 이번 재검토에서 제외 - 점수 로직에서 삭제, 화면 경고 배지(⚠️)만 유지
+      // performance-report: 전체 승률34.7%/순손실-581,580원, "실시간포착" 보드가 손실의 대부분(117건 중 81패)을 차지 -
+      //   조건검색 자동편입이 필터 없이 무조건 담는 게 원인으로 보임(autoAddConditionHits에 isTodayHigh 가드 추가함).
       let score = 0;
-      score += recentDelta * 4; // 미검증 신호라 가중치 축소 (기존 8 -> 4)
-      if (r.bidTurnedPositive) score += 5.5; // 실측 근거 있음 - 기존 4에서 상향
-      if (r.buyReqSpike) score += 3.5; // 실측 근거 있음 - 기존 2.5에서 상향
-      if (r.sellReqThinning) score += 1.5; // 매수잔량급증과 같은 계열(수급유입) 신호지만 이건 아직 자체 백테스트 전 - 신중하게 작게
+      score += recentDelta * 4;
+      if (r.bidTurnedPositive) score += 5.5; // 실측 근거 유지
+      if (r.buyReqSpike) score += 3.5; // 실측 근거 유지
+      if (r.sellReqThinning) score += 3.5; // bidTurnedPositive/buyReqSpike와 동급 효과 확인됨 - 1.5 -> 3.5 상향
       // 복합신호(강한매수세): 매수전환+매수잔량급증이 동시에 뜨면 개별 신호보다 훨씬 강한 확인 -
       // 둘 다 검증된 신호가 동시에 나타나는 거라 우연히 겹칠 확률이 낮고, 방향성 있는 진짜 수급일 가능성이 큼
-      if (r.bidTurnedPositive && r.buyReqSpike) score += 2;
-      // 거래량 동반 확인: 호가잔량 신호(매수전환/매수잔량급증)는 취소되는 허수주문에 흔들릴 수 있다는 게
-      // 정석적인 주의사항 - 실제 체결거래량도 같이 튀는 경우만 "진짜 수급"으로 더 신뢰해서 추가 가점
-      const volumeConfirmed = (r.bidTurnedPositive || r.buyReqSpike) && r.volumeSpikeRatio && r.volumeSpikeRatio >= 1.5;
-      if (volumeConfirmed) score += 1.5;
+      if (r.bidTurnedPositive && r.buyReqSpike) score += 3; // edge가 개별신호보다 뚜렷이 커서 2 -> 3 상향
       // 체결강도 절대수준: 100 넘는지(방향)뿐 아니라 얼마나 강한지도 봄 - 150 이상은 "강한 매수세 유입"이 통상적 해석 기준
       if ((r.cntr_str || 0) >= 150) score += 1.5;
+      // 2일 연속 급등리스트 등장 - 실거래 데이터상 뚜렷한 양의 성과(일회성 반짝보다 지속 관심이 낫다는 근거)
+      if (r.repeatDays === 2) score += 1;
+      // 당일신고가: 지금 이 순간이 오늘 최고치라는 뜻 - 백테스트/실거래 모두 일관되게 역효과 확인됨(추격매수 위험)
+      if (r.isTodayHigh) score -= 4;
       score += (r.relativeStrength || 0) * 0.5;
       if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
-      if ((r.price || 0) < 2000) score -= 3; // 동전주 위험
       // 거래대금 10억 미만은 슬리피지로 수익이 깎일 위험 - 진입 자체를 신중히
       if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) score -= 2;
       if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
       if (isLateSession) score -= 2; // 오후 늦은 시각 - 마감까지 회복 시간이 부족
-      if (isGoldenTime) score += 1.5; // 09:00~09:30 - 가장 활발한 시간대(골든타임 배너와 동일 기준)
       if (weakMarket) score -= 1.5; // 코스피/코스닥 동반 약세 - 급등주 신호 신뢰도 하락
-      return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: !!volumeConfirmed };
+      return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: false };
     })
     .sort((a, b) => b.recoScore - a.recoScore)
     .slice(0, 10);
@@ -1429,10 +1429,9 @@ function computeVerdict(r) {
   score += recentDelta * 2; // 지금 이 순간의 방향
   if (r.bidTurnedPositive) score += 2;
   if (r.buyReqSpike) score += 1.5;
-  if (r.sellReqThinning) score += 1;
-  if (r.isTodayHigh) score -= 1.5; // 백테스트상 역효과 - 이미 고점이라 되레 감점
+  if (r.sellReqThinning) score += 1.5; // bidTurnedPositive와 동급 효과 재확인(2026-08-09 백테스트) - 1 -> 1.5
+  if (r.isTodayHigh) score -= 2; // 백테스트/실거래 모두 일관되게 역효과 확인됨 - 1.5 -> 2
   if ((r.change_rate || 0) >= 28) score -= 3; // 상한가 임박 - 여력 없음
-  if ((r.price || 0) < 2000) score -= 1.5; // 동전주 위험
   if (recentDelta < 0) score -= 2; // 지금 꺾이는 중
 
   if (score >= 3) return { emoji: '🟢', cls: 'verdictUp' };
@@ -2351,6 +2350,13 @@ function autoAddConditionHits(history, condName) {
     if (autoAddedCondCodes.has(h.code + ':' + h.time)) continue;
     autoAddedCondCodes.add(h.code + ':' + h.time);
     if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
+    // "실시간포착" 보드가 실거래 손실의 대부분(2026-08-09 performance-report: 117건 중 81패, -604,970원)을
+    // 차지한 원인이 필터 없는 무조건 자동편입이었음. 당일신고가(백테스트 edge -0.075로 가장 일관된 악재
+    // 신호)를 지금 막 찍은 상태인데 수급유입 신호(매수전환/매수잔량급증/매도잔량급감)가 하나도 없으면
+    // 추격매수 위험이 크다고 판단해서 자동편입만 거름(정보 자체는 byCodeMap에 아직 없을 수도 있어 -
+    // 이 경우엔 판단 근거가 없으니 보수적으로 그냥 담음).
+    const cInfo = byCodeMap[h.code];
+    if (cInfo && cInfo.isTodayHigh && !cInfo.bidTurnedPositive && !cInfo.buyReqSpike && !cInfo.sellReqThinning) continue;
 
     const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
     watchlistCodes.add(h.code);
