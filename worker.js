@@ -2403,17 +2403,14 @@ function renderMarketIndexBar(index, globalIndex) {
   if (!hasKr && !hasGlobal) return;
   const bar = document.getElementById('marketIndexBar');
   const track = document.getElementById('marketIndexBarTrack');
-  let tickerItemIdx = 0;
   const fmtIdx = (label, d) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
-    const delay = (tickerItemIdx++ * 1.2).toFixed(1);
-    return '<span class="tickerItem" style="animation-delay:' + delay + 's">' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
+    return '<span class="tickerItem">' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
   const fmtUsdKrw = (d) => {
     const cls = d.rate >= 0 ? 'up' : 'down';
-    const delay = (tickerItemIdx++ * 1.2).toFixed(1);
-    return '<span class="tickerItem" style="animation-delay:' + delay + 's">USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
+    return '<span class="tickerItem">USD/KRW <b>' + d.price.toFixed(1) + '</b> ' +
       '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
   };
   weakMarket = hasKr && index.kospi.rate < 0 && index.kosdaq.rate < 0;
@@ -2570,6 +2567,28 @@ setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
   bar.addEventListener('touchstart', pause, { passive: true });
   bar.addEventListener('touchend', scheduleResume, { passive: true });
   bar.addEventListener('scroll', () => { pause(); scheduleResume(); }, { passive: true });
+
+  // 매 프레임 바 중앙에 가장 가까운 항목에만 확대 클래스를 부여
+  let lastCentered = null;
+  const updateCentered = () => {
+    const barRect = bar.getBoundingClientRect();
+    const centerX = barRect.left + barRect.width / 2;
+    const items = track.querySelectorAll('.tickerItem');
+    let closest = null, closestDist = Infinity;
+    items.forEach(el => {
+      const r = el.getBoundingClientRect();
+      const itemCenter = r.left + r.width / 2;
+      const dist = Math.abs(itemCenter - centerX);
+      if (dist < closestDist) { closestDist = dist; closest = el; }
+    });
+    if (closest !== lastCentered) {
+      if (lastCentered) lastCentered.classList.remove('centered');
+      if (closest) closest.classList.add('centered');
+      lastCentered = closest;
+    }
+    requestAnimationFrame(updateCentered);
+  };
+  requestAnimationFrame(updateCentered);
 })();
 // ---------- 클라이언트 장시간 판단 (D1/relay 불필요 폴링 억제용) ----------
 // 장마감 후에도 탭을 계속 켜놨을 때 15초/30초/2분 주기 폴링들이 D1을 계속 두드리는 낭비를 막기 위해,
@@ -3190,12 +3209,11 @@ function renderDashboard() {
   }
   #marketIndexBar span { flex-shrink:0; }
   #marketIndexBarTrack .tickerItem {
-    display:inline-block; animation: tickerPulse 6s ease-in-out infinite;
+    display:inline-block; transform: scale(1); transform-origin: center;
+    transition: transform 0.25s ease-out;
   }
-  #marketIndexBarTrack.paused .tickerItem { animation-play-state: paused; }
-  @keyframes tickerPulse {
-    0%, 80%, 100% { transform: scale(1); }
-    90% { transform: scale(1.36); }
+  #marketIndexBarTrack .tickerItem.centered {
+    transform: scale(1.7); position:relative; z-index:2;
   }
   #marketIndexBar .weakMarketNote { color:#ffa94d; }
   .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
