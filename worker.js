@@ -1591,7 +1591,7 @@ async function load() {
   // 초경량 전용 엔드포인트(KV 60초 캐시)에서 가장 먼저 가져와서 최우선으로 그림.
   const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
     .then(r => r.json())
-    .then(async wq => {
+    .then(wq => {
       if (wq.ok) {
         watchlistLastKnownMap = {};
         (wq.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
@@ -1604,13 +1604,8 @@ async function load() {
         watchlistExitMap = {};
         (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
 
-        // 미니차트가 이미 도착했으면 즉시 합쳐서 그리고, 아직이면 최대 120ms만 짧게 기다림
-        // (보통 KV 캐시 응답은 이 안에 옴 - 텍스트와 차트가 같이 뜨는 걸 최대한 늘림).
-        // 120ms를 넘기면 더 기다리지 않고 텍스트부터 바로 그려서, relay 왕복으로 미니차트가
-        // 느려지는 순간에도 관심종목 표시 자체가 무한정 늦어지지 않게 함(폴백은 아래에서 처리).
-        if (!miniDataArrived) {
-          await Promise.race([miniPromise, new Promise(resolve => setTimeout(resolve, 120))]);
-        }
+        // 미니차트가 이미 도착해 있으면 바로 합쳐서 그림 - 기다리지 않고 텍스트를 즉시 그림.
+        // 차트가 늦게 오면 아래 miniPromise.then에서 별도로(5개씩 순서대로) 최대한 빨리 채움.
         if (miniDataArrived && miniDataArrived.ok && miniDataArrived.cache) {
           Object.keys(miniDataArrived.cache).forEach(code => {
             if (!(code in miniCandleCache)) miniCandleCache[code] = miniDataArrived.cache[code].candles;
@@ -1645,32 +1640,29 @@ async function load() {
               miniCandleCache[code] = cache[code].candles;
             }
           });
-          const applyUpdates = () => {
-            const rowMap = new Map();
-            document.querySelectorAll('#watchlist tr.miniChartRow').forEach(tr => {
-              rowMap.set(tr.getAttribute('data-code'), tr);
-            });
-            const renderOne = (code) => {
-              const tr = rowMap.get(code);
-              if (!tr || !(code in miniCandleCache)) return;
-              const td = tr.querySelector('td');
-              const w = watchlistItems.find(x => x.code === code);
-              td.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
-            };
-            // 관심종목 등록 순서(1~5번, 6~10번...) 그대로 5개씩 끊어서 프레임마다 렌더 -
-            // 종목을 대량으로 담아도 위에서부터 순식간에 차례로 채워지는 걸 눈으로 볼 수 있음.
-            const orderedCodes = (wq.watchlist || []).map(w => w.code);
-            const MINI_CHUNK = 5;
-            let idx = 0;
-            const renderNextMiniChunk = () => {
-              const next = orderedCodes.slice(idx, idx + MINI_CHUNK);
-              next.forEach(renderOne);
-              idx += MINI_CHUNK;
-              if (idx < orderedCodes.length) requestAnimationFrame(renderNextMiniChunk);
-            };
-            renderNextMiniChunk();
+          const rowMap = new Map();
+          document.querySelectorAll('#watchlist tr.miniChartRow').forEach(tr => {
+            rowMap.set(tr.getAttribute('data-code'), tr);
+          });
+          const renderOne = (code) => {
+            const tr = rowMap.get(code);
+            if (!tr || !(code in miniCandleCache)) return;
+            const td = tr.querySelector('td');
+            const w = watchlistItems.find(x => x.code === code);
+            td.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
           };
-          requestAnimationFrame(applyUpdates);
+          // 관심종목 등록 순서(1~15번, 16~30번...) 그대로 15개씩 끊어서 프레임마다 렌더 -
+          // 첫 청크는 지연 없이 즉시 그리고, 나머지만 다음 프레임들에 이어서 채움.
+          const orderedCodes = (wq.watchlist || []).map(w => w.code);
+          const MINI_CHUNK = 15;
+          let idx = 0;
+          const renderNextMiniChunk = () => {
+            const next = orderedCodes.slice(idx, idx + MINI_CHUNK);
+            next.forEach(renderOne);
+            idx += MINI_CHUNK;
+            if (idx < orderedCodes.length) requestAnimationFrame(renderNextMiniChunk);
+          };
+          renderNextMiniChunk();
           const stillMissing = (wq.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
           if (stillMissing.length) queueMiniCandleFetches(stillMissing);
         });
