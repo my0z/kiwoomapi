@@ -1625,12 +1625,53 @@ async function load() {
         // 이미 도착해 있어도 화면 반영이 그만큼 늦어지는 게 체감 지연의 원인이었음.
         miniPromise.then(mcData => {
           const cache = (mcData && mcData.ok && mcData.cache) || {};
+          const codesToUpdate = [];
           Object.keys(cache).forEach(code => {
             if (!(code in miniCandleCache)) {
               miniCandleCache[code] = cache[code].candles;
-              updateMiniChartCell(code);
+              codesToUpdate.push(code);
             }
           });
+          if (codesToUpdate.length) {
+            const rowMap = new Map();
+            document.querySelectorAll('#watchlist tr.miniChartRow').forEach(tr => {
+              rowMap.set(tr.getAttribute('data-code'), tr);
+            });
+            const renderOne = (code) => {
+              const tr = rowMap.get(code);
+              if (!tr) return;
+              const td = tr.querySelector('td');
+              const w = watchlistItems.find(x => x.code === code);
+              td.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
+            };
+            // 화면에 지금 보이는(또는 곧 보일) 종목만 즉시 렌더하고, 스크롤로 아직 안 보이는
+            // 나머지는 실제로 뷰포트에 들어오는 순간에 렌더 - 관심종목이 수십~수백개일 때
+            // 초기 렌더 비용(SVG 문자열 생성+innerHTML)을 한꺼번에 지불하지 않게 함.
+            const viewportH = window.innerHeight;
+            const immediate = [], deferred = [];
+            codesToUpdate.forEach(code => {
+              const tr = rowMap.get(code);
+              if (tr && tr.getBoundingClientRect().top < viewportH + 600) immediate.push(code);
+              else deferred.push(code);
+            });
+            immediate.forEach(renderOne);
+            if (deferred.length) {
+              if ('IntersectionObserver' in window) {
+                const io = new IntersectionObserver((entries, obs) => {
+                  entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                      const code = entry.target.getAttribute('data-code');
+                      renderOne(code);
+                      obs.unobserve(entry.target);
+                    }
+                  });
+                }, { rootMargin: '600px 0px' });
+                deferred.forEach(code => { const tr = rowMap.get(code); if (tr) io.observe(tr); });
+              } else {
+                deferred.forEach(renderOne);
+              }
+            }
+          }
           const stillMissing = (wq.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
           if (stillMissing.length) queueMiniCandleFetches(stillMissing);
         });
