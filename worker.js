@@ -3255,14 +3255,14 @@ function renderDashboard() {
     cursor:pointer;
   }
   #cfUsageToggle {
-    position:fixed; left:14px; top:60px; z-index:94;
-    width:48px; height:48px; border-radius:50%; background:#232323;
-    display:flex; align-items:center; justify-content:center; font-size:22px;
-    opacity:0.8; cursor:pointer;
+    position:fixed; right:14px; top:44px; z-index:94;
+    width:44px; height:44px; border-radius:50%; background:#232323;
+    display:flex; align-items:center; justify-content:center; font-size:20px;
+    opacity:0.8; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.5);
   }
   #cfUsageToggle:active { opacity:1; }
   #cfUsagePanel {
-    position:fixed; left:14px; top:114px; z-index:94;
+    position:fixed; right:14px; top:94px; z-index:94;
     background:#1c1c1c; border:1px solid #333; border-radius:10px;
     padding:10px 12px; font-size:11px; color:#aaa; width:220px;
     box-shadow:0 2px 10px rgba(0,0,0,0.5);
