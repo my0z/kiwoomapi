@@ -173,7 +173,7 @@ async function checkWatchlistRiskLevels(env) {
   const token = await kiwoomIssueToken(env);
   let checked = 0;
   const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제 (손절)
-  const AUTO_TAKE_PROFIT_PNL_PCT = 2.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
+  const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
   for (const w of items) {
     try {
       // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
@@ -1248,27 +1248,38 @@ function computeRecommendations(latest, pullbackCodes) {
       const olderDelta = mom.length ? mom[mom.length - 1].delta : recentDelta; // 가장 오래된 구간(약10분전)
       const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지 (배지 표시용으로만 씀, 아래 참고)
 
-      // ---- 2026-08-09 backtest-signals(ticks=758, 4일치 누적) + performance-report(실거래 표본150) 재검증 ----
+      // ---- 2026-08-10 backtest-signals(ticks=784) + performance-report(실거래 표본208) 재검증 ----
       // (edgeVsBaseline: 그 신호가 있었을 때 다음 틱 평균 등락이 전체 평균보다 얼마나 높았는지)
-      //   bidTurnedPositive +0.051(표본9669) / buyReqSpike +0.040(표본14179) -> 여전히 유효, 유지
-      //   sellReqThinning +0.051(표본7741) -> bidTurnedPositive와 사실상 동급 효과인데 그동안 1.5로 저평가돼있었음, 대폭 상향
-      //   comboBuySignal +0.065(표본4107) -> 단일신호보다 뚜렷이 강함, 상향
-      //   isTodayHigh -0.075(표본13454, 8/8일 전부 일관되게 마이너스) -> 그동안 recoScore에 전혀 반영 안 되고 있던 게 확인됨(누락 버그).
-      //     실거래(performance-report)에서도 avgPnlPct -1.676%/승률29.4%(표본17)로 정확히 일치 - 명확한 악재 신호라 처음으로 감점 추가
-      //   isGoldenTime: 최근 3일(08/06,08/08,08/09) 연속 -0.18~-0.21로 강한 역효과 - 기존 +1.5 가점을 제거
-      //   volumeConfirmed: 표본이 758틱 기준 69로 늘었는데 -0.043로 역전(과거 표본12개는 우연히 +였던 것) -> 신뢰 불가, 가점 제거
-      //   repeatDays===2(2일째등장) 실거래 avgPnlPct +0.736%/승률66.7%(표본18) -> 지금까지 점수에 전혀 안 쓰이던 유효신호, 소폭 가점 추가
-      //   동전주(가격<2000) 감점은 이번 재검토에서 제외 - 점수 로직에서 삭제, 화면 경고 배지(⚠️)만 유지
-      // performance-report: 전체 승률34.7%/순손실-581,580원, "실시간포착" 보드가 손실의 대부분(117건 중 81패)을 차지 -
-      //   조건검색 자동편입이 필터 없이 무조건 담는 게 원인으로 보임(autoAddConditionHits에 isTodayHigh 가드 추가함).
+      // 직전 조정(08-09) 이후 overall이 avgPnlPct -0.388%->-0.102%, 승률 34.7%->41.8%로 개선됨.
+      // "실시간포착"도 -0.517%->-0.135% / 승률 29.9%->40%로 크게 나아짐(자동편입 필터 효과로 보임) - 방향 유지.
+      //   bidTurnedPositive +0.050(표본10060) / buyReqSpike +0.040(표본14659) / sellReqThinning +0.043(표본7815)
+      //     -> 셋 다 대표본에서 안정적으로 유효. 다만 실거래 표본에선 매수전환 -0.735%(n=9)/매수잔량급증 -1.692%(n=11)로
+      //        어긋나는데, 표본이 1만건 대 10건 수준이라 백테스트를 신뢰하되 과신은 피해서 소폭 하향 조정.
+      //   comboBuySignal +0.064(표본4087) -> 개별신호보다 일관되게 강함, 유지
+      //   isTodayHigh -0.067(표본14893) + 실거래 -1.676%/승률29.4%(n=17) -> 백테스트·실거래 모두 일치, 감점 유지
+      //   isGoldenTime +0.048(표본5785) -> 08-09에 "3일 연속 역효과"로 판단해 가점을 뺐는데, 그건 표본307짜리
+      //     소표본 편향이었음이 대표본에서 드러남(부호가 반대로 뒤집힘). 가점 복구.
+      //   realPullback +0.017(표본2831) -> 처음으로 안정적 플러스. 단순 pullbackLike(-0.031)와 정반대라
+      //     "수급유입이 동반된 눌림목만 유효하다"는 가설이 실측으로 확인됨. 지금까지 점수에 안 쓰이던 신호라 신규 도입.
+      //   volumeConfirmed +0.027(표본72) -> 표본이 늘며 다시 플러스로 돌아왔으나 그동안 부호가 계속 뒤집혀온
+      //     신호(표본12 -> +, 표본69 -> -, 표본72 -> +)라 아직 신뢰 낮음. 아주 작게만 반영.
+      //   accelerating -0.013 / cntrStrRising +0.001 / pullbackLike -0.031 -> 무효 내지 역효과, 점수 미반영 유지
+      //   repeatDays===2(2일째등장) 실거래 avgPnlPct +0.736%/승률66.7%(n=18) -> 유효, 유지
       let score = 0;
       score += recentDelta * 4;
-      if (r.bidTurnedPositive) score += 5.5; // 실측 근거 유지
-      if (r.buyReqSpike) score += 3.5; // 실측 근거 유지
-      if (r.sellReqThinning) score += 3.5; // bidTurnedPositive/buyReqSpike와 동급 효과 확인됨 - 1.5 -> 3.5 상향
+      if (r.bidTurnedPositive) score += 5; // 실거래 표본이 어긋나 과신 피함 - 5.5 -> 5
+      if (r.buyReqSpike) score += 3; // 위와 동일한 이유 - 3.5 -> 3
+      if (r.sellReqThinning) score += 3.5; // 대표본에서 안정적, 실거래 표본(n=2)은 판단 불가 수준이라 유지
       // 복합신호(강한매수세): 매수전환+매수잔량급증이 동시에 뜨면 개별 신호보다 훨씬 강한 확인 -
       // 둘 다 검증된 신호가 동시에 나타나는 거라 우연히 겹칠 확률이 낮고, 방향성 있는 진짜 수급일 가능성이 큼
-      if (r.bidTurnedPositive && r.buyReqSpike) score += 3; // edge가 개별신호보다 뚜렷이 커서 2 -> 3 상향
+      if (r.bidTurnedPositive && r.buyReqSpike) score += 3;
+      // 진짜 눌림목: 되돌림 후 재상승(pullbackLike) 자체는 역효과지만, 거기에 수급유입 신호가 동반되면
+      // 처음으로 뚜렷한 플러스로 바뀜 - 이미 한 번 힘을 보여주고 쉬었다가 실제 수급과 함께 다시 도는 자리
+      const realPullback = pullbackCodes.has(r.code) && (r.bidTurnedPositive || r.buyReqSpike || r.sellReqThinning);
+      if (realPullback) score += 2;
+      // 거래량 동반 확인: 호가잔량 신호가 실제 체결거래량 증가와 같이 온 경우 - 표본이 작아 가중치는 최소로만
+      const volumeConfirmed = (r.bidTurnedPositive || r.buyReqSpike) && r.volumeSpikeRatio && r.volumeSpikeRatio >= 1.5;
+      if (volumeConfirmed) score += 0.5;
       // 체결강도 절대수준: 100 넘는지(방향)뿐 아니라 얼마나 강한지도 봄 - 150 이상은 "강한 매수세 유입"이 통상적 해석 기준
       if ((r.cntr_str || 0) >= 150) score += 1.5;
       // 2일 연속 급등리스트 등장 - 실거래 데이터상 뚜렷한 양의 성과(일회성 반짝보다 지속 관심이 낫다는 근거)
@@ -1281,8 +1292,9 @@ function computeRecommendations(latest, pullbackCodes) {
       if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) score -= 2;
       if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
       if (isLateSession) score -= 2; // 오후 늦은 시각 - 마감까지 회복 시간이 부족
+      if (isGoldenTime) score += 1.5; // 09:00~09:30 - 대표본 재검증에서 유효 확인되어 가점 복구
       if (weakMarket) score -= 1.5; // 코스피/코스닥 동반 약세 - 급등주 신호 신뢰도 하락
-      return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: false };
+      return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: !!volumeConfirmed, realPullback };
     })
     .sort((a, b) => b.recoScore - a.recoScore)
     .slice(0, 10);
@@ -1404,6 +1416,7 @@ function activeBadgeLabels(r) {
   if (r.sellReqThinning) labels.push('매도잔량급감');
   if (r.freshEntry) labels.push('신규진입');
   if (r.accelerating) labels.push('가속중'); // 추천종목 보드에서만 존재하는 필드
+  if (r.realPullback) labels.push('눌림목수급동반'); // 추천종목 보드에서만 존재 - 이번에 새로 도입한 신호라 실거래 검증용으로 기록
   return labels;
 }
 
@@ -1714,15 +1727,15 @@ async function load() {
     '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
     ' · 거래량 ' + fmt(r.volume) +
     ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
-    ((r.accelerating || r.comboBuySignal || r.volumeConfirmed || pullbackCodes.has(r.code))
+    ((r.accelerating || r.comboBuySignal || r.volumeConfirmed || r.realPullback)
       ? '<div class="momentumLine">' +
         (r.comboBuySignal ? '<span class="delta">🔥강한매수세</span>' : '') +
-        (r.comboBuySignal && (r.volumeConfirmed || r.accelerating || pullbackCodes.has(r.code)) ? ' · ' : '') +
+        (r.comboBuySignal && (r.volumeConfirmed || r.accelerating || r.realPullback) ? ' · ' : '') +
         (r.volumeConfirmed ? '<span class="delta">✅거래량동반확인</span>' : '') +
-        (r.volumeConfirmed && (r.accelerating || pullbackCodes.has(r.code)) ? ' · ' : '') +
+        (r.volumeConfirmed && (r.accelerating || r.realPullback) ? ' · ' : '') +
         (r.accelerating ? '<span class="delta">⚡가속중</span>' : '') +
-        (r.accelerating && pullbackCodes.has(r.code) ? ' · ' : '') +
-        (pullbackCodes.has(r.code) ? '<span class="delta">🌊눌림목재상승</span>' : '') +
+        (r.accelerating && r.realPullback ? ' · ' : '') +
+        (r.realPullback ? '<span class="delta">🌊눌림목재상승(수급동반)</span>' : '') +
         '</div>'
       : ''),
   '데이터 없음', undefined, '추천종목TOP10');
@@ -4575,7 +4588,7 @@ self.addEventListener('fetch', (e) => {
         }
       }
 
-      // relay 전용 - 15:50 일괄정리. 그 시점 관심종목 전체를 훑어서 +2.5%/-1.5% 조건에 걸리는
+      // relay 전용 - 15:50 일괄정리. 그 시점 관심종목 전체를 훑어서 +3.5%/-1.5% 조건에 걸리는
       // 종목을 한 번에 익절/손절 확정삭제. 이후(15:50~장마감)엔 다시 매매중지 유지되므로 이 라우트는
       // 15:50 매매중지 게이트를 우회하는 별도 엔드포인트로 둠 (auto-remove와 게이트 조건이 반대).
       if (url.pathname === "/api/watchlist/final-sweep" && request.method === "POST") {
@@ -4591,7 +4604,7 @@ self.addEventListener('fetch', (e) => {
           const details = [];
           for (const it of items) {
             if (typeof it.pnlPct !== "number") continue;
-            if (!(it.pnlPct >= 2.5 || it.pnlPct <= -1.5)) continue; // 조건 재검증 (relay 판단을 신뢰하되 이중확인)
+            if (!(it.pnlPct >= 3.5 || it.pnlPct <= -1.5)) continue; // 조건 재검증 (relay 판단을 신뢰하되 이중확인)
             const w = await env.DB.prepare(
               `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
             )
@@ -4604,7 +4617,7 @@ self.addEventListener('fetch', (e) => {
             }
             await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(it.code).run();
             await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(it.code).run();
-            const reason = it.pnlPct >= 2.5 ? "익절" : "손절";
+            const reason = it.pnlPct >= 3.5 ? "익절" : "손절";
             details.push(`${w.name}(${it.code}) ${it.pnlPct.toFixed(2)}%[${reason}]`);
             removed++;
           }
@@ -4643,7 +4656,7 @@ self.addEventListener('fetch', (e) => {
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
           const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
-          const reason = typeof pnlPct === "number" && pnlPct >= 2.5 ? "익절" : "손절";
+          const reason = typeof pnlPct === "number" && pnlPct >= 3.5 ? "익절" : "손절";
           await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제[${reason}] [relay]`);
           console.log(`relay ${reason} 자동삭제: ${code} (${pnlStr}%)`);
           return Response.json({ ok: true });
@@ -5441,6 +5454,134 @@ self.addEventListener('fetch', (e) => {
               "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
               "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것. " +
               "profitWon/lossWon/netWon은 종목당 100만원 매수 가정(수수료·세금 미반영)으로 환산한 근사 금액.",
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // 익절/손절 임계값 시뮬레이터 - "그때 임계값이 달랐다면 실제로 얼마 벌었을까"를 실측 데이터로 계산.
+      // 실제로 담았던 관심종목(watchlist_performance에 기록된 added_at/entry_price)의 진입 이후 가격 경로를
+      // snapshots(2분 간격) + watchlist_fine_snapshots(30초 간격)에서 시간순으로 재구성한 뒤, 임계값 조합마다
+      // "먼저 닿는 쪽"으로 청산했다고 가정해 손익을 집계함.
+      // - 30분 시점 가격만 보는 performance-report와 달리, 중간에 익절선/손절선을 스쳤는지까지 반영됨
+      // - 장중에 어느 쪽도 안 닿으면 마지막 관측가로 청산(장마감 정리에 해당)
+      // - 수수료/세금은 관심종목 화면과 동일 기준(매수·매도 각 0.015%, 매도 거래세 0.20%)으로 반영
+      if (url.pathname === "/api/admin/simulate-exits") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        try {
+          const days = Math.min(parseInt(url.searchParams.get("days") || "7", 10) || 7, 30);
+          const maxHoldMin = Math.min(parseInt(url.searchParams.get("holdMin") || "390", 10) || 390, 390);
+          const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+          // 실제로 담았던 이력 - horizon_min=30 행 하나당 "한 번의 진입"으로 취급(중복 방지)
+          const entriesRes = await env.DB.prepare(
+            `SELECT DISTINCT code, name, added_at, entry_price, source_board
+             FROM watchlist_performance
+             WHERE horizon_min = 30 AND entry_price > 0 AND added_at >= ?
+             ORDER BY added_at ASC`
+          )
+            .bind(cutoff)
+            .all();
+          const entries = entriesRes.results || [];
+          if (!entries.length) {
+            return Response.json({ ok: true, sampleSize: 0, note: "해당 기간에 기록된 진입 이력이 없습니다." });
+          }
+
+          // 진입 종목들의 가격 경로를 한 번에 가져옴(종목별 개별 쿼리 대신 IN절 - D1 왕복 최소화).
+          // 변수 개수 제한 때문에 종목코드는 60개씩 끊어서 조회.
+          const codes = [...new Set(entries.map((e) => e.code))];
+          const priceRows = [];
+          for (let i = 0; i < codes.length; i += 60) {
+            const chunk = codes.slice(i, i + 60);
+            const ph = chunk.map(() => "?").join(",");
+            const [snapRes, fineRes] = await Promise.all([
+              env.DB.prepare(
+                `SELECT code, price, captured_at FROM snapshots WHERE code IN (${ph}) AND captured_at >= ?`
+              ).bind(...chunk, cutoff).all().catch(() => ({ results: [] })),
+              env.DB.prepare(
+                `SELECT code, price, captured_at FROM watchlist_fine_snapshots WHERE code IN (${ph}) AND captured_at >= ?`
+              ).bind(...chunk, cutoff).all().catch(() => ({ results: [] })),
+            ]);
+            priceRows.push(...(snapRes.results || []), ...(fineRes.results || []));
+          }
+
+          // 종목별 시간순 가격 경로 구성 (snapshots와 fine을 합쳐서 정렬 - 같은 시각 중복은 무해)
+          const pathByCode = new Map();
+          for (const r of priceRows) {
+            if (!r.price || r.price <= 0) continue;
+            if (!pathByCode.has(r.code)) pathByCode.set(r.code, []);
+            pathByCode.get(r.code).push({ t: new Date(r.captured_at).getTime(), price: r.price });
+          }
+          for (const arr of pathByCode.values()) arr.sort((a, b) => a.t - b.t);
+
+          const FEE = 0.00015, TAX = 0.0020, BUDGET = 1000000;
+          // 비율 손익을 수수료·세금 반영한 실질 손익률로 환산 (관심종목 화면의 computeRealisticPnl과 동일 기준)
+          const netPct = (entryPrice, exitPrice) => {
+            const qty = Math.floor(BUDGET / entryPrice);
+            if (qty <= 0) return null;
+            const invested = qty * entryPrice;
+            const cost = invested + invested * FEE;
+            const proceeds = qty * exitPrice - qty * exitPrice * FEE - qty * exitPrice * TAX;
+            return { pct: ((proceeds - cost) / cost) * 100, won: Math.round(proceeds - cost) };
+          };
+
+          const simulate = (tpPct, slPct) => {
+            let wins = 0, losses = 0, profitWon = 0, lossWon = 0, tpHit = 0, slHit = 0, timeout = 0, used = 0;
+            for (const e of entries) {
+              const path = pathByCode.get(e.code);
+              if (!path || !path.length) continue;
+              const startMs = new Date(e.added_at).getTime();
+              const endMs = startMs + maxHoldMin * 60000;
+              const after = path.filter((p) => p.t >= startMs && p.t <= endMs);
+              if (!after.length) continue;
+              used++;
+              const tpPrice = e.entry_price * (1 + tpPct / 100);
+              const slPrice = e.entry_price * (1 + slPct / 100);
+              let exitPrice = after[after.length - 1].price, hit = "timeout";
+              for (const p of after) {
+                // 같은 관측 시점에 둘 다 걸릴 수 있는데(2분/30초 간격이라 그 사이 움직임은 알 수 없음),
+                // 실제 운용에서 손실이 먼저 확정되는 보수적 가정을 따름 - 손절을 우선 판정.
+                if (p.price <= slPrice) { exitPrice = slPrice; hit = "sl"; break; }
+                if (p.price >= tpPrice) { exitPrice = tpPrice; hit = "tp"; break; }
+              }
+              if (hit === "tp") tpHit++; else if (hit === "sl") slHit++; else timeout++;
+              const n = netPct(e.entry_price, exitPrice);
+              if (!n) continue;
+              if (n.won > 0) { wins++; profitWon += n.won; } else { losses++; lossWon += n.won; }
+            }
+            const total = wins + losses;
+            return {
+              takeProfitPct: tpPct, stopLossPct: slPct,
+              sampleSize: used,
+              winRatePct: total ? +((wins / total) * 100).toFixed(1) : null,
+              netWon: profitWon + lossWon,
+              profitWon, lossWon,
+              tpHitCount: tpHit, slHitCount: slHit, timeoutCount: timeout,
+            };
+          };
+
+          const tpCandidates = [2, 2.5, 3, 3.5, 4, 5];
+          const slCandidates = [-1, -1.5, -2, -2.5];
+          const results = [];
+          for (const tp of tpCandidates) for (const sl of slCandidates) results.push(simulate(tp, sl));
+          results.sort((a, b) => b.netWon - a.netWon);
+
+          return Response.json({
+            ok: true,
+            days, maxHoldMin,
+            entriesFound: entries.length,
+            best: results[0],
+            current: results.find((r) => r.takeProfitPct === 3.5 && r.stopLossPct === -1.5),
+            previous: results.find((r) => r.takeProfitPct === 2.5 && r.stopLossPct === -1.5),
+            allResults: results,
+            caveats:
+              "가격 경로가 snapshots(2분)+fine(30초) 관측점 기준이라 그 사이의 순간 고저는 안 잡힘 - 실제보다 익절/손절 도달이 과소집계될 수 있음. " +
+              "한 관측점에서 익절선·손절선이 동시에 걸리면 보수적으로 손절을 우선 적용함. " +
+              "5~15% 밴드를 벗어난 구간은 snapshots에 안 남으므로 관심종목이 아니었던 시간대는 경로가 끊길 수 있음. " +
+              "표본이 작으면(대략 30 미만) 순위가 우연일 수 있으니 days를 늘려서 재확인할 것.",
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
