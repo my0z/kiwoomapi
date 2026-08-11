@@ -273,6 +273,13 @@ async function trackWatchlistPerformance(env) {
       if (!row) continue; // 그 시점 데이터 아직 없음(또는 밴드 밖) - 다음 틱에 다시 시도
 
       const pnlPct = ((row.price - w.entry_price) / w.entry_price) * 100;
+      // 진입가 오류(조회 실패로 엉뚱한 값 저장, 액면분할/거래정지로 가격체계 변경 등)로 생긴 값이
+      // 통계를 통째로 왜곡하는 것을 막기 위해 애초에 기록하지 않음. 5~15% 밴드 종목이 30분 만에
+      // ±40%를 넘는 건 정상적인 시세 변동으로 보기 어려움(상하한가도 30%).
+      if (Math.abs(pnlPct) > 40) {
+        await logSystemEvent(env, "perf_outlier_skipped", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(1)}% - 진입가 ${w.entry_price} 오류 의심으로 성과기록 제외`);
+        continue;
+      }
       await env.DB.prepare(
         `INSERT OR REPLACE INTO watchlist_performance
          (code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state, recorded_at)
@@ -5368,14 +5375,26 @@ self.addEventListener('fetch', (e) => {
         // 백테스트(가상)와 달리 이건 "실제로 내가 담은 것"들의 성적표라 가중치 조정의 가장 강한 근거임.
         try {
           const horizon = parseInt(url.searchParams.get("horizon") || "30", 10) || 30;
+          // 이상치 기준: 급등주 스크리너는 5~15% 밴드 종목만 담으므로 30분 후 손익률이 이 범위를 크게
+          // 벗어나는 건 진입가 오류(조회 실패 시 엉뚱한 값 저장, 액면분할/거래정지로 가격체계 변경 등)일
+          // 가능성이 높음. 실제로 +227% 한 건이 전체 순손익을 -25만원 -> +202만원으로 뒤집어버린 사례가 있었음.
+          // outlierPct 파라미터로 조정 가능하고, includeOutliers=1이면 예전처럼 전부 포함해서 볼 수 있음.
+          const outlierPct = Math.abs(parseFloat(url.searchParams.get("outlierPct") || "40")) || 40;
+          const includeOutliers = url.searchParams.get("includeOutliers") === "1";
           const res = await env.DB.prepare(
-            `SELECT source_board, added_state, pnl_pct FROM watchlist_performance WHERE horizon_min = ?`
+            `SELECT code, name, added_at, entry_price, later_price, source_board, added_state, pnl_pct
+             FROM watchlist_performance WHERE horizon_min = ?`
           )
             .bind(horizon)
             .all();
-          const rows = res.results;
-          if (!rows.length) {
+          const allRows = res.results;
+          if (!allRows.length) {
             return Response.json({ ok: true, horizon, sampleSize: 0, note: "아직 기록된 성과 데이터가 없습니다. 관심종목을 담고 30분 이상 지나야 쌓입니다." });
+          }
+          const outliers = allRows.filter((r) => Math.abs(r.pnl_pct) > outlierPct);
+          const rows = includeOutliers ? allRows : allRows.filter((r) => Math.abs(r.pnl_pct) <= outlierPct);
+          if (!rows.length) {
+            return Response.json({ ok: true, horizon, sampleSize: 0, excludedOutliers: outliers, note: "이상치를 제외하고 나니 남은 표본이 없습니다." });
           }
 
           // 관심종목 화면과 동일하게 "100만원 매수 가정"으로 손익 금액 환산 - 수수료/세금은 화면 표시와
@@ -5439,6 +5458,14 @@ self.addEventListener('fetch', (e) => {
             horizon,
             sampleSize: rows.length,
             buyAmountAssumedWon: BUY_AMOUNT,
+            outlierThresholdPct: outlierPct,
+            outliersExcluded: includeOutliers ? 0 : outliers.length,
+            // 제외된 레코드를 그대로 보여줘서 원인(진입가 오류인지, 실제 급등인지)을 바로 확인할 수 있게 함
+            outlierRecords: outliers.map((r) => ({
+              code: r.code, name: r.name, addedAt: r.added_at,
+              entryPrice: r.entry_price, laterPrice: r.later_price, pnlPct: r.pnl_pct,
+              sourceBoard: r.source_board, addedState: r.added_state,
+            })),
             overall: {
               avgPnlPct: overallAvg,
               winRatePct: overallWinRate,
@@ -5453,7 +5480,9 @@ self.addEventListener('fetch', (e) => {
             interpretation:
               "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
               "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것. " +
-              "profitWon/lossWon/netWon은 종목당 100만원 매수 가정(수수료·세금 미반영)으로 환산한 근사 금액.",
+              "profitWon/lossWon/netWon은 종목당 100만원 매수 가정(수수료·세금 미반영)으로 환산한 근사 금액. " +
+              "손익률 절댓값이 " + outlierPct + "%를 넘는 건은 진입가 오류일 가능성이 높아 집계에서 제외했고 " +
+              "outlierRecords에 따로 담았음(전부 포함해서 보려면 &includeOutliers=1).",
           });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -5987,8 +6016,12 @@ self.addEventListener('fetch', (e) => {
             )
               .bind(startUtc, endUtc)
               .all();
-            let profitWon = 0, lossWon = 0;
+            let profitWon = 0, lossWon = 0, outlierCount = 0;
             for (const r of perfRes.results || []) {
+              // 급등주 스크리너는 5~15% 밴드 종목만 담으므로 30분 손익률이 ±40%를 넘는 건 진입가 오류
+              // (조회 실패로 엉뚱한 값 저장, 액면분할 등)일 가능성이 높음. 실제로 +227% 한 건이 화면
+              // 실현손익을 -25만원에서 +225만원으로 뒤집어 보여준 사례가 있어서 집계에서 제외함.
+              if (Math.abs(r.pnl_pct) > 40) { outlierCount++; continue; }
               const amount = BUY_AMOUNT * (r.pnl_pct / 100);
               if (amount > 0) profitWon += amount;
               else lossWon += amount;
@@ -5996,6 +6029,7 @@ self.addEventListener('fetch', (e) => {
             return {
               added, removed: removedProfit + removedLoss, removedProfit, removedLoss,
               profitWon: Math.round(profitWon), lossWon: Math.round(lossWon), netWon: Math.round(profitWon + lossWon),
+              outlierCount,
             };
           }
 
@@ -6057,6 +6091,9 @@ self.addEventListener('fetch', (e) => {
 
           const byDate = {};
           for (const r of res.results || []) {
+            // daily-stats와 동일 기준으로 진입가 오류 의심 건(±40% 초과) 제외 - 이런 값 하나가 들어가면
+            // 막대그래프 스케일이 통째로 망가져서 나머지 날짜가 전부 납작하게 보이는 문제도 같이 해결됨
+            if (Math.abs(r.pnl_pct) > 40) continue;
             if (!byDate[r.d]) byDate[r.d] = { profitWon: 0, lossWon: 0, count: 0 };
             const amount = BUY_AMOUNT * (r.pnl_pct / 100);
             if (amount > 0) byDate[r.d].profitWon += amount;
