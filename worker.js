@@ -139,6 +139,11 @@ function isTradingActiveKST(date) {
 // 그래야 performance-report가 "살아남은 것만" 좋게 보이는 왜곡(생존 편향) 없이 실제 승률을 반영함.
 async function recordWatchlistExitPerformance(env, w, exitPrice, actualPnlPct) {
   try {
+    // 실제 손익 부호에 맞는 라벨을 붙임 - 예전엔 익절이든 손절이든 무조건 "손절삭제"로 고정 기록돼서,
+    // performance-report의 bySignal 분류(손절삭제 카테고리)에 익절 종료 건과 손절 종료 건이 뒤섞여
+    // 있었음. avgPnlPct가 실제보다 나빠 보이는 착시를 만들었을 뿐 아니라, 신호별 효과 판단 자체가
+    // 이 오염된 라벨을 근거로 이뤄지고 있었음 - 금액 합계 자체는 안 틀렸지만 분류가 틀렸던 것.
+    const exitLabel = actualPnlPct >= 0 ? "익절삭제" : "손절삭제";
     for (const horizon of [30, 60]) {
       const already = await env.DB.prepare(
         `SELECT 1 FROM watchlist_performance WHERE code = ? AND added_at = ? AND horizon_min = ?`
@@ -154,7 +159,7 @@ async function recordWatchlistExitPerformance(env, w, exitPrice, actualPnlPct) {
       )
         .bind(
           w.code, w.name, w.added_at, horizon, w.entry_price, exitPrice,
-          +actualPnlPct.toFixed(3), w.source_board || "", (w.added_state || "") + ",손절삭제", new Date().toISOString()
+          +actualPnlPct.toFixed(3), w.source_board || "", (w.added_state || "") + "," + exitLabel, new Date().toISOString()
         )
         .run()
         .catch(() => {});
@@ -299,7 +304,28 @@ async function trackWatchlistPerformance(env) {
 
 // 조용히 묻히던 수집 실패를 D1에 남겨서 나중에 확인 가능하게 함 (system_events 테이블 필요 - schema.sql 참고)
 // 로깅 자체가 실패해도(테이블 없음 등) 전체 흐름을 막으면 안 되니 조용히 무시
-async function logSystemEvent(env, kind, message) {
+// 관심종목 화면(클라이언트 computeRealisticPnl)과 정확히 동일한 공식 - 정수 주식 매수, 매수/매도
+// 수수료 각 0.015%, 매도 시 증권거래세 0.20%. performance-report/daily-stats/pnl-history가 그동안
+// 이 비용을 반영 안 한 순수 가격변동률(pnl_pct)만으로 금액을 계산해서, 화면과 리포트 숫자가
+// 서로 달랐고(리포트가 실제보다 더 좋게 보임) 리포트가 실제 성과를 과소평가하고 있었음.
+const KIWOOM_FEE_RATE = 0.00015;
+const SELL_TAX_RATE = 0.002;
+function computeRealisticPnlServer(entryPrice, exitPrice, budget) {
+  const qty = Math.floor(budget / entryPrice);
+  if (qty <= 0) return null;
+  const investedAmount = qty * entryPrice;
+  const buyFee = investedAmount * KIWOOM_FEE_RATE;
+  const currentValue = qty * exitPrice;
+  const sellFee = currentValue * KIWOOM_FEE_RATE;
+  const sellTax = currentValue * SELL_TAX_RATE;
+  const netProceeds = currentValue - sellFee - sellTax;
+  const totalCost = investedAmount + buyFee;
+  const netPnlAmount = Math.round(netProceeds - totalCost);
+  const netPnlPct = (netPnlAmount / totalCost) * 100;
+  return { qty, netPnlAmount, netPnlPct };
+}
+
+
   try {
     await env.DB.prepare(`INSERT INTO system_events (kind, message, created_at) VALUES (?, ?, ?)`)
       .bind(kind, String(message).slice(0, 2000), new Date().toISOString())
@@ -5397,19 +5423,31 @@ self.addEventListener('fetch', (e) => {
             return Response.json({ ok: true, horizon, sampleSize: 0, excludedOutliers: outliers, note: "이상치를 제외하고 나니 남은 표본이 없습니다." });
           }
 
-          // 관심종목 화면과 동일하게 "100만원 매수 가정"으로 손익 금액 환산 - 수수료/세금은 화면 표시와
-          // 달리 여기선 생략(비율 기반 근사치). 건별 손익금을 승/패로 나눠 합산해서 "얼마 벌고 얼마 잃었는지" 파악.
+          // 관심종목 화면(computeRealisticPnl)과 동일한 공식으로 실질 손익을 미리 계산해둠.
+          // 예전엔 순수 가격변동률(pnl_pct)만으로 금액을 냈는데, 그러면 수수료·세금(왕복 약 0.23%)이
+          // 통째로 빠져서 리포트가 실제보다 항상 좋게 나왔음(하루 표본 270여건 기준 약 60만원 차이).
           const BUY_AMOUNT = 1000000;
+          const netRows = rows
+            .map((r) => {
+              if (!r.entry_price || r.entry_price <= 0 || !r.later_price || r.later_price <= 0) return null;
+              const net = computeRealisticPnlServer(r.entry_price, r.later_price, BUY_AMOUNT);
+              if (!net) return null;
+              return { ...r, netPnlPct: net.netPnlPct, netPnlAmount: net.netPnlAmount };
+            })
+            .filter(Boolean);
+          if (!netRows.length) {
+            return Response.json({ ok: true, horizon, sampleSize: 0, note: "실질손익 계산 가능한 표본이 없습니다(진입가/현재가 누락)." });
+          }
+
           const moneyAgg = (keyFn) => {
             const map = new Map();
-            rows.forEach((r) => {
+            netRows.forEach((r) => {
               for (const k of keyFn(r)) {
                 if (!k) continue;
                 if (!map.has(k)) map.set(k, { profitSum: 0, lossSum: 0, profitCount: 0, lossCount: 0 });
                 const s = map.get(k);
-                const amount = BUY_AMOUNT * (r.pnl_pct / 100);
-                if (amount > 0) { s.profitSum += amount; s.profitCount++; }
-                else if (amount < 0) { s.lossSum += amount; s.lossCount++; }
+                if (r.netPnlAmount > 0) { s.profitSum += r.netPnlAmount; s.profitCount++; }
+                else if (r.netPnlAmount < 0) { s.lossSum += r.netPnlAmount; s.lossCount++; }
               }
             });
             const out = {};
@@ -5427,14 +5465,14 @@ self.addEventListener('fetch', (e) => {
 
           const agg = (keyFn) => {
             const map = new Map();
-            rows.forEach((r) => {
+            netRows.forEach((r) => {
               for (const k of keyFn(r)) {
                 if (!k) continue;
                 if (!map.has(k)) map.set(k, { count: 0, sum: 0, wins: 0 });
                 const s = map.get(k);
                 s.count++;
-                s.sum += r.pnl_pct;
-                if (r.pnl_pct > 0) s.wins++;
+                s.sum += r.netPnlPct;
+                if (r.netPnlAmount > 0) s.wins++;
               }
             });
             const out = {};
@@ -5448,16 +5486,17 @@ self.addEventListener('fetch', (e) => {
             return out;
           };
 
-          const overallAvg = +(rows.reduce((s, r) => s + r.pnl_pct, 0) / rows.length).toFixed(3);
-          const overallWinRate = +((rows.filter((r) => r.pnl_pct > 0).length / rows.length) * 100).toFixed(1);
-          const overallProfitWon = Math.round(rows.reduce((s, r) => s + Math.max(0, BUY_AMOUNT * (r.pnl_pct / 100)), 0));
-          const overallLossWon = Math.round(rows.reduce((s, r) => s + Math.min(0, BUY_AMOUNT * (r.pnl_pct / 100)), 0));
+          const overallAvg = +(netRows.reduce((s, r) => s + r.netPnlPct, 0) / netRows.length).toFixed(3);
+          const overallWinRate = +((netRows.filter((r) => r.netPnlAmount > 0).length / netRows.length) * 100).toFixed(1);
+          const overallProfitWon = Math.round(netRows.reduce((s, r) => s + Math.max(0, r.netPnlAmount), 0));
+          const overallLossWon = Math.round(netRows.reduce((s, r) => s + Math.min(0, r.netPnlAmount), 0));
 
           return Response.json({
             ok: true,
             horizon,
-            sampleSize: rows.length,
+            sampleSize: netRows.length,
             buyAmountAssumedWon: BUY_AMOUNT,
+            feesIncluded: true,
             outlierThresholdPct: outlierPct,
             outliersExcluded: includeOutliers ? 0 : outliers.length,
             // 제외된 레코드를 그대로 보여줘서 원인(진입가 오류인지, 실제 급등인지)을 바로 확인할 수 있게 함
@@ -5480,7 +5519,8 @@ self.addEventListener('fetch', (e) => {
             interpretation:
               "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
               "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것. " +
-              "profitWon/lossWon/netWon은 종목당 100만원 매수 가정(수수료·세금 미반영)으로 환산한 근사 금액. " +
+              "profitWon/lossWon/netWon은 종목당 100만원 매수 가정, 매수/매도 수수료(0.015%씩)와 매도 거래세(0.20%)를 " +
+              "실제 관심종목 화면과 동일하게 반영한 실질 손익 금액. avgPnlPct/winRatePct도 동일 기준. " +
               "손익률 절댓값이 " + outlierPct + "%를 넘는 건은 진입가 오류일 가능성이 높아 집계에서 제외했고 " +
               "outlierRecords에 따로 담았음(전부 포함해서 보려면 &includeOutliers=1).",
           });
@@ -5612,6 +5652,47 @@ self.addEventListener('fetch', (e) => {
               "5~15% 밴드를 벗어난 구간은 snapshots에 안 남으므로 관심종목이 아니었던 시간대는 경로가 끊길 수 있음. " +
               "표본이 작으면(대략 30 미만) 순위가 우연일 수 있으니 days를 늘려서 재확인할 것.",
           });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
+      // 잘못 들어간 성과 레코드 삭제 (테스트 데이터 정리용) - code와 added_at을 둘 다 정확히
+      // 지정해야만 지워지므로 실수로 다른 데이터를 날릴 위험이 낮음. 삭제 전 대상을 먼저 보여주고,
+      // confirm=1이 있을 때만 실제로 지움.
+      if (url.pathname === "/api/admin/delete-performance") {
+        if (!checkAdminKey(request, url, env)) {
+          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
+        }
+        try {
+          const code = url.searchParams.get("code");
+          const addedAt = url.searchParams.get("addedAt");
+          if (!code || !addedAt) {
+            return Response.json({ ok: false, error: "code, addedAt 파라미터 둘 다 필요" }, { status: 400 });
+          }
+          const targetRes = await env.DB.prepare(
+            `SELECT code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state
+             FROM watchlist_performance WHERE code = ? AND added_at = ?`
+          )
+            .bind(code, addedAt)
+            .all();
+          const targets = targetRes.results || [];
+          if (!targets.length) {
+            return Response.json({ ok: true, deleted: 0, note: "해당 조건에 맞는 레코드가 없습니다. addedAt이 DB에 저장된 형식과 정확히 같아야 합니다." });
+          }
+          if (url.searchParams.get("confirm") !== "1") {
+            return Response.json({
+              ok: true, deleted: 0, wouldDelete: targets.length, targets,
+              note: "확인용 미리보기입니다. 실제로 지우려면 URL 끝에 &confirm=1 을 붙이세요.",
+            });
+          }
+          const del = await env.DB.prepare(
+            `DELETE FROM watchlist_performance WHERE code = ? AND added_at = ?`
+          )
+            .bind(code, addedAt)
+            .run();
+          await logSystemEvent(env, "perf_record_deleted", `${code} ${addedAt} 성과레코드 ${targets.length}건 수동삭제`);
+          return Response.json({ ok: true, deleted: del.meta?.changes ?? targets.length, targets });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
@@ -6012,7 +6093,7 @@ self.addEventListener('fetch', (e) => {
             }
             const BUY_AMOUNT = 1000000;
             const perfRes = await env.DB.prepare(
-              `SELECT pnl_pct FROM watchlist_performance WHERE horizon_min = 30 AND recorded_at >= ? AND recorded_at < ?`
+              `SELECT entry_price, later_price, pnl_pct FROM watchlist_performance WHERE horizon_min = 30 AND recorded_at >= ? AND recorded_at < ?`
             )
               .bind(startUtc, endUtc)
               .all();
@@ -6022,9 +6103,13 @@ self.addEventListener('fetch', (e) => {
               // (조회 실패로 엉뚱한 값 저장, 액면분할 등)일 가능성이 높음. 실제로 +227% 한 건이 화면
               // 실현손익을 -25만원에서 +225만원으로 뒤집어 보여준 사례가 있어서 집계에서 제외함.
               if (Math.abs(r.pnl_pct) > 40) { outlierCount++; continue; }
-              const amount = BUY_AMOUNT * (r.pnl_pct / 100);
-              if (amount > 0) profitWon += amount;
-              else lossWon += amount;
+              // 화면(computeRealisticPnl)과 동일하게 수수료·세금 반영한 실질 손익으로 계산 -
+              // 예전엔 순수 가격변동률만 써서 실제보다 하루 수십만원씩 좋게 보이던 문제를 고침.
+              if (!r.entry_price || r.entry_price <= 0 || !r.later_price || r.later_price <= 0) continue;
+              const net = computeRealisticPnlServer(r.entry_price, r.later_price, BUY_AMOUNT);
+              if (!net) continue;
+              if (net.netPnlAmount > 0) profitWon += net.netPnlAmount;
+              else lossWon += net.netPnlAmount;
             }
             return {
               added, removed: removedProfit + removedLoss, removedProfit, removedLoss,
@@ -6081,7 +6166,7 @@ self.addEventListener('fetch', (e) => {
           // recorded_at은 UTC 저장이므로 KST(+9h) 보정 후 날짜만 뽑아서 그룹핑.
           // horizon_min=30만 써서 60분치와 중복집계 방지 (daily-stats와 동일 기준).
           const res = await env.DB.prepare(
-            `SELECT DATE(datetime(recorded_at, '+9 hours')) as d, pnl_pct
+            `SELECT DATE(datetime(recorded_at, '+9 hours')) as d, entry_price, later_price, pnl_pct
              FROM watchlist_performance
              WHERE horizon_min = 30 AND recorded_at >= ?
              ORDER BY recorded_at ASC`
@@ -6094,10 +6179,13 @@ self.addEventListener('fetch', (e) => {
             // daily-stats와 동일 기준으로 진입가 오류 의심 건(±40% 초과) 제외 - 이런 값 하나가 들어가면
             // 막대그래프 스케일이 통째로 망가져서 나머지 날짜가 전부 납작하게 보이는 문제도 같이 해결됨
             if (Math.abs(r.pnl_pct) > 40) continue;
+            if (!r.entry_price || r.entry_price <= 0 || !r.later_price || r.later_price <= 0) continue;
+            // 화면과 동일하게 수수료·세금 반영한 실질 손익으로 계산
+            const net = computeRealisticPnlServer(r.entry_price, r.later_price, BUY_AMOUNT);
+            if (!net) continue;
             if (!byDate[r.d]) byDate[r.d] = { profitWon: 0, lossWon: 0, count: 0 };
-            const amount = BUY_AMOUNT * (r.pnl_pct / 100);
-            if (amount > 0) byDate[r.d].profitWon += amount;
-            else byDate[r.d].lossWon += amount;
+            if (net.netPnlAmount > 0) byDate[r.d].profitWon += net.netPnlAmount;
+            else byDate[r.d].lossWon += net.netPnlAmount;
             byDate[r.d].count += 1;
           }
 
