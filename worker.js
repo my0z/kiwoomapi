@@ -1,5 +1,4 @@
 /**
-*****
  * 키움 REST API 기반 5~15% 상승 종목 스크리너
  * - cron으로 키움 ka10027(전일대비등락률상위요청)을 호출해 KOSPI/KOSDAQ 5~15% 구간 종목을 D1에 저장
  * - / 로 접속하면 대시보드 표시 (최상단: 5연속/3연속 상승, 그 아래: 직전 대비 TOP5, 전체 목록)
@@ -326,7 +325,7 @@ function computeRealisticPnlServer(entryPrice, exitPrice, budget) {
   return { qty, netPnlAmount, netPnlPct };
 }
 
-
+async function logSystemEvent(env, kind, message) {
   try {
     await env.DB.prepare(`INSERT INTO system_events (kind, message, created_at) VALUES (?, ?, ?)`)
       .bind(kind, String(message).slice(0, 2000), new Date().toISOString())
