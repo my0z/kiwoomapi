@@ -4502,6 +4502,51 @@ self.addEventListener('fetch', (e) => {
             .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
+
+          // 관심종목 전역 상한(20개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가
+          // 커져서(체감상 버벅거림) 20개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이
+          // 여기서 일괄 적용됨. 그냥 지우면 통계가 왜곡되니(생존편향 방지 원칙과 동일) 실제 현재가로
+          // 정식 청산 처리 - 익절/손절 자동삭제와 동일하게 watchlist_performance에 기록하고 라벨도
+          // 실제 손익 부호에 맞게 붙임(recordWatchlistExitPerformance가 자동 처리).
+          const WATCHLIST_MAX_SIZE = 20;
+          const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
+          const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
+          if (overCount > 0) {
+            const oldestRes = await env.DB.prepare(
+              `SELECT code, name, entry_price, added_at, source_board, added_state
+               FROM watchlist ORDER BY added_at ASC LIMIT ?`
+            )
+              .bind(overCount)
+              .all()
+              .catch(() => ({ results: [] }));
+            for (const w of oldestRes.results || []) {
+              try {
+                let exitPrice = 0;
+                // relay 실시간가를 우선 시도 - 키움 TR 초당1건 제한 없이 즉시 얻을 수 있음
+                try {
+                  const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
+                  const relayData = await relayRes.json();
+                  const q = relayData.stocks && relayData.stocks[w.code];
+                  if (q && q.price) exitPrice = q.price;
+                } catch (e) { /* 아래 폴백으로 진행 */ }
+                if (!exitPrice) {
+                  const token = await kiwoomIssueToken(env);
+                  const quoteRaw = await kiwoomQuote(env, token, w.code);
+                  exitPrice = parseKiwoomQuote(quoteRaw).price || 0;
+                }
+                if (exitPrice > 0 && w.entry_price > 0) {
+                  const pnlPct = ((exitPrice - w.entry_price) / w.entry_price) * 100;
+                  await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
+                  await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[정원초과] [cap20]`);
+                }
+              } catch (e) {
+                // 개별 종목 청산가 조회 실패해도 상한 유지가 더 중요하니 그냥 삭제는 진행
+              }
+              await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
+              await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
+            }
+          }
+
           if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
           return Response.json({ ok: true, entryPrice });
         } catch (e) {
