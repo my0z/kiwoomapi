@@ -4503,12 +4503,12 @@ self.addEventListener('fetch', (e) => {
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
 
-          // 관심종목 전역 상한(20개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가
-          // 커져서(체감상 버벅거림) 20개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이
+          // 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가
+          // 커져서(체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이
           // 여기서 일괄 적용됨. 그냥 지우면 통계가 왜곡되니(생존편향 방지 원칙과 동일) 실제 현재가로
           // 정식 청산 처리 - 익절/손절 자동삭제와 동일하게 watchlist_performance에 기록하고 라벨도
           // 실제 손익 부호에 맞게 붙임(recordWatchlistExitPerformance가 자동 처리).
-          const WATCHLIST_MAX_SIZE = 20;
+          const WATCHLIST_MAX_SIZE = 10;
           const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
           const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
           if (overCount > 0) {
