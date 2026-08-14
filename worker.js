@@ -2807,7 +2807,9 @@ function loadWatchlistDailyStats() {
     .then(res => res.json())
     .then(data => {
       const tag = document.getElementById('autoRemovedTag');
-      if (!data.ok) { tag.style.visibility = 'hidden'; return; }
+      const topBar = document.getElementById('netPnlBar');
+      const topBarValue = document.getElementById('netPnlBarValue');
+      if (!data.ok) { tag.style.visibility = 'hidden'; topBar.style.visibility = 'hidden'; return; }
       const netWon = data.netWon || 0;
       const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
       const dateLabel = (data.statsDate && data.statsDate !== 'today') ? '(' + data.statsDate + ' 기준) ' : '';
@@ -2817,11 +2819,16 @@ function loadWatchlistDailyStats() {
         ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
         ' (<span style="color:#e03131">익 +' + (data.profitWon || 0).toLocaleString() + '</span> / <span style="color:#1971c2">손 ' + (data.lossWon || 0).toLocaleString() + '</span>)';
       tag.style.visibility = 'visible';
+
+      // 최상단 요약바 - 스크롤해도 항상 보이는 위치라 한눈에 오늘 성적 확인용
+      topBarValue.textContent = (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원';
+      topBarValue.className = netWon > 0 ? 'up' : (netWon < 0 ? 'down' : '');
+      topBar.style.visibility = 'visible';
     })
     .catch(() => {});
 }
 loadWatchlistDailyStats();
-setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadWatchlistDailyStats(); }, 30000); // 30초마다 - relay는 10초 주기로 삭제하므로 배너보다 빠르게
+setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadWatchlistDailyStats(); }, 5000); // 5초마다 - 관심종목 자동삭제(익절/손절/정원초과)가 일어나는 즉시에 가깝게 반영
 
 // 일별 실현손익 히스토리 - SVG 막대그래프, 외부 라이브러리 없이 자체 렌더링.
 // PC(hover)/모바일(tap) 둘 다 지원하도록 각 막대에 마우스/터치 이벤트를 이벤트 위임으로 붙임(.pnlBarHit).
@@ -3070,6 +3077,7 @@ function renderDashboard() {
 <style>
   body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:0 16px 80px; }
   #marketIndexBar { margin-left:-16px; margin-right:-16px; }
+  #netPnlBar { margin-left:-16px; margin-right:-16px; }
   h1 { font-size:18px; margin:0 0 4px; }
   .sub { color:#888; font-size:12px; margin-bottom:16px; }
   .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
@@ -3325,11 +3333,20 @@ function renderDashboard() {
   #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
   #marketIndexBar {
     display:flex; flex-wrap:nowrap; font-size:13px; color:#ffffff; font-weight:700;
-    background:linear-gradient(180deg,#181d27,#0b0d12); border-radius:0; padding:0; margin-bottom:14px;
+    background:linear-gradient(180deg,#181d27,#0b0d12); border-radius:0; padding:0; margin-bottom:0;
     position:sticky; top:0; z-index:95; box-shadow:0 2px 10px rgba(0,0,0,0.7);
     overflow:hidden; height:34px; align-items:center; white-space:nowrap;
     border-bottom:2px solid #333c4d;
   }
+  #netPnlBar {
+    position:sticky; top:34px; z-index:94; height:26px; margin-bottom:14px;
+    display:flex; align-items:center; justify-content:center; gap:6px;
+    font-size:12px; color:#999; background:#17171a; border-bottom:1px solid #2a2a2a;
+    box-shadow:0 2px 6px rgba(0,0,0,0.5);
+  }
+  #netPnlBarValue { font-size:13px; font-weight:800; }
+  #netPnlBarValue.up { color:#ff3b3b; }
+  #netPnlBarValue.down { color:#3d9bff; }
   #marketIndexBarTrack {
     display:flex; flex-wrap:nowrap; align-items:center; gap:16px; padding:0 12px; width:max-content;
     animation: marketTickerScroll 30s linear infinite;
@@ -3365,6 +3382,7 @@ function renderDashboard() {
   <div class="sub" style="display:none;"></div>
   <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
   <div id="marketIndexBar" style="visibility:hidden; height:34px;"><div id="marketIndexBarTrack"></div></div>
+  <div id="netPnlBar" style="visibility:hidden;">오늘 실현손익 <b id="netPnlBarValue">-</b></div>
   <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
   <div id="cfUsagePanel" style="display:none;"></div>
 
