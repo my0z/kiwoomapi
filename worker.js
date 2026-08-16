@@ -325,6 +325,52 @@ function computeRealisticPnlServer(entryPrice, exitPrice, budget) {
   return { qty, netPnlAmount, netPnlPct };
 }
 
+// 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가 커져서
+// (체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이 항상 적용.
+// POST /api/watchlist(새로 추가하는 순간)뿐 아니라 cron(scheduled)에서도 매틱 호출함 - 새 추가가
+// 없어도(예: 배포 직후 이미 상한을 넘겨 갖고 있던 경우) 저절로 정리되게 하기 위함. 그냥 지우면
+// 통계가 왜곡되니(생존편향 방지 원칙과 동일) 실제 현재가로 정식 청산 처리 - 익절/손절 자동삭제와
+// 동일하게 watchlist_performance에 기록하고 라벨도 실제 손익 부호에 맞게 붙임.
+const WATCHLIST_MAX_SIZE = 10;
+async function enforceWatchlistCap(env) {
+  const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
+  const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
+  if (overCount <= 0) return;
+  const oldestRes = await env.DB.prepare(
+    `SELECT code, name, entry_price, added_at, source_board, added_state
+     FROM watchlist ORDER BY added_at ASC LIMIT ?`
+  )
+    .bind(overCount)
+    .all()
+    .catch(() => ({ results: [] }));
+  for (const w of oldestRes.results || []) {
+    try {
+      let exitPrice = 0;
+      // relay 실시간가를 우선 시도 - 키움 TR 초당1건 제한 없이 즉시 얻을 수 있음
+      try {
+        const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
+        const relayData = await relayRes.json();
+        const q = relayData.stocks && relayData.stocks[w.code];
+        if (q && q.price) exitPrice = q.price;
+      } catch (e) { /* 아래 폴백으로 진행 */ }
+      if (!exitPrice) {
+        const token = await kiwoomIssueToken(env);
+        const quoteRaw = await kiwoomQuote(env, token, w.code);
+        exitPrice = parseKiwoomQuote(quoteRaw).price || 0;
+      }
+      if (exitPrice > 0 && w.entry_price > 0) {
+        const pnlPct = ((exitPrice - w.entry_price) / w.entry_price) * 100;
+        await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
+        await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[정원초과] [cap${WATCHLIST_MAX_SIZE}]`);
+      }
+    } catch (e) {
+      // 개별 종목 청산가 조회 실패해도 상한 유지가 더 중요하니 그냥 삭제는 진행
+    }
+    await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
+    await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
+  }
+}
+
 async function logSystemEvent(env, kind, message) {
   try {
     await env.DB.prepare(`INSERT INTO system_events (kind, message, created_at) VALUES (?, ?, ?)`)
@@ -4483,7 +4529,9 @@ self.addEventListener('fetch', (e) => {
               )
                 .bind(new Date().toISOString(), addedState || "", code)
                 .run();
-              if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
+              // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
+          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
+          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
               return Response.json({ ok: true, entryPrice: existing.entry_price });
             }
             // D1에 없는데 클라이언트만 있던 상태(레이스) - 아래 일반 경로로 신규 추가 진행
@@ -4520,52 +4568,11 @@ self.addEventListener('fetch', (e) => {
             .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
+          await enforceWatchlistCap(env);
 
-          // 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가
-          // 커져서(체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이
-          // 여기서 일괄 적용됨. 그냥 지우면 통계가 왜곡되니(생존편향 방지 원칙과 동일) 실제 현재가로
-          // 정식 청산 처리 - 익절/손절 자동삭제와 동일하게 watchlist_performance에 기록하고 라벨도
-          // 실제 손익 부호에 맞게 붙임(recordWatchlistExitPerformance가 자동 처리).
-          const WATCHLIST_MAX_SIZE = 10;
-          const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
-          const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
-          if (overCount > 0) {
-            const oldestRes = await env.DB.prepare(
-              `SELECT code, name, entry_price, added_at, source_board, added_state
-               FROM watchlist ORDER BY added_at ASC LIMIT ?`
-            )
-              .bind(overCount)
-              .all()
-              .catch(() => ({ results: [] }));
-            for (const w of oldestRes.results || []) {
-              try {
-                let exitPrice = 0;
-                // relay 실시간가를 우선 시도 - 키움 TR 초당1건 제한 없이 즉시 얻을 수 있음
-                try {
-                  const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
-                  const relayData = await relayRes.json();
-                  const q = relayData.stocks && relayData.stocks[w.code];
-                  if (q && q.price) exitPrice = q.price;
-                } catch (e) { /* 아래 폴백으로 진행 */ }
-                if (!exitPrice) {
-                  const token = await kiwoomIssueToken(env);
-                  const quoteRaw = await kiwoomQuote(env, token, w.code);
-                  exitPrice = parseKiwoomQuote(quoteRaw).price || 0;
-                }
-                if (exitPrice > 0 && w.entry_price > 0) {
-                  const pnlPct = ((exitPrice - w.entry_price) / w.entry_price) * 100;
-                  await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
-                  await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[정원초과] [cap20]`);
-                }
-              } catch (e) {
-                // 개별 종목 청산가 조회 실패해도 상한 유지가 더 중요하니 그냥 삭제는 진행
-              }
-              await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
-              await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
-            }
-          }
-
-          if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
+          // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
+          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
+          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
           return Response.json({ ok: true, entryPrice });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -4577,7 +4584,9 @@ self.addEventListener('fetch', (e) => {
           const code = url.searchParams.get("code");
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
-          if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
+          // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
+          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
+          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
           return Response.json({ ok: true });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -4857,7 +4866,9 @@ self.addEventListener('fetch', (e) => {
                   .filter((f) => zeroEntryCodes.has(f.code) && f.price > 0)
                   .map((f) => env.DB.prepare(`UPDATE watchlist SET entry_price = ? WHERE code = ?`).bind(f.price, f.code).run())
               );
-              if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
+              // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
+          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
+          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
             }
           }
 
@@ -6355,29 +6366,17 @@ self.addEventListener('fetch', (e) => {
         await checkWatchlistRiskLevels(env).catch((e) => {
           console.error("관심종목 리스크체크 실패:", e.message || e);
         });
+        await enforceWatchlistCap(env).catch((e) => {
+          console.error("관심종목 상한 정리 실패:", e.message || e);
+        });
         await trackWatchlistPerformance(env).catch((e) => {
           console.error("관심종목 성과추적 실패:", e.message || e);
         });
         await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
-        // 미니차트 KV 캐시 미리 갱신 - 사용자가 페이지를 열 때 KV 미스로 relay를 왕복하는
-        // 일이 없게, 2분마다 이 cron이 미리 relay에서 받아와 KV에 넣어둠.
-        if (env.RELAY_URL && env.RELAY_SECRET && env.CACHE_KV) {
-          try {
-            const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
-            if (mcRes.ok) {
-              const mcData = await mcRes.json();
-              if (mcData.ok) {
-                await env.CACHE_KV.put(
-                  "mini-candles-all-v1",
-                  JSON.stringify({ ok: true, cache: mcData.cache || {} }),
-                  { expirationTtl: 200 }
-                );
-              }
-            }
-          } catch (e) {
-            console.error("미니캔들 KV 프리웜 실패:", e.message || e);
-          }
-        }
+        // 미니차트 KV 프리웜은 제거함 - 2분마다 무조건 KV write가 발생해서(장중 하루 약 200회)
+        // Workers KV 무료 티어 쓰기 한도를 크게 잡아먹던 주된 원인이었음. 클라이언트가 실제로 페이지를
+        // 보고 있을 때만(load() 주기 15초) 호출하는 /api/mini-candles-all의 온디맨드 캐시 채움만으로도
+        // 충분해서, 아무도 안 보고 있을 때까지 미리 채워두는 낭비를 없앰.
       })().catch((e) => {
         console.error("scheduled 정리작업 실패:", e.message || e);
         return logSystemEvent(env, "cron_failure", `정리작업 실패: ${e.message || e}`);
