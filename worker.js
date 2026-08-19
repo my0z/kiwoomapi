@@ -4736,7 +4736,7 @@ self.addEventListener('fetch', (e) => {
           return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
         }
         try {
-          const { items } = await request.json(); // [{code, name, pnlPct}, ...] - relay가 실시간가로 이미 계산해서 보냄
+          const { items } = await request.json(); // [{code, pnlPct}, ...] - relay가 실시간가로 이미 계산해서 보냄
           if (!Array.isArray(items) || !items.length) {
             return Response.json({ ok: true, removed: 0 });
           }
@@ -4744,7 +4744,10 @@ self.addEventListener('fetch', (e) => {
           const details = [];
           for (const it of items) {
             if (typeof it.pnlPct !== "number") continue;
-            if (!(it.pnlPct >= 3.5 || it.pnlPct <= -1.5)) continue; // 조건 재검증 (relay 판단을 신뢰하되 이중확인)
+            // 예전엔 여기서 +3.5%/-1.5% 조건에 걸리는 것만 골라 정리했는데, 그 사이(예: +1.5%) 포지션은
+            // 밤새 그대로 들고 가게 돼서 다음날 개장 갭에 노출되는 문제가 있었음(실측: 09:01 개장 직후
+            // -10%~-5% 대형 손절 무더기 발생). 이제 relay가 보내는 관심종목 전량을 조건과 무관하게
+            // 무조건 청산함 - 이 시스템은 애초에 장중 데이트레이딩 전제라 밤을 넘기지 않는 게 원칙.
             const w = await env.DB.prepare(
               `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
             )
@@ -4753,16 +4756,15 @@ self.addEventListener('fetch', (e) => {
             if (!w) continue;
             if (w.entry_price > 0) {
               const exitPrice = w.entry_price * (1 + it.pnlPct / 100);
-              await recordWatchlistExitPerformance(env, w, exitPrice, it.pnlPct);
+              await recordWatchlistExitPerformance(env, w, exitPrice, it.pnlPct); // 라벨(익절삭제/손절삭제)은 실제 부호로 자동 결정됨
             }
             await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(it.code).run();
             await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(it.code).run();
-            const reason = it.pnlPct >= 3.5 ? "익절" : "손절";
-            details.push(`${w.name}(${it.code}) ${it.pnlPct.toFixed(2)}%[${reason}]`);
+            details.push(`${w.name}(${it.code}) ${it.pnlPct.toFixed(2)}%`);
             removed++;
           }
           if (removed > 0) {
-            await logSystemEvent(env, "watchlist_final_sweep", `15:50 일괄정리 ${removed}종목 삭제 - ${details.join(", ")}`);
+            await logSystemEvent(env, "watchlist_final_sweep", `15:50 장마감 일괄청산 ${removed}종목 - ${details.join(", ")}`);
           }
           return Response.json({ ok: true, removed });
         } catch (e) {
