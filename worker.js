@@ -336,23 +336,51 @@ async function enforceWatchlistCap(env) {
   const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
   const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
   if (overCount <= 0) return;
-  const oldestRes = await env.DB.prepare(
-    `SELECT code, name, entry_price, added_at, source_board, added_state
-     FROM watchlist ORDER BY added_at ASC LIMIT ?`
+
+  const allRes = await env.DB.prepare(
+    `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`
   )
-    .bind(overCount)
     .all()
     .catch(() => ({ results: [] }));
-  for (const w of oldestRes.results || []) {
+  const all = allRes.results || [];
+  if (!all.length) return;
+
+  // 전체 종목 실시간가를 relay 호출 한 번으로 일괄 조회 (종목마다 따로 조회하지 않아 훨씬 빠르고 가벼움)
+  let liveStocks = {};
+  try {
+    const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
+    const relayData = await relayRes.json();
+    liveStocks = relayData.stocks || {};
+  } catch (e) { /* 아래에서 종목별 폴백 처리 */ }
+
+  // 가장 오래된 게 아니라 "지금 손익률이 가장 나쁜" 순으로 자름 - 예전엔 added_at 기준이라
+  // 이제 막 상승 중인 젊은 포지션이 익절선 도달 전에 정원초과로 억울하게 끊기는 경우가 있었음
+  // (실측: +1.51% 상태에서 정원초과로 강제청산된 사례 확인됨). 가격 정보가 아예 없는 종목은
+  // 판단 불가하니 가장 나중 순위(맨 뒤)로 미뤄서 우선순위에서 제외.
+  const withPnl = all.map((w) => {
+    const live = liveStocks[w.code];
+    const price = live && live.price ? live.price : 0;
+    const pnlPct = price > 0 && w.entry_price > 0 ? ((price - w.entry_price) / w.entry_price) * 100 : null;
+    return { ...w, livePrice: price, pnlPct };
+  });
+  withPnl.sort((a, b) => {
+    if (a.pnlPct === null && b.pnlPct === null) return 0;
+    if (a.pnlPct === null) return 1; // 가격 모르는 쪽은 뒤로
+    if (b.pnlPct === null) return -1;
+    return a.pnlPct - b.pnlPct; // 손익률 낮은(더 나쁜) 것부터
+  });
+  const victims = withPnl.slice(0, overCount);
+
+  for (const w of victims) {
+    // 삭제 직전 재확인 - 조건검색이 짧은 시간에 여러 종목을 몰아서 담을 때, 여러 요청이 거의
+    // 동시에 이 함수를 실행하면서 서로 읽은 스냅샷이 겹쳐 같은 종목을 중복으로 처리하려던 문제가
+    // 있었음(실측: 한 종목이 같은 초에 10번 연속 "정원초과 삭제" 로그가 찍힘). 이미 다른 요청이
+    // 먼저 지웠다면 여기서 저렴하게 건너뛰어서, 불필요한 시세조회/기록/로그가 중복되지 않게 함.
+    const stillExists = await env.DB.prepare(`SELECT 1 FROM watchlist WHERE code = ?`).bind(w.code).first().catch(() => null);
+    if (!stillExists) continue;
+
     try {
-      let exitPrice = 0;
-      // relay 실시간가를 우선 시도 - 키움 TR 초당1건 제한 없이 즉시 얻을 수 있음
-      try {
-        const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
-        const relayData = await relayRes.json();
-        const q = relayData.stocks && relayData.stocks[w.code];
-        if (q && q.price) exitPrice = q.price;
-      } catch (e) { /* 아래 폴백으로 진행 */ }
+      let exitPrice = w.livePrice;
       if (!exitPrice) {
         const token = await kiwoomIssueToken(env);
         const quoteRaw = await kiwoomQuote(env, token, w.code);
@@ -4316,7 +4344,7 @@ async function computeSignalBacktest(env, tickLimit) {
   const signalNames = [
     "accelerating", "bidTurnedPositive", "cntrStrRising",
     "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
-    "sellReqThinning", "realPullback", "comboBuySignal", "isGoldenTime", "volumeConfirmed", "strongCntrStr",
+    "sellReqThinning", "realPullback", "comboBuySignal", "isGoldenTime", "isLunchLull", "volumeConfirmed", "strongCntrStr",
   ];
   const stats = {};
   signalNames.forEach((name) => {
@@ -4372,6 +4400,13 @@ async function computeSignalBacktest(env, tickLimit) {
           const kst = new Date(new Date(cur.captured_at).getTime() + 9 * 3600 * 1000);
           const m = kst.getUTCHours() * 60 + kst.getUTCMinutes();
           return m >= 9 * 60 && m <= 9 * 60 + 30;
+        })(),
+        // 13:00~14:30 - "점심 이후 거래량 감소·슬리피지 증가 구간이라 매매하지 말라"는 주장을 실측으로
+        // 검증하기 위한 신호. edge가 뚜렷한 음수면 그 주장이 맞는 것이고, 0에 가깝거나 양수면 근거 없음.
+        isLunchLull: (() => {
+          const kst = new Date(new Date(cur.captured_at).getTime() + 9 * 3600 * 1000);
+          const m = kst.getUTCHours() * 60 + kst.getUTCMinutes();
+          return m >= 13 * 60 && m <= 14 * 60 + 30;
         })(),
       };
 
