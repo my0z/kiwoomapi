@@ -389,7 +389,11 @@ async function enforceWatchlistCap(env) {
       if (exitPrice > 0 && w.entry_price > 0) {
         const pnlPct = ((exitPrice - w.entry_price) / w.entry_price) * 100;
         await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
-        await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[정원초과] [cap${WATCHLIST_MAX_SIZE}]`);
+        // daily-stats 카운트는 메시지에 정확히 "[익절]" 문자열이 있는지로 익절/손절을 구분함
+        // (다른 청산 경로: cron/relay와 동일한 형식으로 맞춰야 함 - "[익절·정원초과]"처럼 붙이면
+        // 닫는 대괄호 위치가 달라져서 매칭이 안 됨). 태그를 분리해서 [익절] 단독으로 유지.
+        const reason = pnlPct >= 0 ? "익절" : "손절";
+        await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[${reason}] [정원초과][cap${WATCHLIST_MAX_SIZE}]`);
       }
     } catch (e) {
       // 개별 종목 청산가 조회 실패해도 상한 유지가 더 중요하니 그냥 삭제는 진행
@@ -2921,6 +2925,8 @@ exitListOverlay.addEventListener('click', (e) => {
   if (e.target === exitListOverlay) closeExitListPopup();
 });
 
+let exitListCurrentItems = []; // 클릭 시 openStockModal에 넘길 데이터를 code로 찾기 위한 캐시
+
 function openExitListPopup(type, dateStr) {
   const isProfit = type === 'profit';
   exitListTitle.textContent = (isProfit ? '🔴 오늘 익절 종목' : '🔵 오늘 손절 종목') + (dateStr ? ' (' + dateStr + ')' : '');
@@ -2932,14 +2938,15 @@ function openExitListPopup(type, dateStr) {
     .then(data => {
       if (!data.ok) { exitListBody.innerHTML = '<div class="detailError">불러오기 실패</div>'; return; }
       const list = isProfit ? data.profitList : data.lossList;
+      exitListCurrentItems = list;
       if (!list.length) {
         exitListBody.innerHTML = '<div class="empty">' + (isProfit ? '익절' : '손절') + '된 종목이 없습니다</div>';
         return;
       }
-      exitListBody.innerHTML = list.map(item => {
+      exitListBody.innerHTML = list.map((item, idx) => {
         const pctCls = item.pnlPct >= 0 ? 'up' : 'down';
         const timeLabel = new Date(item.recordedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
-        return '<div class="exitListRow">' +
+        return '<div class="exitListRow clickable" data-idx="' + idx + '">' +
           '<div><div class="exitListName">' + item.name + '</div>' +
           '<div class="exitListMeta">' + item.code + ' · ' + fmt(item.entryPrice) + '원 → ' + fmt(item.exitPrice) + '원 · ' + timeLabel + '</div></div>' +
           '<div class="exitListPct ' + pctCls + '">' + (item.pnlPct >= 0 ? '+' : '') + item.pnlPct.toFixed(2) + '%</div>' +
@@ -2953,6 +2960,22 @@ document.addEventListener('click', (e) => {
   const btn = e.target.closest('.exitCountBtn');
   if (!btn) return;
   openExitListPopup(btn.dataset.type, btn.dataset.date || '');
+});
+
+// 리스트 항목 클릭 -> 다른 화면(관심종목/추천종목 등)과 동일한 종목 상세 모달(차트/뉴스/호가/AI분석)을
+// 그대로 열어줌. exit-list 응답엔 실시간 현재가/등락률/호가잔량이 없으므로 청산가를 현재가 자리에
+// 임시로 넣어두면, 모달이 열리면서 실시간 시세로 바로 갱신되므로 문제없음.
+document.getElementById('exitListBody').addEventListener('click', (e) => {
+  const row = e.target.closest('.exitListRow');
+  if (!row) return;
+  const item = exitListCurrentItems[+row.dataset.idx];
+  if (!item) return;
+  closeExitListPopup();
+  openStockModal({
+    code: item.code, name: item.name,
+    price: item.exitPrice, rate: item.pnlPct,
+    buyReq: 0, selReq: 0,
+  });
 });
 
 // 일별 실현손익 히스토리 - SVG 막대그래프, 외부 라이브러리 없이 자체 렌더링.
@@ -3260,6 +3283,8 @@ function renderDashboard() {
     display:flex; justify-content:space-between; align-items:center;
     padding:10px 4px; border-bottom:1px solid #2a2a2a;
   }
+  .exitListRow.clickable { cursor:pointer; }
+  .exitListRow.clickable:active { background:#2a2a2a; }
   .exitListRow:last-child { border-bottom:none; }
   .exitListName { font-size:14px; color:#eee; }
   .exitListMeta { font-size:11px; color:#888; margin-top:2px; }
@@ -4851,6 +4876,12 @@ self.addEventListener('fetch', (e) => {
             if (w.entry_price > 0) {
               const exitPrice = w.entry_price * (1 + it.pnlPct / 100);
               await recordWatchlistExitPerformance(env, w, exitPrice, it.pnlPct); // 라벨(익절삭제/손절삭제)은 실제 부호로 자동 결정됨
+              // daily-stats의 "익절 X / 손절 Y" 카운트는 kind=watchlist_auto_removed 행만 세는데,
+              // 예전엔 여기서 종목별 개별 로그 없이 요약 로그(watchlist_final_sweep) 하나만 남겨서
+              // 15:50 일괄청산분이 그 카운트에서 통째로 빠지는 불일치가 있었음. 다른 청산 경로(cron/relay/
+              // 정원초과)와 동일하게 종목별로 하나씩 남겨서 집계가 일치하게 함.
+              const reason = it.pnlPct >= 0 ? "익절" : "손절";
+              await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${it.code}) 손익률 ${it.pnlPct.toFixed(2)}% 자동삭제[${reason}] [final-sweep]`);
             }
             await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(it.code).run();
             await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(it.code).run();
