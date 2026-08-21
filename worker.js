@@ -2946,10 +2946,13 @@ function openExitListPopup(type, dateStr) {
       exitListBody.innerHTML = list.map((item, idx) => {
         const pctCls = item.pnlPct >= 0 ? 'up' : 'down';
         const timeLabel = new Date(item.recordedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
-        // 종가 정보 - 청산 후 그 종목이 장 끝날 때까지 어떻게 됐는지 바로 비교할 수 있게 옆에 붙임.
-        // 아직 장중이라 종가 데이터가 없거나(당일 15:36 이전) 수집 실패한 경우 조용히 생략.
+        // 종가 정보 - "손절/익절한 가격 대비 종가가 몇% 더 움직였는지"가 핵심(closeVsExitPct).
+        // 손절 후 종가가 더 내려갔으면 손절이 맞은 선택, 반등했으면 조기손절이었다는 뜻.
+        // 진입가 기준 종가 손익률(closePct, "청산 안 했으면 총 몇%")은 괄호로 보조 표시.
+        // 아직 장중이라 종가 데이터가 없으면(당일 15:36 이전) 조용히 생략.
         const closeHtml = item.closePrice
-          ? ' · 종가 ' + fmt(item.closePrice) + '원(<span class="' + (item.closePct >= 0 ? 'up' : 'down') + '">' + (item.closePct >= 0 ? '+' : '') + item.closePct + '%</span>)'
+          ? ' · 종가 ' + fmt(item.closePrice) + '원 (청산대비 <span class="' + (item.closeVsExitPct >= 0 ? 'up' : 'down') + '">' + (item.closeVsExitPct >= 0 ? '+' : '') + item.closeVsExitPct + '%</span>' +
+            ' · 진입가대비 <span class="' + (item.closePct >= 0 ? 'up' : 'down') + '">' + (item.closePct >= 0 ? '+' : '') + item.closePct + '%</span>)'
           : '';
         return '<div class="exitListRow clickable" data-idx="' + idx + '">' +
           '<div><div class="exitListName">' + item.name + '</div>' +
@@ -6404,6 +6407,9 @@ self.addEventListener('fetch', (e) => {
               it.closePrice = closePrice || null;
               // 종가 기준 손익률도 같이 계산 - "청산 안 하고 그냥 뒀으면 어땠을지" 바로 비교 가능하게
               it.closePct = closePrice && it.entryPrice > 0 ? +(((closePrice - it.entryPrice) / it.entryPrice) * 100).toFixed(2) : null;
+              // 청산가 대비 종가 변동률 - "손절/익절한 그 시점 이후로 얼마나 더 움직였는지"를 바로 보여줌.
+              // 예: 손절 후 종가가 더 내려갔으면 손절이 잘한 선택, 오히려 반등했으면 조기손절이었다는 뜻.
+              it.closeVsExitPct = closePrice && it.exitPrice > 0 ? +(((closePrice - it.exitPrice) / it.exitPrice) * 100).toFixed(2) : null;
             }
           }
 
