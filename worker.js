@@ -6295,8 +6295,27 @@ self.addEventListener('fetch', (e) => {
             const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
             startKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
           }
+          const dateKey = startKst.toISOString().slice(0, 10);
+
+          // 짧은 캐시(20초) - 팝업을 여러 번 열어도 그 사이엔 D1을 다시 안 탐. 오늘 날짜는 계속
+          // 갱신되니 짧게, 지난 날짜는 어차피 안 바뀌니 길게 캐싱함.
+          const isToday = dateKey === new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+          const CACHE_KEY = "exit-list-v1-" + dateKey;
+          if (env.CACHE_KV) {
+            const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
+            if (cached) return Response.json(cached);
+          }
+
           const startUtc = new Date(startKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
           const endUtc = new Date(startKst.getTime() - 9 * 60 * 60 * 1000 + 24 * 60 * 60 * 1000).toISOString();
+
+          // recorded_at 범위조회에 쓸 인덱스 - 없으면 매번 watchlist_performance 전체를 스캔하게 돼서
+          // (예전에 snapshots 테이블에서 LIKE 프리픽스매칭 때문에 D1 read가 폭증했던 것과 같은 유형의
+          // 문제) 팝업이 느려지는 주된 원인이었을 가능성이 큼. IF NOT EXISTS라 최초 1회 이후는
+          // 사실상 무비용 - 매 요청마다 실행해도 안전함.
+          await env.DB.prepare(
+            `CREATE INDEX IF NOT EXISTS idx_wp_recorded ON watchlist_performance (horizon_min, recorded_at)`
+          ).run().catch(() => {});
 
           const res = await env.DB.prepare(
             `SELECT code, name, entry_price, later_price, pnl_pct, added_state, source_board, recorded_at
@@ -6321,14 +6340,20 @@ self.addEventListener('fetch', (e) => {
             // 둘 다 아니면(자연 30분 관찰 종료 등) 팝업 목적과 무관하므로 제외
           }
 
-          return Response.json({
+          const payload = {
             ok: true,
-            date: startKst.toISOString().slice(0, 10),
+            date: dateKey,
             profitCount: profitList.length,
             lossCount: lossList.length,
             profitList,
             lossList,
-          });
+          };
+          if (env.CACHE_KV) {
+            ctx.waitUntil(
+              env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: isToday ? 20 : 3600 }).catch(() => {})
+            );
+          }
+          return Response.json(payload);
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
