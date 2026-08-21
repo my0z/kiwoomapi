@@ -2886,10 +2886,14 @@ function loadWatchlistDailyStats() {
       if (!data.ok) { tag.style.visibility = 'hidden'; topBar.style.visibility = 'hidden'; return; }
       const netWon = data.netWon || 0;
       const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
-      const dateLabel = (data.statsDate && data.statsDate !== 'today') ? '(' + data.statsDate + ' 기준) ' : '';
+      // 팝업이 daily-stats와 같은 날짜를 보도록 statsDate를 그대로 넘김 (statsDate가 'today'면
+      // 팝업 쪽에서 date 파라미터 없이 오늘로 조회)
+      const popupDate = (data.statsDate && data.statsDate !== 'today') ? data.statsDate : '';
+      const dateLabel = popupDate ? '(' + popupDate + ' 기준) ' : '';
       tag.innerHTML =
         dateLabel + '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
-        ' (<span style="color:#e03131">익절 ' + (data.removedProfit || 0) + '</span> / <span style="color:#1971c2">손절 ' + (data.removedLoss || 0) + '</span>)' +
+        ' (<span class="exitCountBtn" data-type="profit" data-date="' + popupDate + '" style="color:#e03131">익절 ' + (data.removedProfit || 0) + '</span> / ' +
+        '<span class="exitCountBtn" data-type="loss" data-date="' + popupDate + '" style="color:#1971c2">손절 ' + (data.removedLoss || 0) + '</span>)' +
         ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
         ' (<span style="color:#e03131">익 +' + (data.profitWon || 0).toLocaleString() + '</span> / <span style="color:#1971c2">손 ' + (data.lossWon || 0).toLocaleString() + '</span>)';
       tag.style.visibility = 'visible';
@@ -2903,6 +2907,53 @@ function loadWatchlistDailyStats() {
 }
 loadWatchlistDailyStats();
 setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadWatchlistDailyStats(); }, 5000); // 5초마다 - 관심종목 자동삭제(익절/손절/정원초과)가 일어나는 즉시에 가깝게 반영
+
+// 익절/손절 카운트 버튼 - 눌렀을 때 그날 실제로 익절/손절된 종목 목록을 팝업으로 보여줌
+const exitListOverlay = document.getElementById('exitListOverlay');
+const exitListTitle = document.getElementById('exitListTitle');
+const exitListBody = document.getElementById('exitListBody');
+
+function closeExitListPopup() {
+  exitListOverlay.classList.remove('open');
+}
+document.getElementById('exitListClose').addEventListener('click', closeExitListPopup);
+exitListOverlay.addEventListener('click', (e) => {
+  if (e.target === exitListOverlay) closeExitListPopup();
+});
+
+function openExitListPopup(type, dateStr) {
+  const isProfit = type === 'profit';
+  exitListTitle.textContent = (isProfit ? '🔴 오늘 익절 종목' : '🔵 오늘 손절 종목') + (dateStr ? ' (' + dateStr + ')' : '');
+  exitListBody.innerHTML = '<div class="detailLoading">불러오는 중...</div>';
+  exitListOverlay.classList.add('open');
+  const qs = dateStr ? ('?date=' + encodeURIComponent(dateStr)) : '';
+  fetch('/api/watchlist-exit-list' + qs)
+    .then(res => res.json())
+    .then(data => {
+      if (!data.ok) { exitListBody.innerHTML = '<div class="detailError">불러오기 실패</div>'; return; }
+      const list = isProfit ? data.profitList : data.lossList;
+      if (!list.length) {
+        exitListBody.innerHTML = '<div class="empty">' + (isProfit ? '익절' : '손절') + '된 종목이 없습니다</div>';
+        return;
+      }
+      exitListBody.innerHTML = list.map(item => {
+        const pctCls = item.pnlPct >= 0 ? 'up' : 'down';
+        const timeLabel = new Date(item.recordedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+        return '<div class="exitListRow">' +
+          '<div><div class="exitListName">' + item.name + '</div>' +
+          '<div class="exitListMeta">' + item.code + ' · ' + fmt(item.entryPrice) + '원 → ' + fmt(item.exitPrice) + '원 · ' + timeLabel + '</div></div>' +
+          '<div class="exitListPct ' + pctCls + '">' + (item.pnlPct >= 0 ? '+' : '') + item.pnlPct.toFixed(2) + '%</div>' +
+          '</div>';
+      }).join('');
+    })
+    .catch(() => { exitListBody.innerHTML = '<div class="detailError">요청 오류</div>'; });
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.exitCountBtn');
+  if (!btn) return;
+  openExitListPopup(btn.dataset.type, btn.dataset.date || '');
+});
 
 // 일별 실현손익 히스토리 - SVG 막대그래프, 외부 라이브러리 없이 자체 렌더링.
 // PC(hover)/모바일(tap) 둘 다 지원하도록 각 막대에 마우스/터치 이벤트를 이벤트 위임으로 붙임(.pnlBarHit).
@@ -3180,6 +3231,39 @@ function renderDashboard() {
   .empty { color:#666; padding:12px 0; }
   tr.clickable { cursor:pointer; }
   tr.clickable:active { background:#2a2a2a; }
+
+  /* 익절/손절 카운트 버튼 */
+  .exitCountBtn {
+    cursor:pointer; text-decoration:underline dotted; padding:1px 2px; border-radius:4px;
+  }
+  .exitCountBtn:active { background:rgba(255,255,255,0.12); }
+
+  /* 익절/손절 리스트 팝업 */
+  #exitListOverlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
+    z-index:105; align-items:flex-end; justify-content:center;
+  }
+  #exitListOverlay.open { display:flex; }
+  #exitListBox {
+    background:#1c1c1c; width:100%; max-width:420px; max-height:78vh; overflow-y:auto;
+    border-radius:16px 16px 0 0; padding:16px 16px 20px; animation:slideUp .15s ease-out;
+  }
+  .exitListHeadRow { display:flex; align-items:center; margin-bottom:10px; }
+  #exitListTitle { margin:0; font-size:17px; font-weight:700; flex:1; }
+  #exitListClose {
+    color:#888; font-size:20px; cursor:pointer;
+    display:inline-flex; align-items:center; justify-content:center;
+    min-width:36px; min-height:36px;
+  }
+  #exitListClose:active { color:#eee; }
+  .exitListRow {
+    display:flex; justify-content:space-between; align-items:center;
+    padding:10px 4px; border-bottom:1px solid #2a2a2a;
+  }
+  .exitListRow:last-child { border-bottom:none; }
+  .exitListName { font-size:14px; color:#eee; }
+  .exitListMeta { font-size:11px; color:#888; margin-top:2px; }
+  .exitListPct { font-size:15px; font-weight:700; text-align:right; white-space:nowrap; }
 
   /* 모달 */
   #modalOverlay {
@@ -3547,6 +3631,16 @@ function renderDashboard() {
     </div>
     <div id="conditionDockBody">
       <table id="conditionList"><tbody><tr><td class="empty">감시 중...</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <div id="exitListOverlay">
+    <div id="exitListBox">
+      <div class="exitListHeadRow">
+        <h3 id="exitListTitle">-</h3>
+        <span id="exitListClose">✕</span>
+      </div>
+      <div id="exitListBody"></div>
     </div>
   </div>
 
@@ -6187,6 +6281,59 @@ self.addEventListener('fetch', (e) => {
       }
 
       // 오늘 관심종목 추가/자동삭제 건수 - 관심종목 패널 헤더에 표시용
+      // 오늘(또는 지정 날짜) 익절/손절된 종목 상세 목록 - 화면 상단 "익절 X / 손절 Y" 버튼을
+      // 눌렀을 때 뜨는 팝업용. daily-stats의 요약 숫자와 같은 데이터 소스(watchlist_performance)를
+      // 쓰고, 실제 손익 부호로 기록된 라벨(익절삭제/손절삭제 - 예전 라벨링 버그 수정본)로 구분함.
+      if (url.pathname === "/api/watchlist-exit-list") {
+        try {
+          const dateParam = url.searchParams.get("date"); // YYYY-MM-DD(KST 기준), 없으면 오늘
+          let startKst;
+          if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+            const [y, m, d] = dateParam.split("-").map(Number);
+            startKst = new Date(Date.UTC(y, m - 1, d));
+          } else {
+            const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+            startKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
+          }
+          const startUtc = new Date(startKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
+          const endUtc = new Date(startKst.getTime() - 9 * 60 * 60 * 1000 + 24 * 60 * 60 * 1000).toISOString();
+
+          const res = await env.DB.prepare(
+            `SELECT code, name, entry_price, later_price, pnl_pct, added_state, source_board, recorded_at
+             FROM watchlist_performance
+             WHERE horizon_min = 30 AND recorded_at >= ? AND recorded_at < ?
+             ORDER BY recorded_at DESC`
+          )
+            .bind(startUtc, endUtc)
+            .all();
+
+          const profitList = [], lossList = [];
+          for (const r of res.results || []) {
+            if (Math.abs(r.pnl_pct) > 40) continue; // 진입가 오류 의심 이상치 제외 (다른 리포트와 동일 기준)
+            const state = r.added_state || "";
+            const item = {
+              code: r.code, name: r.name,
+              entryPrice: r.entry_price, exitPrice: r.later_price,
+              pnlPct: r.pnl_pct, sourceBoard: r.source_board, recordedAt: r.recorded_at,
+            };
+            if (state.includes("익절삭제")) profitList.push(item);
+            else if (state.includes("손절삭제")) lossList.push(item);
+            // 둘 다 아니면(자연 30분 관찰 종료 등) 팝업 목적과 무관하므로 제외
+          }
+
+          return Response.json({
+            ok: true,
+            date: startKst.toISOString().slice(0, 10),
+            profitCount: profitList.length,
+            lossCount: lossList.length,
+            profitList,
+            lossList,
+          });
+        } catch (e) {
+          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/watchlist-daily-stats") {
         try {
           async function computeStatsFor(startUtc, endUtc) {
