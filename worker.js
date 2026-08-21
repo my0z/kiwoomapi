@@ -2951,7 +2951,7 @@ function openExitListPopup(type, dateStr) {
         // 진입가 기준 종가 손익률(closePct, "청산 안 했으면 총 몇%")은 괄호로 보조 표시.
         // 아직 장중이라 종가 데이터가 없으면(당일 15:36 이전) 조용히 생략.
         const closeHtml = item.closePrice
-          ? ' · 종가 ' + fmt(item.closePrice) + '원 (청산대비 <span class="' + (item.closeVsExitPct >= 0 ? 'up' : 'down') + '">' + (item.closeVsExitPct >= 0 ? '+' : '') + item.closeVsExitPct + '%</span>' +
+          ? '<br>종가 ' + fmt(item.closePrice) + '원 (청산대비 <span class="' + (item.closeVsExitPct >= 0 ? 'up' : 'down') + '">' + (item.closeVsExitPct >= 0 ? '+' : '') + item.closeVsExitPct + '%</span>' +
             ' · 진입가대비 <span class="' + (item.closePct >= 0 ? 'up' : 'down') + '">' + (item.closePct >= 0 ? '+' : '') + item.closePct + '%</span>)'
           : '';
         return '<div class="exitListRow clickable" data-idx="' + idx + '">' +
