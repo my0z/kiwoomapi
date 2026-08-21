@@ -2946,9 +2946,14 @@ function openExitListPopup(type, dateStr) {
       exitListBody.innerHTML = list.map((item, idx) => {
         const pctCls = item.pnlPct >= 0 ? 'up' : 'down';
         const timeLabel = new Date(item.recordedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+        // 종가 정보 - 청산 후 그 종목이 장 끝날 때까지 어떻게 됐는지 바로 비교할 수 있게 옆에 붙임.
+        // 아직 장중이라 종가 데이터가 없거나(당일 15:36 이전) 수집 실패한 경우 조용히 생략.
+        const closeHtml = item.closePrice
+          ? ' · 종가 ' + fmt(item.closePrice) + '원(<span class="' + (item.closePct >= 0 ? 'up' : 'down') + '">' + (item.closePct >= 0 ? '+' : '') + item.closePct + '%</span>)'
+          : '';
         return '<div class="exitListRow clickable" data-idx="' + idx + '">' +
           '<div><div class="exitListName">' + item.name + '</div>' +
-          '<div class="exitListMeta">' + item.code + ' · ' + fmt(item.entryPrice) + '원 → ' + fmt(item.exitPrice) + '원 · ' + timeLabel + '</div></div>' +
+          '<div class="exitListMeta">' + item.code + ' · ' + fmt(item.entryPrice) + '원 → ' + fmt(item.exitPrice) + '원 · ' + timeLabel + closeHtml + '</div></div>' +
           '<div class="exitListPct ' + pctCls + '">' + (item.pnlPct >= 0 ? '+' : '') + item.pnlPct.toFixed(2) + '%</div>' +
           '</div>';
       }).join('');
@@ -6369,6 +6374,37 @@ self.addEventListener('fetch', (e) => {
             if (state.includes("익절삭제")) profitList.push(item);
             else if (state.includes("손절삭제")) lossList.push(item);
             // 둘 다 아니면(자연 30분 관찰 종료 등) 팝업 목적과 무관하므로 제외
+          }
+
+          // 종목별 그날 종가를 붙임 - snapshots 테이블의 그날 마지막 시세를 종가로 사용.
+          // 15:36에 전종목 종가를 한 번 일괄수집(final-quotes)해두므로, 5~15% 밴드를 이미
+          // 이탈해서 평소엔 snapshots에 안 남는 종목도 그 시점 데이터는 확보돼 있음.
+          const allItems = [...profitList, ...lossList];
+          if (allItems.length) {
+            const codes = [...new Set(allItems.map((it) => it.code))];
+            const closeMap = new Map();
+            for (let i = 0; i < codes.length; i += 60) {
+              const chunk = codes.slice(i, i + 60);
+              const ph = chunk.map(() => "?").join(",");
+              const closeRes = await env.DB.prepare(
+                `SELECT code, price, captured_at FROM snapshots
+                 WHERE code IN (${ph}) AND captured_at >= ? AND captured_at < ?
+                 ORDER BY captured_at DESC`
+              )
+                .bind(...chunk, startUtc, endUtc)
+                .all()
+                .catch(() => ({ results: [] }));
+              // captured_at DESC 정렬이라 코드별로 처음 만나는 행이 그날 마지막(=종가) 시세
+              for (const r of closeRes.results || []) {
+                if (!closeMap.has(r.code)) closeMap.set(r.code, r.price);
+              }
+            }
+            for (const it of allItems) {
+              const closePrice = closeMap.get(it.code);
+              it.closePrice = closePrice || null;
+              // 종가 기준 손익률도 같이 계산 - "청산 안 하고 그냥 뒀으면 어땠을지" 바로 비교 가능하게
+              it.closePct = closePrice && it.entryPrice > 0 ? +(((closePrice - it.entryPrice) / it.entryPrice) * 100).toFixed(2) : null;
+            }
           }
 
           const payload = {
