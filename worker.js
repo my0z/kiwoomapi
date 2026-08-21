@@ -1,6626 +1,4758 @@
-/**
- * 키움 REST API 기반 5~15% 상승 종목 스크리너
- * - cron으로 키움 ka10027(전일대비등락률상위요청)을 호출해 KOSPI/KOSDAQ 5~15% 구간 종목을 D1에 저장
- * - / 로 접속하면 대시보드 표시 (최상단: 5연속/3연속 상승, 그 아래: 직전 대비 TOP5, 전체 목록)
- * - 예전엔 네이버 금융 페이지를 스크래핑했으나, 네이버가 Cloudflare 계열 IP를 차단하는 것으로
- *   보여 키움 REST API(시세조회 TR)로 전환함. 매수/매도 주문에 쓰던 앱키/시크릿을 그대로 재사용.
- *
- * 배포: GitHub 연동 (Cloudflare Workers Builds) 사용
- * - wrangler.toml 에 D1 바인딩 / cron 트리거가 정의되어 있음
- * - D1 스키마(snapshots 테이블)는 별도 schema.sql로 미리 생성해둘 것
- * - KIWOOM_APP_KEY / KIWOOM_APP_SECRET 시크릿 필요 (Cloudflare 대시보드에서 Secret으로 등록)
- *
- * Cron (UTC 기준, 평일 KST 09:01~15:15 커버):
- *   2분 간격으로 실행 (UTC 0-6시 범위, 실제 경계는 isMarketHoursKST()에서 처리)
- *   (키움 TR 초당1건 제한에는 여유있게 안 걸림. D1 무료플랜 일 5만건 쓰기 제한 감안한 값)
- * (코드 안에서도 09:01~15:15 KST가 아니면 스킵하므로 이중 안전장치)
- */
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
-import { unzipSync } from "fflate";
-
-const MIN_RATE = 5;
-const MAX_RATE = 15;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ---------- 일반종목 필터 (ETF/ETN/인버스/레버리지 등 제외) ----------
-const NON_STOCK_KEYWORD = /(ETN|ETF|인버스|레버리지|선물|커버드콜|합성|파생결합|TDF|액티브|스팩|리츠|맥쿼리인프라)/i;
-const ETF_BRAND_PREFIX =
-  /^(KODEX|TIGER|KBSTAR|KIWOOM|ACE|SOL|RISE|PLUS|HANARO|KOSEF|KINDEX|TIMEFOLIO|마이다스|파워|WOORI|히어로즈|신한|대신|KTOP|FOCUS|네비게이터|파빌리온|우리|코세프|VITA|1Q|삼성|미래에셋|한투|마이티|WON|IBK|메리츠)\s?[0-9A-Za-z가-힣]*(200|100|150|300|배당|채권|국고채|MSCI|합성)/i;
-
-function isRegularStock(name) {
-  if (!name) return false;
-  if (NON_STOCK_KEYWORD.test(name)) return false;
-  if (ETF_BRAND_PREFIX.test(name)) return false;
-  return true;
-}
-
-// ---------- 키움 REST API: 등락률 상위 조회 (ka10027) ----------
-// mrktTp: "001"=코스피, "101"=코스닥
-async function kiwoomRankingUp(env, token, mrktTp) {
-  const res = await kiwoomRelayFetch(env, "/api/dostk/rkinfo", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      authorization: `Bearer ${token}`,
-      "cont-yn": "N",
-      "next-key": "",
-      "api-id": "ka10027", // 전일대비등락률상위요청
-    },
-    body: JSON.stringify({
-      mrkt_tp: mrktTp,
-      sort_tp: "1", // 1: 상승률
-      trde_qty_cnd: "0000", // 거래량조건: 전체조회
-      updown_incls: "1", // 상하한 포함
-      stk_cnd: "0", // 종목조건: 전체조회
-      crd_cnd: "0", // 신용조건: 전체조회
-      pric_cnd: "0", // 가격조건: 전체조회
-      trde_prica_cnd: "0", // 거래대금조건: 전체조회
-      flu_cnd: "1", // 등락구분: 상승
-      stex_tp: "3", // 거래소구분: 통합
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok || data.return_code !== 0) {
-    throw new Error(`ka10027 실패(mrkt_tp=${mrktTp}): ${JSON.stringify(data)}`);
+// worker.js
+var CF_ACCOUNT_ID = "709dcc6af36c8ee7b6d3d99e7a9fe422";
+var CF_AI_GATEWAY = "yzusb";
+var STYLE = `
+  :root{
+    --bg:#FFF9F6; --surface:#FDEFE9; --border:#F3DDD4;
+    --accent:#FF7A85; --accent-text:#E85C6B; --amber:#FFC65C; --amber-text:#C98A1F;
+    --green:#5FD9A8; --green-text:#2FA97A; --lav:#B9A6F5;
+    --text:#3A2E2A; --muted:#9C8B85; --ink-chip:#3A2E2A;
   }
-  return data;
-}
-
-// 응답에서 return_code/return_msg를 제외한 첫 배열 필드를 데이터로 간주 후 필드명 유연 매핑
-function parseKiwoomRankingRows(json) {
-  let rows = [];
-  for (const key of Object.keys(json)) {
-    if (Array.isArray(json[key])) {
-      rows = json[key];
-      break;
-    }
+  *{box-sizing:border-box;}
+  body{
+    background:var(--bg); color:var(--text); margin:0;
+    font-family:'Inter',system-ui,-apple-system,sans-serif;
+    line-height:1.6;
   }
-  return rows
-    .map((row) => {
-      const code = (row.stk_cd || row.stk_no || "").split("_")[0];
-      const name = row.stk_nm || row.stk_name || "";
-      const price =
-        Math.abs(parseInt(String(row.cur_prc ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
-      const rate = parseFloat(row.flu_rt ?? row.updn_rt ?? "0") || 0;
-      const volume =
-        Math.abs(
-          parseInt(String(row.now_trde_qty ?? row.trde_qty ?? "0").replace(/[^\d-]/g, ""), 10)
-        ) || 0;
-      const cntrStr = parseFloat(row.cntr_str ?? "0") || 0; // 체결강도 (100 초과: 매수세 우위)
-      const buyReq =
-        Math.abs(parseInt(String(row.buy_req ?? "0").replace(/[^\d-]/g, ""), 10)) || 0; // 매수잔량
-      const selReq =
-        Math.abs(parseInt(String(row.sel_req ?? "0").replace(/[^\d-]/g, ""), 10)) || 0; // 매도잔량
-      return { code, name, price, rate, volume, cntrStr, buyReq, selReq };
-    })
-    .filter((r) => r.code);
-}
+  .mono{ font-family:'IBM Plex Mono',monospace; }
+  h1,h2,h3{ font-family:'Space Grotesk',sans-serif; letter-spacing:-0.02em; margin:0; }
+  a{ color:inherit; text-decoration:none; }
+  .wrap{ max-width:1200px; margin:0 auto; padding:0 24px; }
+  .top-banner{
+    display:block; position:relative; max-width:1200px; margin:10px auto 0; padding:0 24px;
+  }
+  .top-banner-inner{
+    position:relative; display:block; height:150px; border-radius:22px; overflow:hidden;
+    text-decoration:none; color:#fff; box-shadow:0 10px 28px rgba(58,46,42,0.18);
+  }
+  .top-banner-bg{
+    position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+    filter:brightness(0.6) saturate(1.15);
+    transform:scale(1.02); transition:transform 0.5s ease;
+  }
+  .top-banner-inner:hover .top-banner-bg{ transform:scale(1.08); }
+  .top-banner-fg{
+    position:absolute; right:20px; top:0; bottom:0; height:100%; width:auto; max-width:60%;
+    object-fit:contain; filter:drop-shadow(0 14px 22px rgba(0,0,0,0.38));
+  }
+  .top-banner-scrim{
+    position:absolute; inset:0;
+    background:linear-gradient(100deg, rgba(58,46,42,0.78) 0%, rgba(58,46,42,0.55) 38%, rgba(58,46,42,0.08) 75%);
+  }
+  .top-banner-info{
+    position:absolute; inset:0; display:flex; flex-direction:column; justify-content:center; gap:8px;
+    padding:18px 24px;
+  }
+  .top-banner-eyebrow{
+    font-family:'Gaegu',cursive; font-size:13px; font-weight:700; letter-spacing:0.01em;
+    color:#fff; background:var(--accent); display:inline-flex; width:fit-content;
+    padding:4px 11px; border-radius:100px; box-shadow:0 3px 8px rgba(255,122,133,0.4);
+  }
+  .top-banner-title{
+    font-family:'Jua',sans-serif; font-weight:600; font-size:19px; line-height:1.3; max-width:520px;
+    overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    text-shadow:0 2px 8px rgba(0,0,0,0.3);
+  }
+  .top-banner-info .price-tag{ width:fit-content; }
+  @media(max-width:680px){
+    .top-banner{ padding:0 16px; }
+    .top-banner-inner{ height:128px; border-radius:18px; }
+    .top-banner-info{ padding:14px 16px; gap:6px; }
+    .top-banner-title{ font-size:15px; max-width:78%; -webkit-line-clamp:2; }
+    .top-banner-eyebrow{ font-size:10px; padding:3px 9px; }
+    .top-banner-fg{ max-width:48%; right:12px; }
+  }
+  header.site{ border-bottom:1px solid var(--border); padding:20px 0; }
+  header.site .wrap{ display:flex; justify-content:space-between; align-items:center; }
+  .logo{ font-family:'Jua',sans-serif; font-weight:600; font-size:21px; display:flex; align-items:center; gap:8px; letter-spacing:-0.01em; }
+  .logo span{ color:var(--accent); }
+  .logo-icon{ display:flex; align-items:center; justify-content:center; }
+  .hero{
+    position:relative; padding:44px 0 54px; border-bottom:1px solid var(--border);
+    background-image: radial-gradient(var(--border) 1.5px, transparent 1.5px);
+    background-size: 24px 24px;
+    background-position: -8px -8px;
+  }
+  .hero .wrap{ position:relative; }
+  .hero .eyebrow{
+    font-family:'IBM Plex Mono',monospace; font-size:12px; font-weight:600; letter-spacing:0.08em;
+    color:#fff; background:var(--accent); text-transform:uppercase; margin-bottom:16px;
+    display:inline-block; padding:5px 12px; border-radius:100px; transform:rotate(-1.5deg);
+    box-shadow:0 4px 10px rgba(255,122,133,0.35);
+  }
+  .hero h1{ font-family:'Jua',sans-serif; font-weight:600; font-size:40px; max-width:640px; line-height:1.2; letter-spacing:-0.01em; }
+  .hero p.sub{ color:var(--muted); font-size:16px; margin:16px 0 0; max-width:520px; }
+  .hero .meta-line{
+    margin-top:18px; font-family:'IBM Plex Mono',monospace; font-size:13px; color:var(--muted);
+  }
+  .hero .meta-line b{ color:var(--accent-text); font-weight:700; }
+  .logo.compact .logo-text{ display:none; }
+  @keyframes logoPulse{ 0%,100%{ transform:scale(1) rotate(0deg); } 50%{ transform:scale(1.12) rotate(-6deg); } }
+  .logo.compact .logo-icon{ animation:logoPulse 1.8s ease-in-out infinite; }
+  .index{ padding:16px 0 48px; display:grid; grid-template-columns:repeat(4, 1fr); gap:18px; }
+  .entry{
+    display:flex; flex-direction:column; gap:0; padding:0; position:relative;
+    border:1px solid var(--border); border-radius:20px; overflow:visible; background:var(--bg);
+    box-shadow:0 3px 12px rgba(58,46,42,0.05);
+    transition:transform 0.25s cubic-bezier(.34,1.56,.64,1), box-shadow 0.25s ease, border-color 0.25s ease;
+  }
+  .entry:hover{ transform:translateY(-4px) scale(1.015); box-shadow:0 12px 26px rgba(255,122,133,0.18); border-color:var(--accent); z-index:5; }
+  .entry:first-child{ padding-top:0; }
+  .entry-main{ flex:1; min-width:0; padding:16px 18px 18px; position:relative; }
+  .entry-eyebrow{
+    font-family:'Gaegu',cursive; font-size:13px; color:var(--accent-text); font-weight:700;
+    letter-spacing:0.01em; margin-bottom:10px;
+  }
+  .entry-eyebrow::before{ content:'✦ '; }
+  .entry-title{
+    font-family:'Jua',sans-serif; font-weight:600;
+    font-size:18px; line-height:1.35; color:var(--text); margin:0 0 8px; letter-spacing:-0.005em;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; /* 2줄로 잘라서 카드 높이 통일 */
+  }
+  .entry:hover .entry-title{ color:var(--accent-text); }
+  .entry-excerpt{ color:var(--muted); font-size:14px; line-height:1.6; margin:0 0 10px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .entry-meta{ font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--muted); }
+  .entry-thumb{
+    width:100%; aspect-ratio:16/10; border-radius:20px 20px 0 0;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--surface); overflow:visible; position:relative;
+  }
+  .entry-thumb img{ width:100%; height:100%; object-fit:contain; display:block; position:relative; z-index:1; transition:transform 0.4s cubic-bezier(0.22,1,0.36,1); will-change:transform; }
+  .entry:hover .entry-thumb img{ transform:scale(1.3); }
+  /* 상품이미지 배경 장식 랜덤 변형 — 밋밋함 방지 */
+  .entry-thumb.d1::before{ /* 색종이 흩뿌리기 */
+    content:''; position:absolute; z-index:0; top:14%; left:10%; width:8px; height:8px;
+    background:var(--accent); border-radius:2px; transform:rotate(12deg);
+    box-shadow:
+      145px 42px 0 -1px var(--amber), 58px 92px 0 -2px var(--lav),
+      215px 98px 0 -1px var(--green), 26px 8px 0 -2px var(--amber),
+      188px 12px 0 -1px var(--accent), 100px 130px 0 -2px var(--lav);
+  }
+  .entry-thumb.d2::before{ /* 물결 */
+    content:''; position:absolute; z-index:0; left:0; right:0; bottom:0; height:38%;
+    background:var(--accent); opacity:0.16;
+    clip-path: polygon(0% 45%,8% 32%,16% 48%,24% 62%,32% 48%,40% 32%,48% 48%,56% 62%,64% 48%,72% 32%,80% 48%,88% 62%,96% 48%,100% 38%,100% 100%,0% 100%);
+  }
+  .entry-thumb.d3::before{ /* 블롭 */
+    content:''; position:absolute; z-index:0; width:72%; height:72%; top:14%; left:14%;
+    background:var(--lav); opacity:0.28; border-radius:42% 58% 65% 35%/45% 40% 60% 55%;
+  }
+  .entry-thumb.d4::before{ /* 점선 링 */
+    content:''; position:absolute; z-index:0; width:66%; height:66%; top:17%; left:17%;
+    border:3px dashed var(--accent); opacity:0.32; border-radius:50%;
+  }
+  .entry-thumb.d5::before{ /* 사선무늬 */
+    content:''; position:absolute; inset:0; z-index:0;
+    background:repeating-linear-gradient(45deg, var(--amber) 0, var(--amber) 2px, transparent 2px, transparent 14px);
+    opacity:0.14;
+  }
+  .price-tag{
+    display:inline-flex; align-items:center; gap:5px; background:var(--ink-chip); color:var(--amber);
+    font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:13px; letter-spacing:0.02em;
+    padding:6px 13px; border-radius:100px; position:relative;
+    transform:rotate(-2deg); box-shadow:0 4px 10px rgba(58,46,42,0.25);
+    transition:transform 0.25s cubic-bezier(.34,1.56,.64,1);
+  }
+  .price-tag::before{ content:'✦'; font-size:10px; }
+  .price-tag.deal{ color:var(--green); }
+  /* 가격풍선 모양 랜덤 변형 — 카드마다 다른 실루엣/기울기 */
+  .price-tag.v1{ border-radius:100px; transform:rotate(-3deg); }
+  .price-tag.v2{ border-radius:6px 22px 22px 6px; transform:rotate(2deg); }
+  .price-tag.v3{ border-radius:50% 18px 50% 18px/18px 50% 18px 50%; transform:rotate(-1.5deg); }
+  .price-tag.v4{ border-radius:4px 18px 4px 18px; transform:rotate(4deg); }
+  .price-tag.v5{ border-radius:100px 8px 100px 8px; transform:rotate(-4deg); }
+  /* 말풍선 색깔 랜덤 변형 */
+  .price-tag.c1{ background:var(--ink-chip); color:var(--amber); }
+  .price-tag.c2{ background:var(--accent); color:#fff; }
+  .price-tag.c3{ background:var(--lav); color:#fff; }
+  .price-tag.c4{ background:var(--green); color:#1f4a3a; }
+  .price-tag.c5{ background:var(--amber); color:#5c3d0a; }
+  /* 말풍선 글씨체 랜덤 변형 */
+  .price-tag.f1{ font-family:'IBM Plex Mono',monospace; font-weight:600; letter-spacing:0.02em; }
+  .price-tag.f2{ font-family:'Jua',sans-serif; font-weight:400; letter-spacing:0; font-size:14px; }
+  .price-tag.f3{ font-family:'Gaegu',cursive; font-weight:700; letter-spacing:0; font-size:14px; }
+  .entry-thumb .price-tag{ position:absolute; left:10px; bottom:10px; z-index:1; font-size:12px; }
+  .entry:hover .price-tag{ transform:rotate(3deg) scale(1.08); }
+  @media(max-width:680px){
+    .hero h1{ font-size:34px; }
+    .index{ grid-template-columns:repeat(2, 1fr); gap:14px; }
+    .entry-thumb{ aspect-ratio:1/1; }
+    .entry-thumb img{ object-fit:contain; } /* 잘리지 않고 이미지 전체가 보이게 */
+    .entry-main{ padding:10px 12px 12px; }
+    .entry-eyebrow{ font-size:10px; margin-bottom:6px; }
+    .entry-title{ font-size:15px; line-height:1.35; margin-bottom:6px; }
+    .entry-excerpt{ display:none; } /* 카드 폭이 좁아서 발췌문은 생략 */
+    .entry-meta{ font-size:10px; }
+    .entry-thumb .price-tag{ font-size:11px; padding:4px 9px 4px 14px; left:6px; bottom:6px; }
+    .hero .eyebrow{ font-size:11px; }
+  }
+  .cta{
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+    margin-top:6px; padding:13px 20px;
+    background:var(--accent); color:#fff; font-weight:700; border-radius:100px;
+    text-align:center; font-size:14px; box-shadow:0 6px 16px rgba(255,122,133,0.4);
+    border:none; transition:transform 0.2s cubic-bezier(.34,1.56,.64,1);
+  }
+  .cta:hover{ transform:translateY(-2px) scale(1.03); }
+  .post-body{ padding:44px 0; max-width:720px; }
+  .post-body h1{ font-family:'Jua',sans-serif; font-size:29px; font-weight:600; margin-bottom:8px; letter-spacing:-0.01em; }
+  .post-body .meta{ color:var(--muted); font-size:13px; font-family:'IBM Plex Mono',monospace; margin-bottom:28px; }
+  .post-body h2{ font-family:'Jua',sans-serif; font-size:20px; font-weight:600; margin:32px 0 12px; }
+  .tldr-box{
+    background:var(--surface); border:1.5px solid var(--accent); border-radius:16px;
+    padding:16px 20px; margin:20px 0 28px; position:relative;
+  }
+  .tldr-label{
+    font-family:'Gaegu',cursive; font-weight:700; font-size:14px; color:var(--accent-text);
+    display:block; margin-bottom:6px;
+  }
+  .tldr-box p{ margin:0; font-size:15px; line-height:1.6; font-weight:500; }
+  .faq-section{ margin-top:40px; }
+  .faq-item{
+    border:1px solid var(--border); border-radius:12px; padding:14px 18px; margin-bottom:10px; background:var(--bg);
+  }
+  .faq-item summary{ font-family:'Jua',sans-serif; font-size:15px; cursor:pointer; list-style:none; }
+  .faq-item summary::-webkit-details-marker{ display:none; }
+  .faq-item summary::before{ content:'Q. '; color:var(--accent-text); }
+  .faq-item p{ margin:10px 0 0; color:var(--muted); font-size:14px; line-height:1.6; }
+  .faq-item p::before{ content:'A. '; color:var(--green-text); font-weight:700; }
+  .post-body p{ margin:0 0 16px; color:var(--text); }
+  .product-block{
+    position:relative; overflow:hidden;
+    background:var(--surface); border:1px solid var(--border); border-radius:20px;
+    padding:20px; margin:24px 0; min-height:180px; display:flex; align-items:flex-end;
+  }
+  .product-block:hover{ overflow:visible; z-index:5; }
+  .product-block .thumb{
+    position:absolute; inset:0; width:100%; height:100%; overflow:hidden;
+  }
+  .product-block:hover .thumb{ overflow:visible; }
+  .product-block .thumb-bg{
+    position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+    filter:brightness(0.6) saturate(1.15); transform:scale(1.2);
+  }
+  .product-block .thumb-fg{
+    position:absolute; right:0; top:0; bottom:0; height:100%; width:auto; max-width:85%;
+    object-fit:contain; display:block;
+    filter:drop-shadow(0 14px 22px rgba(0,0,0,0.38));
+    transition:transform 0.35s cubic-bezier(.25,.8,.35,1); transform-origin:bottom right; z-index:2;
+  }
+  .product-block:hover .thumb-fg{ transform:scale(1.35); }
+  .product-block .pb-scrim{
+    position:absolute; inset:0;
+    background:linear-gradient(180deg, rgba(58,46,42,0.05) 0%, rgba(58,46,42,0.45) 55%, rgba(58,46,42,0.82) 100%);
+  }
+  .product-block .pb-info{ position:relative; z-index:1; color:#fff; }
+  .product-block .pb-info h3{ color:#fff; }
+  footer{ border-top:1px solid var(--border); padding:24px 0; color:var(--muted); font-size:13px; }
+  table{ width:100%; border-collapse:collapse; margin-top:20px; }
+  th,td{ text-align:left; padding:10px; border-bottom:1px solid var(--border); font-size:14px; }
+  th{ white-space:nowrap; }
+  .table-scroll{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .table-scroll table{ min-width:640px; margin-top:0; }
+  .table-scroll th:first-child, .table-scroll td:first-child{
+    position:sticky; left:0; background:var(--surface); z-index:2;
+    box-shadow:2px 0 4px rgba(58,46,42,0.08);
+  }
+  button{ background:var(--accent); color:#fff; border:none; padding:10px 18px; border-radius:100px; font-weight:700; cursor:pointer; }
+  button.danger{ background:#F08A8A; color:#fff; }
+  .kenburns-wrap{ overflow:hidden; border-radius:16px; background:#000; }
+  .kenburns-wrap img{ width:100%; height:100%; object-fit:cover; display:block; }
+  .kb1{ animation: kenburns1 4.5s ease-in-out infinite alternate; }
+  .kb2{ animation: kenburns2 4.5s ease-in-out infinite alternate; }
+  .kb3{ animation: kenburns3 4.5s ease-in-out infinite alternate; }
+  .kb4{ animation: kenburns4 4.5s ease-in-out infinite alternate; }
+  @keyframes kenburns1{ 0%{ transform:scale(1) translate(0,0); } 100%{ transform:scale(1.3) translate(-4%,-4%); } }
+  @keyframes kenburns2{ 0%{ transform:scale(1.3) translate(4%,4%); } 100%{ transform:scale(1) translate(0,0); } }
+  @keyframes kenburns3{ 0%{ transform:scale(1) translate(0,0); } 100%{ transform:scale(1.35) translate(4%,-4%); } }
+  @keyframes kenburns4{ 0%{ transform:scale(1.25) translate(-3%,3%); } 100%{ transform:scale(1.05) translate(3%,-3%); } }
+  .privacy-banner{
+    position:fixed; left:0; right:0; bottom:0; z-index:999;
+    background:var(--surface); border-top:1px solid var(--border);
+    padding:16px 20px; display:flex; gap:16px; align-items:center; justify-content:space-between;
+    flex-wrap:wrap; box-shadow:0 -2px 12px rgba(0,0,0,0.06);
+  }
+  .privacy-banner p{ margin:0; font-size:13px; color:var(--muted); line-height:1.5; max-width:760px; }
+  .privacy-banner button{
+    background:var(--accent); color:#fff; border:none; padding:9px 20px; border-radius:6px;
+    font-weight:700; font-size:13px; cursor:pointer; flex-shrink:0;
+  }
+  .privacy-banner.hidden{ display:none; }
 
-async function fetchRiseListKiwoom(env, token, mrktTp, market) {
-  const json = await kiwoomRankingUp(env, token, mrktTp);
-  const rows = parseKiwoomRankingRows(json);
-  return rows
-    .filter((r) => r.rate >= MIN_RATE && r.rate <= MAX_RATE && isRegularStock(r.name))
-    .map((r) => ({ ...r, market }));
-}
+  /* ===== Admin console ===== */
+  .admin-shell{ padding:28px 0 60px; }
+  .admin-topbar{
+    display:flex; justify-content:space-between; align-items:flex-start; gap:20px;
+    flex-wrap:wrap; margin-bottom:20px;
+  }
+  .admin-topbar h2{ font-size:22px; }
+  .admin-topbar .eyebrow{ font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--muted); letter-spacing:0.04em; text-transform:uppercase; margin-bottom:4px; }
+  .admin-stat-strip{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:24px;
+  }
+  .admin-stat{
+    background:var(--surface); border:1px solid var(--border); border-radius:14px;
+    padding:14px 16px; display:flex; flex-direction:column; gap:4px;
+  }
+  .admin-stat .num{ font-family:'Space Grotesk',sans-serif; font-size:24px; font-weight:700; line-height:1; }
+  .admin-stat .label{ font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--muted); }
+  .admin-stat.ok .num{ color:var(--green-text); }
+  .admin-stat.warn .num{ color:#c0392b; }
+  .admin-actions{
+    background:var(--surface); border:1px solid var(--border); border-radius:16px;
+    padding:16px 18px; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:24px;
+  }
+  .admin-actions form{ display:flex; gap:8px; align-items:center; }
+  .admin-actions input[type=text], .admin-actions input[type=url]{
+    padding:9px 12px; border-radius:8px; border:1px solid var(--border);
+    background:var(--bg); color:var(--text); font-size:13px; font-family:'IBM Plex Mono',monospace;
+  }
+  .admin-card{
+    background:var(--surface); border:1px solid var(--border); border-radius:16px;
+    padding:18px 20px; margin-bottom:20px;
+  }
+  .admin-card.alert{ background:#fdecea; border-color:#f5b5ab; }
+  .admin-card-head{
+    display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;
+  }
+  .admin-card-head .title{ font-size:14px; font-weight:700; font-family:'Space Grotesk',sans-serif; }
+  .admin-card.alert .title{ color:#c0392b; }
+  .admin-card table{ margin-top:0; }
+  @keyframes pkwPromote{
+    0%{ box-shadow:0 0 0 0 rgba(255,198,92,0); }
+    30%{ box-shadow:0 0 0 6px rgba(255,198,92,0.55); transform:scale(1.1); }
+    100%{ box-shadow:0 0 0 0 rgba(255,198,92,0); transform:scale(1); }
+  }
+  .pkw-badge.promoted, .purl-badge.promoted{ animation:pkwPromote 0.6s ease-out; }
+`;
+var FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Jua&family=Gaegu:wght@400;700&family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap" onload="this.onload=null;this.rel='stylesheet'"><noscript><link href="https://fonts.googleapis.com/css2?family=Jua&family=Gaegu:wght@400;700&family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet"></noscript>`;
+// ============================================
+// Danawa IT 카테고리 정의
+// ============================================
+const IT_CATEGORIES = [
+  { name: '노트북', cate: 'cate=112758' },
+  { name: '모니터', cate: 'cate=112757' },
+  { name: '스마트폰', cate: 'cate=122515' },
+  { name: '태블릿', cate: 'cate=12210596' },
+  { name: 'SSD', cate: 'cate=112760' },
+  { name: 'CPU', cate: 'cate=112747' },
+  { name: '메인보드', cate: 'cate=112751' },
+  { name: '그래픽카드', cate: 'cate=112753' },
+  { name: '키보드', cate: 'cate=112782' },
+  { name: '이어폰/헤드폰', cate: 'cate=11252453' },
+  { name: '웹캠', cate: 'cate=11253489' },
+  { name: '공유기', cate: 'cate=112804' },
+  { name: '액션캠', cate: 'cate=12237508' },
+  { name: '블루투스스피커', cate: 'cate=12237379' },
+  { name: '드론', cate: 'cate=19217301' },
+  { name: '미니게임기', cate: 'cate=11338109' },
+  { name: '휴대용PC게임기', cate: 'cate=11341228' },
+  { name: '휴대미니프로젝터', cate: 'cate=1032820' },
+  { name: '삼각대셀카봉짐벌', cate: 'cate=12337581' },
+  { name: '홈IP카메라(베이비캠)', cate: 'cate=19327720' },
+  { name: '스마트워치', cate: 'cate=12215657' },
+  { name: '학습/과학완구', cate: 'cate=16322482' }
+];
 
-// ---------- KST 시간 체크 ----------
-function isMarketHoursKST(date) {
-  const kst = new Date(
-    date.toLocaleString("en-US", { timeZone: "Asia/Seoul" })
-  );
-  const day = kst.getDay(); // 0=Sun
-  if (day === 0 || day === 6) return false;
-  const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 46; // 09:01 ~ 15:46 (15:38~46은 놓친 종가 재시도용)
-}
+var HOT_KEYWORDS = [
+  // 현재 인기 플래그십 위주 — 필요시 여기만 수동으로 갱신
+  "아이폰17프로",
+  "아이폰17",
+  "아이폰에어",
+  "갤럭시Z폴드7",
+  "갤럭시Z플립7",
+  "갤럭시S25",
+  "에어팟프로",
+  "갤럭시워치8",
+  "애플워치",
+  "맥북에어",
+  "갤럭시탭S10"
+];
 
-// 15:50 이후 전체 매매(신규 자동편입 + 익절/손절 자동삭제) 중지 - 데이터 조회/표시는 그대로 유지,
-// 실제 매매 관련 로직만 이 시간 이후 멈춤. isMarketHoursKST와 별개로 매매 전용 게이트.
-function isTradingActiveKST(date) {
-  const kst = new Date(
-    date.toLocaleString("en-US", { timeZone: "Asia/Seoul" })
-  );
-  const day = kst.getDay();
-  if (day === 0 || day === 6) return false;
-  const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes < 15 * 60 + 50; // 09:01 ~ 15:50 미만
+var KEYWORDS = [
+  // 오디오
+  "무선이어폰",
+  "블루투스이어폰",
+  "블루투스스피커",
+  "헤드폰",
+  "헤드셋",
+  "사운드바",
+  "게이밍헤드셋",
+  "넥밴드이어폰",
+  "스피커독",
+  "미니스피커",
+  "유선이어폰",
+  "콘덴서마이크",
+  "방송용마이크",
+  // 모바일 액세서리
+  "보조배터리",
+  "무선충전기",
+  "충전기",
+  "폰케이스",
+  "강화유리필름",
+  "차량용거치대",
+  "차량용충전기",
+  "고속충전케이블",
+  "C타입케이블",
+  "젠더",
+  "셀카봉",
+  "스마트폰짐벌",
+  "방수케이스",
+  "폰스트랩",
+  "멀티포트충전기",
+  // PC 주변기기
+  "기계식키보드",
+  "무선마우스",
+  "게이밍마우스",
+  "게이밍키보드",
+  "모니터암",
+  "웹캠",
+  "웹캠거치대",
+  "usb허브",
+  "외장SSD",
+  "외장하드",
+  "usb메모리",
+  "hdmi케이블",
+  "멀티탭",
+  "노트북거치대",
+  "노트북파우치",
+  "마우스패드",
+  "키보드팔레스트",
+  "도킹스테이션",
+  "usb-c허브",
+  "노트북쿨러",
+  "노트북받침대",
+  // 디스플레이/영상
+  "휴대용모니터",
+  "미니빔프로젝터",
+  "게이밍모니터",
+  "터치모니터",
+  "모니터받침대",
+  "hdmi스위치",
+  // 웨어러블
+  "스마트워치",
+  "스마트링",
+  "스마트밴드",
+  "심박측정기",
+  // 태블릿/독서
+  "태블릿거치대",
+  "전자책리더기",
+  "태블릿케이스",
+  "태블릿펜",
+  "필기감펜",
+  // 스마트홈/생활가전
+  "로봇청소기",
+  "무선청소기",
+  "공기청정기",
+  "스마트플러그",
+  "스마트조명",
+  "스마트도어락",
+  "IoT센서",
+  "홈캠",
+  "CCTV",
+  "반려동물카메라",
+  "스마트체중계",
+  "가습기",
+  "제습기",
+  "온습도계",
+  "도어벨카메라",
+  "스마트초인종",
+  "스팀청소기",
+  "무선다리미",
+  "자외선살균기",
+  // 네트워크
+  "와이파이공유기",
+  "유심라우터",
+  "메시공유기",
+  "랜케이블",
+  "스위칭허브",
+  "포켓와이파이",
+  // 게이밍/VR
+  "콘솔게임패드",
+  "VR기기",
+  "게이밍의자",
+  "조이스틱",
+  "게임패드",
+  "콘솔거치대",
+  "게이밍마우스패드",
+  "스트리밍캡처카드",
+  // 카메라
+  "액션캠",
+  "짐벌",
+  "삼각대",
+  "미러리스카메라",
+  "웹캠라이트",
+  "링라이트",
+  "드론",
+  "카메라가방",
+  "ND필터",
+  "카메라스트랩",
+  "짐벌액세서리",
+  // 차량용 전자기기
+  "블랙박스",
+  "차량용무선카플레이",
+  "차량용공기청정기",
+  "타이어공기압측정기",
+  "차량용청소기",
+  "차량용냉장고",
+  "차량용선풍기",
+  "하이패스단말기",
+  // 건강/헬스테크
+  "혈압계",
+  "체온계",
+  "마사지건",
+  "안마기",
+  // 사무/교육 전자기기
+  "라벨프린터",
+  "문서스캐너",
+  "계산기",
+  "전자사전",
+  "화이트보드",
+  // 조명/전기
+  "led스탠드",
+  "무드등",
+  "감성조명",
+  "usb선풍기",
+  // 3D프린팅/DIY
+  "3d프린터",
+  "라즈베리파이",
+  "아두이노",
+  "납땜인두기",
+  "멀티미터",
+  // 추가 오디오/모바일
+  "블루투스리시버",
+  "블루투스송신기",
+  "스마트폰렌즈",
+  // 추가 PC 주변기기
+  "캡처보드",
+  "펜슬케이스",
+  "외장그래픽카드",
+  // 추가 디스플레이
+  "프로젝터스크린",
+  // 추가 웨어러블
+  "스마트글래스",
+  // 추가 생활가전
+  "가습기",
+  "제습기",
+  "온습도계",
+  // 추가 게이밍
+  "게이밍마우스패드",
+  "스트리밍캡처카드",
+  // 추가 카메라
+  "카메라가방",
+  // 추가 차량용
+  "차량용선풍기",
+  "하이패스단말기",
+  // 추가 건강
+  "체지방측정기",
+  "수면측정기",
+  "스마트줄넘기",
+  "스마트요가매트",
+  // 추가 조명
+  "캠핑랜턴",
+  // 추가 오디오
+  "턴테이블",
+  "앰프",
+  "휴대용DAC",
+  "골전도이어폰",
+  // 추가 모바일
+  "스마트폰그립톡",
+  "폰투명케이스",
+  // 추가 PC 주변기기
+  "웹캠커버",
+  "노트북어댑터",
+  // 추가 웨어러블
+  "스마트이어링",
+  // 추가 스마트홈
+  "도어벨카메라",
+  "스마트초인종",
+  "스팀청소기",
+  "무선다리미",
+  "자외선살균기",
+  // 추가 카메라
+  "ND필터",
+  "카메라스트랩",
+  "짐벌액세서리",
+  // 추가 차량용
+  "타이어펌프",
+  "점프스타터",
+  // 추가 사무
+  "문서파쇄기",
+  // 반려동물테크(신규 카테고리)
+  "자동급식기",
+  "스마트급수기",
+  "펫도어락",
+  "펫트래커",
+  // 홈오피스/생산성(신규 카테고리)
+  "스탠딩데스크",
+  "모니터라이트바",
+  "데스크매트",
+  "케이블정리함",
+  "무선프레젠터",
+  // 스트리밍/방송장비(신규 카테고리)
+  "방송용조명",
+  "그린스크린",
+  "마이크암",
+  "팟캐스트믹서",
+  "스트리밍마이크",
+  // 포터블파워(신규 카테고리)
+  "포터블파워스테이션",
+  "태양광충전기",
+  "캠핑용발전기"
+];
+var CATEGORIES = [
+  { slug: "audio", name: "오디오", keywords: ["무선이어폰", "블루투스이어폰", "블루투스스피커", "헤드폰", "헤드셋", "사운드바", "게이밍헤드셋", "넥밴드이어폰", "스피커독", "미니스피커", "유선이어폰", "콘덴서마이크", "방송용마이크", "블루투스리시버", "블루투스송신기", "턴테이블", "앰프", "휴대용DAC", "골전도이어폰"] },
+  { slug: "mobile", name: "모바일 액세서리", keywords: ["보조배터리", "무선충전기", "충전기", "폰케이스", "강화유리필름", "차량용거치대", "차량용충전기", "고속충전케이블", "C타입케이블", "젠더", "셀카봉", "스마트폰짐벌", "방수케이스", "폰스트랩", "멀티포트충전기", "스마트폰렌즈", "스마트폰그립톡", "폰투명케이스"] },
+  { slug: "pc", name: "PC 주변기기", keywords: ["기계식키보드", "무선마우스", "게이밍마우스", "게이밍키보드", "모니터암", "웹캠", "웹캠거치대", "usb허브", "외장SSD", "외장하드", "usb메모리", "hdmi케이블", "멀티탭", "노트북거치대", "노트북파우치", "마우스패드", "키보드팔레스트", "도킹스테이션", "usb-c허브", "노트북쿨러", "노트북받침대", "캡처보드", "펜슬케이스", "외장그래픽카드", "웹캠커버", "노트북어댑터"] },
+  { slug: "display", name: "디스플레이/영상", keywords: ["휴대용모니터", "미니빔프로젝터", "게이밍모니터", "터치모니터", "모니터받침대", "hdmi스위치", "프로젝터스크린"] },
+  { slug: "wearable", name: "웨어러블", keywords: ["스마트워치", "스마트링", "스마트밴드", "심박측정기", "스마트글래스", "스마트이어링"] },
+  { slug: "tablet", name: "태블릿/독서", keywords: ["태블릿거치대", "전자책리더기", "태블릿케이스", "태블릿펜", "필기감펜"] },
+  { slug: "smarthome", name: "스마트홈/생활가전", keywords: ["로봇청소기", "무선청소기", "공기청정기", "스마트플러그", "스마트조명", "스마트도어락", "IoT센서", "홈캠", "CCTV", "반려동물카메라", "스마트체중계", "가습기", "제습기", "온습도계", "도어벨카메라", "스마트초인종", "스팀청소기", "무선다리미", "자외선살균기"] },
+  { slug: "network", name: "네트워크", keywords: ["와이파이공유기", "유심라우터", "메시공유기", "랜케이블", "스위칭허브", "포켓와이파이"] },
+  { slug: "gaming", name: "게이밍/VR", keywords: ["콘솔게임패드", "VR기기", "게이밍의자", "조이스틱", "게임패드", "콘솔거치대", "게이밍마우스패드", "스트리밍캡처카드"] },
+  { slug: "camera", name: "카메라", keywords: ["액션캠", "짐벌", "삼각대", "미러리스카메라", "웹캠라이트", "링라이트", "드론", "카메라가방", "ND필터", "카메라스트랩", "짐벌액세서리"] },
+  { slug: "car", name: "차량용 전자기기", keywords: ["블랙박스", "차량용무선카플레이", "차량용공기청정기", "타이어공기압측정기", "차량용청소기", "차량용냉장고", "차량용선풍기", "하이패스단말기", "타이어펌프", "점프스타터"] },
+  { slug: "health", name: "건강/헬스테크", keywords: ["혈압계", "체온계", "마사지건", "안마기", "체지방측정기", "수면측정기", "스마트줄넘기", "스마트요가매트"] },
+  { slug: "office", name: "사무/교육 전자기기", keywords: ["라벨프린터", "문서스캐너", "계산기", "전자사전", "화이트보드", "문서파쇄기"] },
+  { slug: "lighting", name: "조명/전기", keywords: ["led스탠드", "무드등", "감성조명", "usb선풍기", "캠핑랜턴"] },
+  { slug: "diy", name: "3D프린팅/DIY", keywords: ["3d프린터", "라즈베리파이", "아두이노", "납땜인두기", "멀티미터"] },
+  { slug: "pet", name: "반려동물테크", keywords: ["자동급식기", "스마트급수기", "펫도어락", "펫트래커"] },
+  { slug: "homeoffice", name: "홈오피스/생산성", keywords: ["스탠딩데스크", "모니터라이트바", "데스크매트", "케이블정리함", "무선프레젠터"] },
+  { slug: "streaming", name: "스트리밍/방송장비", keywords: ["방송용조명", "그린스크린", "마이크암", "팟캐스트믹서", "스트리밍마이크"] },
+  { slug: "power", name: "포터블파워", keywords: ["포터블파워스테이션", "태양광충전기", "캠핑용발전기"] }
+];
+function getCategoryBySlug(slug) {
+  return CATEGORIES.find((c) => c.slug === slug) || null;
 }
-
-// 장마감(15:30) 직후, 그 시점 화면에 떠 있던 종목들을 하나씩 정확하게 재조회해서
-// 배치 수집(2분 간격이라 정각과 살짝 어긋날 수 있음)보다 정확한 최종 종가를 남김.
-// ka10027(배치) 대신 종목별 ka10007(개별 시세)이라 초당1건 제한 때문에 종목당 1.1초 걸림.
-// 관심종목이 ATR 기반 손절/익절 라인에 도달했는지 cron이 대신 체크해서 D1에 남김.
-// 원래는 모달을 직접 열어야만 알 수 있었던 것 - watchlist_risk_status 테이블 필요(schema.sql 참고).
-// 관심종목은 보통 소수(몇 개)라 종목당 1.1초 순차조회를 매 틱마다 해도 부담 적음.
-// 관심종목이 손절 등으로 삭제되기 직전에 호출 - 삭제되면 watchlist에서 사라져 trackWatchlistPerformance가
-// 더 이상 추적을 못 하게 되므로, 아직 기록 안 된 horizon(30/60분)에 대해 삭제 시점 가격을 "확정 결과"로 남겨둠.
-// 그래야 performance-report가 "살아남은 것만" 좋게 보이는 왜곡(생존 편향) 없이 실제 승률을 반영함.
-async function recordWatchlistExitPerformance(env, w, exitPrice, actualPnlPct) {
+__name(getCategoryBySlug, "getCategoryBySlug");
+var KEYWORD_ROTATION_MS = 2 * 24 * 60 * 60 * 1e3;
+var ACTIVE_KEYWORD_POOL_SIZE = 10;
+var KEYWORD_USED_TTL_SECONDS = 5 * 24 * 60 * 60;
+var TECH_SIGNAL_WORDS = [
+  "무선",
+  "유선",
+  "블루투스",
+  "충전",
+  "배터리",
+  "usb",
+  "usb-c",
+  "스마트",
+  "전자",
+  "디지털",
+  "이어폰",
+  "헤드폰",
+  "헤드셋",
+  "스피커",
+  "키보드",
+  "마우스",
+  "모니터",
+  "카메라",
+  "캠",
+  "프로젝터",
+  "로봇청소기",
+  "청소기",
+  "와이파이",
+  "공유기",
+  "드론",
+  "프린터",
+  "스캐너",
+  "웹캠",
+  "태블릿",
+  "노트북",
+  "ssd",
+  "hdmi",
+  "케이블",
+  "허브",
+  "거치대",
+  "워치",
+  "가습기",
+  "제습기",
+  "공기청정기",
+  "체중계",
+  "cctv",
+  "도어락",
+  "리더기",
+  "마이크",
+  "앰프",
+  "전동",
+  "led",
+  "ai",
+  "센서",
+  "라우터",
+  "어댑터",
+  "변환기",
+  "충전기",
+  "보조배터리",
+  "스탠드",
+  "조명",
+  "3d프린터",
+  "측정기"
+];
+function isOutdatedProduct(productName) {
+  const name = productName || "";
+  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
+  const currentYear2 = currentYear % 100;
+  const fourDigitMatches = name.match(/\b(19\d{2}|20\d{2})\b/g) || [];
+  for (const y of fourDigitMatches) {
+    if (Number(y) < currentYear) return true;
+  }
+  const twoDigitMatches = name.match(/\b([0-9]{1,2})년/g) || [];
+  for (const raw of twoDigitMatches) {
+    const num = parseInt(raw, 10);
+    if (num >= 10 && num < currentYear2) return true;
+  }
+  return false;
+}
+__name(isOutdatedProduct, "isOutdatedProduct");
+function isTechRelated(productName) {
+  const name = (productName || "").toLowerCase();
+  return TECH_SIGNAL_WORDS.some((w) => name.includes(w));
+}
+__name(isTechRelated, "isTechRelated");
+async function naverAuthHeaders(env, extra = {}) {
+  return {
+    "X-Naver-Client-Id": env.NAVER_CLIENT_ID,
+    "X-Naver-Client-Secret": env.NAVER_CLIENT_SECRET,
+    ...extra
+  };
+}
+__name(naverAuthHeaders, "naverAuthHeaders");
+function stripNaverHtml(s) {
+  return (s || "").replace(/<\/?b>/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
+}
+__name(stripNaverHtml, "stripNaverHtml");
+async function naverShoppingSearch(query, env, display = 15, sort = "sim") {
+  const url = `https://openapi.naver.com/v1/search/shop.json?query=${encodeURIComponent(query)}&display=${display}&sort=${sort}`;
   try {
-    // 실제 손익 부호에 맞는 라벨을 붙임 - 예전엔 익절이든 손절이든 무조건 "손절삭제"로 고정 기록돼서,
-    // performance-report의 bySignal 분류(손절삭제 카테고리)에 익절 종료 건과 손절 종료 건이 뒤섞여
-    // 있었음. avgPnlPct가 실제보다 나빠 보이는 착시를 만들었을 뿐 아니라, 신호별 효과 판단 자체가
-    // 이 오염된 라벨을 근거로 이뤄지고 있었음 - 금액 합계 자체는 안 틀렸지만 분류가 틀렸던 것.
-    const exitLabel = actualPnlPct >= 0 ? "익절삭제" : "손절삭제";
-    for (const horizon of [30, 60]) {
-      const already = await env.DB.prepare(
-        `SELECT 1 FROM watchlist_performance WHERE code = ? AND added_at = ? AND horizon_min = ?`
-      )
-        .bind(w.code, w.added_at, horizon)
-        .first()
-        .catch(() => null);
-      if (already) continue; // 이미 정상 경로로 기록됐으면 덮어쓰지 않음
-      await env.DB.prepare(
-        `INSERT OR REPLACE INTO watchlist_performance
-         (code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          w.code, w.name, w.added_at, horizon, w.entry_price, exitPrice,
-          +actualPnlPct.toFixed(3), w.source_board || "", (w.added_state || "") + "," + exitLabel, new Date().toISOString()
-        )
-        .run()
-        .catch(() => {});
+    const res = await fetch(url, { headers: await naverAuthHeaders(env) });
+    if (!res.ok) {
+      const bodyText = await res.text();
+      return { items: [], error: `HTTP ${res.status}: ${bodyText.slice(0, 200)}` };
     }
+    const data = await res.json();
+    const items = (data.items || []).map((it) => ({
+      name: stripNaverHtml(it.title),
+      lprice: it.lprice,
+      mallName: it.mallName
+    }));
+    return { items, error: null };
   } catch (e) {
-    // 기록 실패해도 삭제 자체는 진행 - 통계 누락보다 손절 지연이 더 나쁨
+    return { items: [], error: e.message };
   }
 }
-
-async function checkWatchlistRiskLevels(env) {
-  if (!isTradingActiveKST(new Date())) return { checked: 0, skipped: "15:50 이후 매매 중지" };
-  const wlRes = await env.DB.prepare(`SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`).all();
-  const items = wlRes.results;
-  if (!items.length) return { checked: 0 };
-
-  const token = await kiwoomIssueToken(env);
-  let checked = 0;
-  const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제 (손절)
-  const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
-  for (const w of items) {
+__name(naverShoppingSearch, "naverShoppingSearch");
+var NAVER_SHOPPING_CID_LIST = [
+  { cid: "50000003", name: "디지털/가전" }
+  // 실제 반환값이 비어있으면 네이버 데이터랩 쇼핑인사이트 분야 코드가 달라진 것 — cid만 교체하면 됨
+];
+async function naverShoppingHotKeywords(env, cid, count = 8) {
+  const today = /* @__PURE__ */ new Date();
+  const endDate = today.toISOString().slice(0, 10);
+  const startDate = new Date(today.getTime() - 6 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  try {
+    const controllerD1 = new AbortController();
+    const timerD1 = setTimeout(() => controllerD1.abort(), 8000);
+    let res;
     try {
-      // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
-      const ohlc = await getCachedDailyOHLC(env, token, w.code);
-      const quoteRaw = await kiwoomQuote(env, token, w.code);
-      const atr = computeATR(ohlc, 14);
-      if (!atr) continue; // ATR 계산 불가 - 아래 finally에서 대기는 그대로 실행됨
-      const quote = parseKiwoomQuote(quoteRaw);
-      // ATR 손절/익절 라인은 진입가(entry_price) 기준으로 계산해야 함.
-      // 예전엔 "현재가 ± ATR"로 계산한 뒤 같은 현재가와 비교해서 항상 false가 되는
-      // 자기참조 버그가 있었음(진입가가 없으면 ATR 라인 자체를 계산하지 않음).
-      let stopLoss = null, takeProfit = null, status = "safe";
-      if (w.entry_price && w.entry_price > 0) {
-        stopLoss = Math.round(w.entry_price - atr * 1.5);
-        takeProfit = Math.round(w.entry_price + atr * 2);
-        if (quote.price <= stopLoss) status = "stop_loss_hit";
-        else if (quote.price >= takeProfit) status = "take_profit_hit";
-      }
-
-      // 손익률 -1.5% 이하(손절) 또는 +1.5% 이상(익절) - 관심종목에서 바로 제거 (risk_status도 같이 정리)
-      if (w.entry_price && w.entry_price > 0) {
-        const pnlPct = ((quote.price - w.entry_price) / w.entry_price) * 100;
-        if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
-          const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
-          // 삭제되면 watchlist에서 사라져서 trackWatchlistPerformance가 못 보게 됨 -
-          // 확정 손익을 먼저 기록해둬야 성과 통계가 "살아남은 것만" 반영하는 왜곡을 피함
-          await recordWatchlistExitPerformance(env, w, quote.price, pnlPct);
-          await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
-          await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
-          await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[${reason}] [cron]`);
-          checked++;
-          continue;
-        }
-      }
-
-      // entry_price가 아직 없어 stopLoss/takeProfit을 계산 못한 틱에는 status/price만 갱신하고
-      // 손절/익절 라인은 기존에 계산해둔 마지막 값을 그대로 유지함(COALESCE) - entry_price가
-      // 나중에 채워지기 전까지 화면에서 라인이 사라졌다 나타났다 깜빡이는 것을 방지.
-      await env.DB.prepare(
-        `INSERT INTO watchlist_risk_status (code, status, price, stop_loss, take_profit, checked_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(code) DO UPDATE SET
-           status = excluded.status, price = excluded.price,
-           stop_loss = COALESCE(excluded.stop_loss, watchlist_risk_status.stop_loss),
-           take_profit = COALESCE(excluded.take_profit, watchlist_risk_status.take_profit),
-           checked_at = excluded.checked_at`
-      )
-        .bind(w.code, status, quote.price, stopLoss, takeProfit, new Date().toISOString())
-        .run();
-      checked++;
-    } catch (e) {
-      // 이 종목만 이번 틱에 실패, 다음 틱에 다시 시도됨
+      res = await fetch("https://openapi.naver.com/v1/datalab/shopping/category/keywords", {
+        method: "POST",
+        headers: await naverAuthHeaders(env, { "Content-Type": "application/json" }),
+        body: JSON.stringify({ startDate, endDate, timeUnit: "date", category: cid, device: "", gender: "", ages: [] }),
+        signal: controllerD1.signal
+      });
     } finally {
-      await sleep(1100); // 키움 TR 초당1건 제한 - continue/에러로 건너뛰지 않도록 finally에 둠
+      clearTimeout(timerD1);
     }
-  }
-  return { checked };
-}
-
-// 관심종목 성과 추적: 담은 시점 이후 30분/60분/장마감에 실제로 어떻게 됐는지 자동 기록.
-// - 목적: source_board/added_state(어느 보드에서, 어떤 신호였는지)와 결과를 묶어서
-//   "어떤 신호가 실제로 돈이 됐는지"를 감이 아니라 본인 데이터로 알 수 있게 하는 것
-// - 추가 키움 조회 없음: 이미 수집된 snapshots에서 해당 시점 가격을 찾아 씀
-//   (밴드 밖으로 나간 종목은 스냅샷이 없을 수 있어 null로 남고, 다음 틱에 다시 시도됨)
-async function trackWatchlistPerformance(env) {
-  const wlRes = await env.DB.prepare(
-    `SELECT code, name, added_at, entry_price, source_board, added_state FROM watchlist WHERE entry_price > 0`
-  ).all();
-  const items = wlRes.results;
-  if (!items.length) return { tracked: 0 };
-
-  const now = Date.now();
-  let tracked = 0;
-  for (const w of items) {
-    const addedMs = new Date(w.added_at).getTime();
-    const elapsedMin = (now - addedMs) / 60000;
-
-    for (const horizon of [30, 60]) {
-      if (elapsedMin < horizon) continue; // 아직 그 시점에 도달 안 함
-      const already = await env.DB.prepare(
-        `SELECT 1 FROM watchlist_performance WHERE code = ? AND added_at = ? AND horizon_min = ?`
-      )
-        .bind(w.code, w.added_at, horizon)
-        .first()
-        .catch(() => null);
-      if (already) continue; // 이미 기록됨
-
-      // 담은 시점 + horizon분 근처의 스냅샷 가격을 찾음 (그 이후 첫 스냅샷)
-      const targetIso = new Date(addedMs + horizon * 60000).toISOString();
-      const row = await env.DB.prepare(
-        `SELECT price, change_rate, captured_at FROM snapshots
-         WHERE code = ? AND captured_at >= ? ORDER BY captured_at ASC LIMIT 1`
-      )
-        .bind(w.code, targetIso)
-        .first()
-        .catch(() => null);
-      if (!row) continue; // 그 시점 데이터 아직 없음(또는 밴드 밖) - 다음 틱에 다시 시도
-
-      const pnlPct = ((row.price - w.entry_price) / w.entry_price) * 100;
-      // 진입가 오류(조회 실패로 엉뚱한 값 저장, 액면분할/거래정지로 가격체계 변경 등)로 생긴 값이
-      // 통계를 통째로 왜곡하는 것을 막기 위해 애초에 기록하지 않음. 5~15% 밴드 종목이 30분 만에
-      // ±40%를 넘는 건 정상적인 시세 변동으로 보기 어려움(상하한가도 30%).
-      if (Math.abs(pnlPct) > 40) {
-        await logSystemEvent(env, "perf_outlier_skipped", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(1)}% - 진입가 ${w.entry_price} 오류 의심으로 성과기록 제외`);
-        continue;
-      }
-      await env.DB.prepare(
-        `INSERT OR REPLACE INTO watchlist_performance
-         (code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          w.code, w.name, w.added_at, horizon, w.entry_price, row.price,
-          +pnlPct.toFixed(3), w.source_board || "", w.added_state || "", new Date().toISOString()
-        )
-        .run()
-        .catch(() => {});
-      tracked++;
+    if (!res.ok) {
+      const bodyText = await res.text();
+      return { keywords: [], error: `HTTP ${res.status}: ${bodyText.slice(0, 200)}` };
     }
-  }
-  return { tracked };
-}
-
-// 조용히 묻히던 수집 실패를 D1에 남겨서 나중에 확인 가능하게 함 (system_events 테이블 필요 - schema.sql 참고)
-// 로깅 자체가 실패해도(테이블 없음 등) 전체 흐름을 막으면 안 되니 조용히 무시
-// 관심종목 화면(클라이언트 computeRealisticPnl)과 정확히 동일한 공식 - 정수 주식 매수, 매수/매도
-// 수수료 각 0.015%, 매도 시 증권거래세 0.20%. performance-report/daily-stats/pnl-history가 그동안
-// 이 비용을 반영 안 한 순수 가격변동률(pnl_pct)만으로 금액을 계산해서, 화면과 리포트 숫자가
-// 서로 달랐고(리포트가 실제보다 더 좋게 보임) 리포트가 실제 성과를 과소평가하고 있었음.
-const KIWOOM_FEE_RATE = 0.00015;
-const SELL_TAX_RATE = 0.002;
-function computeRealisticPnlServer(entryPrice, exitPrice, budget) {
-  const qty = Math.floor(budget / entryPrice);
-  if (qty <= 0) return null;
-  const investedAmount = qty * entryPrice;
-  const buyFee = investedAmount * KIWOOM_FEE_RATE;
-  const currentValue = qty * exitPrice;
-  const sellFee = currentValue * KIWOOM_FEE_RATE;
-  const sellTax = currentValue * SELL_TAX_RATE;
-  const netProceeds = currentValue - sellFee - sellTax;
-  const totalCost = investedAmount + buyFee;
-  const netPnlAmount = Math.round(netProceeds - totalCost);
-  const netPnlPct = (netPnlAmount / totalCost) * 100;
-  return { qty, netPnlAmount, netPnlPct };
-}
-
-// 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가 커져서
-// (체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이 항상 적용.
-// POST /api/watchlist(새로 추가하는 순간)뿐 아니라 cron(scheduled)에서도 매틱 호출함 - 새 추가가
-// 없어도(예: 배포 직후 이미 상한을 넘겨 갖고 있던 경우) 저절로 정리되게 하기 위함. 그냥 지우면
-// 통계가 왜곡되니(생존편향 방지 원칙과 동일) 실제 현재가로 정식 청산 처리 - 익절/손절 자동삭제와
-// 동일하게 watchlist_performance에 기록하고 라벨도 실제 손익 부호에 맞게 붙임.
-const WATCHLIST_MAX_SIZE = 10;
-async function enforceWatchlistCap(env) {
-  const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
-  const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
-  if (overCount <= 0) return;
-
-  const allRes = await env.DB.prepare(
-    `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`
-  )
-    .all()
-    .catch(() => ({ results: [] }));
-  const all = allRes.results || [];
-  if (!all.length) return;
-
-  // 전체 종목 실시간가를 relay 호출 한 번으로 일괄 조회 (종목마다 따로 조회하지 않아 훨씬 빠르고 가벼움)
-  let liveStocks = {};
-  try {
-    const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
-    const relayData = await relayRes.json();
-    liveStocks = relayData.stocks || {};
-  } catch (e) { /* 아래에서 종목별 폴백 처리 */ }
-
-  // 가장 오래된 게 아니라 "지금 손익률이 가장 나쁜" 순으로 자름 - 예전엔 added_at 기준이라
-  // 이제 막 상승 중인 젊은 포지션이 익절선 도달 전에 정원초과로 억울하게 끊기는 경우가 있었음
-  // (실측: +1.51% 상태에서 정원초과로 강제청산된 사례 확인됨). 가격 정보가 아예 없는 종목은
-  // 판단 불가하니 가장 나중 순위(맨 뒤)로 미뤄서 우선순위에서 제외.
-  const withPnl = all.map((w) => {
-    const live = liveStocks[w.code];
-    const price = live && live.price ? live.price : 0;
-    const pnlPct = price > 0 && w.entry_price > 0 ? ((price - w.entry_price) / w.entry_price) * 100 : null;
-    return { ...w, livePrice: price, pnlPct };
-  });
-  withPnl.sort((a, b) => {
-    if (a.pnlPct === null && b.pnlPct === null) return 0;
-    if (a.pnlPct === null) return 1; // 가격 모르는 쪽은 뒤로
-    if (b.pnlPct === null) return -1;
-    return a.pnlPct - b.pnlPct; // 손익률 낮은(더 나쁜) 것부터
-  });
-  const victims = withPnl.slice(0, overCount);
-
-  for (const w of victims) {
-    // 삭제 직전 재확인 - 조건검색이 짧은 시간에 여러 종목을 몰아서 담을 때, 여러 요청이 거의
-    // 동시에 이 함수를 실행하면서 서로 읽은 스냅샷이 겹쳐 같은 종목을 중복으로 처리하려던 문제가
-    // 있었음(실측: 한 종목이 같은 초에 10번 연속 "정원초과 삭제" 로그가 찍힘). 이미 다른 요청이
-    // 먼저 지웠다면 여기서 저렴하게 건너뛰어서, 불필요한 시세조회/기록/로그가 중복되지 않게 함.
-    const stillExists = await env.DB.prepare(`SELECT 1 FROM watchlist WHERE code = ?`).bind(w.code).first().catch(() => null);
-    if (!stillExists) continue;
-
-    try {
-      let exitPrice = w.livePrice;
-      if (!exitPrice) {
-        const token = await kiwoomIssueToken(env);
-        const quoteRaw = await kiwoomQuote(env, token, w.code);
-        exitPrice = parseKiwoomQuote(quoteRaw).price || 0;
-      }
-      if (exitPrice > 0 && w.entry_price > 0) {
-        const pnlPct = ((exitPrice - w.entry_price) / w.entry_price) * 100;
-        await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
-        // daily-stats 카운트는 메시지에 정확히 "[익절]" 문자열이 있는지로 익절/손절을 구분함
-        // (다른 청산 경로: cron/relay와 동일한 형식으로 맞춰야 함 - "[익절·정원초과]"처럼 붙이면
-        // 닫는 대괄호 위치가 달라져서 매칭이 안 됨). 태그를 분리해서 [익절] 단독으로 유지.
-        const reason = pnlPct >= 0 ? "익절" : "손절";
-        await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[${reason}] [정원초과][cap${WATCHLIST_MAX_SIZE}]`);
-      }
-    } catch (e) {
-      // 개별 종목 청산가 조회 실패해도 상한 유지가 더 중요하니 그냥 삭제는 진행
-    }
-    await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
-    await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
-  }
-}
-
-async function logSystemEvent(env, kind, message) {
-  try {
-    await env.DB.prepare(`INSERT INTO system_events (kind, message, created_at) VALUES (?, ?, ?)`)
-      .bind(kind, String(message).slice(0, 2000), new Date().toISOString())
-      .run();
+    const data = await res.json();
+    const ranks = data?.ranks || data?.results?.[0]?.data || [];
+    const keywords = ranks.slice(0, count).map((r) => r.keyword).filter(Boolean);
+    return { keywords, error: keywords.length ? null : `응답에 순위 없음 — raw: ${JSON.stringify(data).slice(0, 200)}` };
   } catch (e) {
-    // 로깅 실패는 무시 (system_events 테이블이 아직 없을 수 있음)
+    return { keywords: [], error: e.message };
   }
 }
-
-// ---------- Cron: 저장 ----------
-// 해외지수(다우/나스닥/S&P500/원달러 환율) - Yahoo Finance 공개 API, 인증 불필요.
-// KV 60초 캐싱: 2초마다 폴링되는 /api/realtime-all에서 매번 Yahoo를 왕복하면 과도하므로,
-// 해외지수는 국내처럼 초단위로 안 봐도 되는 성격이라 60초 캐시로 충분함.
-const GLOBAL_INDEX_SYMBOLS = { dow: "^DJI", nasdaq: "^IXIC", sp500: "^GSPC", usdkrw: "KRW=X", eurkrw: "EURKRW=X", jpykrw: "JPYKRW=X", cnykrw: "CNYKRW=X" };
-async function fetchGlobalIndices(env) {
-  const CACHE_KEY = "global-indices-v1";
-  if (env.CACHE_KV) {
-    const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
-    if (cached) return cached;
+__name(naverShoppingHotKeywords, "naverShoppingHotKeywords");
+async function scanNaverShoppingProducts(env) {
+  const items = [];
+  if (!env.NAVER_CLIENT_ID || !env.NAVER_CLIENT_SECRET) {
+    console.log("네이버쇼핑 스캔 스킵 — NAVER_CLIENT_ID/SECRET 시크릿 미등록");
+    return items;
   }
-  const entries = await Promise.all(
-    Object.entries(GLOBAL_INDEX_SYMBOLS).map(async ([key, symbol]) => {
-      try {
-        const res = await fetch(
-          `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`,
-          { headers: { "User-Agent": "Mozilla/5.0" } }
-        );
-        if (!res.ok) return [key, null];
-        const json = await res.json();
-        const result = json?.chart?.result?.[0];
-        const meta = result?.meta;
-        if (!meta || meta.regularMarketPrice == null) return [key, null];
-        const price = meta.regularMarketPrice;
-        const prevClose = meta.chartPreviousClose ?? meta.previousClose;
-        const rate = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
-        return [key, { price, rate }];
-      } catch (e) {
-        return [key, null];
-      }
-    })
-  );
-  const out = Object.fromEntries(entries);
-  const payload = { ok: Object.values(out).some(Boolean), ...out };
-  if (env.CACHE_KV && payload.ok) {
-    // waitUntil은 이 함수 스코프에 ctx가 없어 호출부에서 처리 - 여기선 동기적으로 기다리지 않고 바로 반환
-    env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 }).catch(() => {});
-  }
-  return payload;
-}
-
-async function collectAndStore(env) {
-  const now = new Date();
-  const capturedAt = now.toISOString();
-
-  const token = await kiwoomIssueToken(env);
-  const kospi = await fetchRiseListKiwoom(env, token, "001", "KOSPI");
-  await sleep(1100); // ka10027은 초당 1건 제한 -> 여유있게 1.1초 대기
-  const kosdaq = await fetchRiseListKiwoom(env, token, "101", "KOSDAQ");
-  const all = [...kospi, ...kosdaq];
-  if (all.length === 0) return { saved: 0 };
-
-  const stmt = env.DB.prepare(
-    `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  const batch = all.map((s) =>
-    stmt.bind(
-      s.code, s.name, s.price, s.rate, s.volume, s.market, capturedAt,
-      s.cntrStr, s.buyReq, s.selReq
-    )
-  );
-  await env.DB.batch(batch);
-
-  const deleted = await purgeOldRows(env);
-  return { saved: all.length, capturedAt, deleted };
-}
-
-// 7일 지난 데이터 삭제
-async function purgeOldRows(env) {
-  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-  const result = await env.DB.prepare(
-    `DELETE FROM snapshots WHERE captured_at < ?`
-  )
-    .bind(cutoff)
-    .run();
-
-  // 새로 추가된 캐시/로그 테이블들도 같이 정리 (없어도 에러 없이 넘어가게 각각 try)
-  // pattern_scan_cache/latest_extras_cache는 특정 틱 하나만을 위한 임시 캐시라 하루만 지나도 무의미해서 더 짧게(2일) 지움
-  const shortCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
-  await env.DB.prepare(`DELETE FROM pattern_scan_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
-  await env.DB.prepare(`DELETE FROM latest_extras_cache WHERE captured_at < ?`).bind(shortCutoff).run().catch(() => {});
-  // kr_index_last_cache는 이제 "장마감 시 보여줄 마지막 값" 폴백 용도로 씀(대량 이력 저장이 아님) -
-  // 6시간 지났다고 지워버리면 폴백할 값 자체가 사라져서 지수바가 계속 숨겨지는 문제가 있었음.
-  // 대신 아래 저장 시점에서 이 테이블 행 개수를 늘 소수로만 유지함(코드에서 직접 정리).
-  // signal_backtest_history는 하루 1행이라 부담 적지만, 60일 넘은 건 정리
-  const historyCutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  await env.DB.prepare(`DELETE FROM signal_backtest_history WHERE date < ?`).bind(historyCutoff).run().catch(() => {});
-  // daily_ohlc_cache도 하루 지나면 무의미 (다음날은 또 새 일봉이라 어차피 재조회됨)
-  await env.DB.prepare(`DELETE FROM daily_ohlc_cache WHERE updated_at < ?`).bind(shortCutoff).run().catch(() => {});
-  // watchlist_fine_snapshots는 30초마다 쌓여서 금방 커짐 - 2일만 유지
-  const fineCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
-  await env.DB.prepare(`DELETE FROM watchlist_fine_snapshots WHERE captured_at < ?`).bind(fineCutoff).run().catch(() => {});
-  await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
-
-  return result.meta?.changes ?? 0;
-}
-
-// N번 연속 상승 종목 계산 (times[0]이 최신). requiredUps번의 구간이 전부 상승이어야 함
-function computeStreak(times, snapByTime, requiredUps) {
-  if (times.length < requiredUps + 1) return [];
-  const result = [];
-  for (const code of snapByTime[times[0]].keys()) {
-    const rows = [];
-    let ok = true;
-    for (let i = 0; i <= requiredUps; i++) {
-      const row = snapByTime[times[i]]?.get(code);
-      if (!row) { ok = false; break; }
-      rows.push(row);
-    }
-    if (!ok) continue;
-
-    let allUp = true;
-    for (let i = 0; i < requiredUps; i++) {
-      if (rows[i].change_rate <= rows[i + 1].change_rate) { allUp = false; break; }
-    }
-    if (allUp) {
-      result.push({ ...rows[0], totalGain: rows[0].change_rate - rows[requiredUps].change_rate });
-    }
-  }
-  result.sort((a, b) => b.totalGain - a.totalGain);
-  return result;
-}
-
-// ---------- API: 최신 스냅샷 + 상승 TOP5 + 3/5연속 상승 ----------
-async function getLatest(env) {
-  const timesRes = await env.DB.prepare(
-    `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 6`
-  ).all();
-  const times = timesRes.results.map((r) => r.captured_at);
-  if (times.length === 0) {
-    return { latest: [], risingTop5: [], streak3: [], streak5: [], pullbackCandidates: [], capturedAt: null };
-  }
-
-  // 아래 쿼리들은 서로 독립적이라 순차 대기 없이 한 번에 병렬 실행
-  const [latestRes, prevRes, snapRows] = await Promise.all([
-    env.DB.prepare(`SELECT * FROM snapshots WHERE captured_at = ? ORDER BY change_rate DESC`)
-      .bind(times[0])
-      .all(),
-    times.length > 1
-      ? env.DB.prepare(`SELECT code, change_rate FROM snapshots WHERE captured_at = ?`).bind(times[1]).all()
-      : Promise.resolve({ results: [] }),
-    Promise.all(
-      times.map((t) =>
-        env.DB.prepare(
-          `SELECT code, name, price, change_rate, volume, cntr_str, buy_req, sel_req FROM snapshots WHERE captured_at = ?`
-        )
-          .bind(t)
-          .all()
-      )
-    ),
-  ]);
-
-  const latest = latestRes.results;
-
-  // 3연속/5연속 상승 계산에 필요한 스냅샷 (위에서 이미 병렬로 받아온 결과 매핑만)
-  const snapByTime = {};
-  times.forEach((t, i) => {
-    snapByTime[t] = new Map(snapRows[i].results.map((row) => [row.code, row]));
-  });
-
-  // 최근 5틱(수집주기 2분이라 실제로는 대략 2/4/6/8/10분전) 구간별 등락률 변화
-  // - "N분전 delta"는 그 구간 자체(N분전~(N-2)분전)의 변화량. "지금까지 누적"이 아님 -
-  //   누적으로 하면 계속 오르는 종목은 기간이 긴 쪽(10분전) 숫자가 항상 더 커 보여서
-  //   실제 그래프 기울기(최근이 더 가팔랐는지)와 반대로 보이는 착시가 생김
-  // - 추가 조회 없이 위에서 받아온 snapByTime 재사용, TOP20/전체목록/연속상승/TOP5 전부 공유
-  const now = new Date(times[0]);
-  const momentumMap = new Map();
-  for (const [code] of snapByTime[times[0]]) {
-    const momentum = [];
-    for (let i = 1; i < times.length; i++) {
-      const curRow = snapByTime[times[i - 1]]?.get(code); // 이 구간의 최신쪽 끝
-      const prevRow = snapByTime[times[i]]?.get(code); // 이 구간의 과거쪽 끝
-      if (!curRow || !prevRow) break; // 그 시점에 없던 종목(리스트 진입 전)이면 더 과거는 의미 없으니 중단
-      const minutesAgo = Math.round((now - new Date(times[i])) / 60000);
-      momentum.push({ minutesAgo, delta: curRow.change_rate - prevRow.change_rate });
-    }
-    momentumMap.set(code, momentum);
-  }
-  const withMomentum = (r) => ({ ...r, momentum: momentumMap.get(r.code) || [] });
-
-  // ---------- 추가 지표들 (전부 이미 있는 snapshots 데이터로만 계산 - 추가 키움 조회 없음) ----------
-  // 이 계산(당일 종목별 최고치, 3일간 반복출현)은 하루치 데이터를 GROUP BY로 훑어야 해서 꽤 무거움.
-  // 화면이 10초마다 /api/latest를 다시 부르므로, 같은 틱(captured_at)에서는 재계산 없이 캐시 재사용.
-  const todayPrefix = times[0].slice(0, 10); // YYYY-MM-DD (KST 장중은 항상 같은 UTC 날짜라 안전)
-  let todayMaxMap, repeatMap;
-  const extrasCached = await env.DB.prepare(`SELECT today_max_json, repeat_json FROM latest_extras_cache WHERE captured_at = ?`)
-    .bind(times[0])
-    .first()
-    .catch(() => null); // latest_extras_cache 테이블이 아직 없어도(마이그레이션 전) 매번 계산으로 자연스럽게 폴백
-  if (extrasCached) {
-    todayMaxMap = new Map(JSON.parse(extrasCached.today_max_json));
-    repeatMap = new Map(JSON.parse(extrasCached.repeat_json));
-  } else {
-    const threeDaysAgoIso = new Date(new Date(times[0]).getTime() - 3 * 24 * 60 * 60 * 1000).toISOString();
-    const [todayMaxRes, repeatRes] = await Promise.all([
-      // 당일 종목별 등락률 최고치 - 지금이 그 최고치를 찍고 있는 중인지(신고가 경신) 판단용
-      // LIKE 프리픽스매칭은 인덱스를 못 타서 전체 스캔이 됨(D1 read 폭증의 원인이었음) - range 비교로 변경
-      env.DB.prepare(`SELECT code, MAX(change_rate) AS maxRate FROM snapshots WHERE captured_at >= ? AND captured_at < ? GROUP BY code`)
-        .bind(todayPrefix, todayPrefix + "\uFFFF")
-        .all(),
-      // 최근 3일간 이 종목이 급등리스트(5%+)에 며칠 등장했는지 - 일회성 vs 지속 관심 구분용
-      env.DB.prepare(
-        `SELECT code, COUNT(DISTINCT substr(captured_at,1,10)) AS dayCount
-         FROM snapshots WHERE captured_at >= ? AND change_rate >= 5 GROUP BY code`
-      )
-        .bind(threeDaysAgoIso)
-        .all(),
-    ]);
-    todayMaxMap = new Map(todayMaxRes.results.map((r) => [r.code, r.maxRate]));
-    repeatMap = new Map(repeatRes.results.map((r) => [r.code, r.dayCount]));
-    await env.DB.prepare(
-      `INSERT OR REPLACE INTO latest_extras_cache (captured_at, today_max_json, repeat_json, created_at) VALUES (?, ?, ?, ?)`
-    )
-      .bind(
-        times[0],
-        JSON.stringify([...todayMaxMap]),
-        JSON.stringify([...repeatMap]),
-        new Date().toISOString()
-      )
-      .run()
-      .catch(() => {}); // 캐시 저장 실패해도(테이블 없음 등) 이번 요청 자체는 정상 진행
-  }
-  const avgRateNow = latest.length ? latest.reduce((s, r) => s + r.change_rate, 0) / latest.length : 0;
-
-  const withExtras = (r) => {
-    const withMom = withMomentum(r);
-    const prevRow = snapByTime[times[1]]?.get(r.code); // 직전 틱(약 2분전) - 거래량/체결강도/호가잔량 비교용
-    const volumeSpikeRatio = prevRow && prevRow.volume > 0 ? r.volume / prevRow.volume : null;
-    const todayMaxRate = todayMaxMap.get(r.code) ?? r.change_rate;
-
-    // 15:36 마감 정밀조회(relay의 runFinalQuoteReconcile)는 가격/등락률/거래량만 받고 체결강도·매수잔량·매도잔량은
-    // 항상 0으로 저장함(ka10007 개별조회라 그 필드들을 안 받아옴). 그 틱이 "지금"이나 "직전"으로 잡히면
-    // 수급기반 배지가 전부 오판됨(매도잔량이 실제값->0으로 "급감"한 걸로 잘못 계산됨) - 그래서 셋 다 0인 틱은 걸러냄.
-    const isPlaceholderRow = (row) => !row || (row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0);
-    const hasOrderFlowData = !isPlaceholderRow(r) && !isPlaceholderRow(prevRow);
-
-    // 매수전환: 직전엔 매도잔량이 더 많았는데 지금 막 매수잔량 우위로 뒤집힌 것 - 초반 반전 신호
-    const bidTurnedPositive = !!(
-      hasOrderFlowData &&
-      (r.buy_req || 0) > (r.sel_req || 0) &&
-      (prevRow.buy_req || 0) <= (prevRow.sel_req || 0)
-    );
-    // 체결강도개선: 직전 틱보다 지금 체결강도가 더 세짐 - 매수 압력이 커지는 중이라는 신호
-    const cntrStrRising = !!(hasOrderFlowData && (r.cntr_str || 0) > (prevRow.cntr_str || 0));
-    // 매수잔량급증: 직전 틱 대비 매수잔량이 1.5배 이상 - 매수 대기 물량이 갑자기 쌓이는 중
-    const buyReqSpike = !!(hasOrderFlowData && prevRow.buy_req > 0 && (r.buy_req || 0) / prevRow.buy_req >= 1.5);
-    // 매도잔량급감: 직전 틱 대비 매도잔량이 절반 이하로 줄어듦 - 매도 대기 물량이 빠지는 중.
-    // 매수전환/매수잔량급증과 같은 "새로 유입되는 수급 변화" 계열 신호(백테스트에서 이 계열만 효과 확인됨) - 아직 자체 백테스트는 안 함
-    const sellReqThinning = !!(hasOrderFlowData && prevRow.sel_req > 0 && (r.sel_req || 0) / prevRow.sel_req <= 0.5);
-    // 신규진입: 직전 틱엔 이 종목이 5~15% 밴드에 없었음 - 방금 막 새로 터진 종목
-    const freshEntry = withMom.momentum.length === 0;
-
-    return {
-      ...withMom,
-      volumeSpikeRatio, // 2 이상이면 직전 틱 대비 거래량 2배 이상 튄 것
-      isTodayHigh: r.change_rate >= todayMaxRate - 0.001, // 오늘 등락률 최고치를 지금 찍고 있는 중
-      todayMaxRate,
-      repeatDays: repeatMap.get(r.code) || 1, // 최근 3일간 급등리스트 등장 일수
-      relativeStrength: +(r.change_rate - avgRateNow).toFixed(2), // 지금 틱 전체 평균 대비 상대강도
-      bidTurnedPositive,
-      cntrStrRising,
-      buyReqSpike,
-      sellReqThinning,
-      freshEntry,
-    };
-  };
-
-  let risingTop5 = [];
-  if (times.length > 1) {
-    const prevMap = new Map(prevRes.results.map((r) => [r.code, r.change_rate]));
-    risingTop5 = latest
-      .filter((r) => prevMap.has(r.code))
-      .map((r) => ({ ...withExtras(r), delta: r.change_rate - prevMap.get(r.code) }))
-      .filter((r) => r.delta > 0)
-      .sort((a, b) => b.delta - a.delta)
-      .slice(0, 5);
-  }
-
-  const streak3 = computeStreak(times, snapByTime, 3).map(withExtras);
-  const streak5 = computeStreak(times, snapByTime, 5).map(withExtras);
-  const latestWithMomentum = latest.map(withExtras);
-
-  // 눌림목 후보: 오늘 고점 대비 1~4%p 밀렸다가, 최근 구간(2분전) momentum이 다시 양전환된 종목
-  // (상승 후 잠깐 쉬고 재상승 시도하는 지점 - 무작정 고점 추격매수보다 나은 진입 타이밍 후보)
-  const pullbackCandidates = latestWithMomentum
-    .filter((r) => {
-      const pullback = r.todayMaxRate - r.change_rate;
-      const recentMomentum = r.momentum[0]?.delta; // 가장 최근 구간(2분전)
-      return pullback >= 1 && pullback <= 4 && recentMomentum !== undefined && recentMomentum > 0;
-    })
-    .map((r) => ({ ...r, pullbackPct: +(r.todayMaxRate - r.change_rate).toFixed(2) }))
-    .sort((a, b) => (b.momentum[0]?.delta || 0) - (a.momentum[0]?.delta || 0))
-    .slice(0, 10);
-
-  return {
-    latest: latestWithMomentum,
-    risingTop5,
-    streak3,
-    streak5,
-    pullbackCandidates,
-    capturedAt: times[0],
-  };
-}
-
-// ---------- 클라이언트 JS (/app.js로 서빙, HTML과 분리해서 diff/유지보수 쉽게) ----------
-function clientScript() {
-  return `
-function fmt(n){ return Number(n).toLocaleString(); }
-
-// ---------- 종목 클릭 모달 ----------
-const modalOverlay = document.getElementById('modalOverlay');
-const modalName = document.getElementById('modalName');
-
-// 종목명 탭하면 키움 앱 실행 (heromts://heromtshost는 APK 매니페스트에서 직접 확인한 실제 등록 스킴)
-// 종목코드로 특정 화면 이동은 안 됨(과거에 후보 URL들 실기기 테스트로 확인됨) - 앱만 켜짐
-const KIWOOM_SCHEME_URL = 'heromts://heromtshost';
-function openKiwoomApp() {
-  window.location.href = KIWOOM_SCHEME_URL;
-}
-modalName.style.cursor = 'pointer';
-modalName.addEventListener('click', openKiwoomApp);
-
-const modalPrice = document.getElementById('modalPrice');
-const modalRate = document.getElementById('modalRate');
-const modalDetail = document.getElementById('modalDetail');
-const modalCodeBadge = document.getElementById('modalCodeBadge');
-const periodRow = document.getElementById('periodRow');
-const modalPriceBtn = document.getElementById('modalPriceBtn');
-const modalRiskBtn = document.getElementById('modalRiskBtn');
-const modalAiBtn = document.getElementById('modalAiBtn');
-const modalCancelBtn = document.getElementById('modalCancelBtn');
-let currentModalCode = null;
-let currentModalName = null;
-let currentModalSourceBoard = ''; // 모달을 어느 보드에서 열었는지 - 관심종목 추가 시 기록용
-let currentModalAddedState = ''; // 모달 열 때의 배지 상태 - 관심종목 추가 시 기록용
-let currentModalPeriod = '5';
-let currentModalView = 'chart'; // 'chart' | 'quote' - 자동갱신이 어느 화면을 새로고침할지
-let chartRefreshTimer = null;
-const CHART_REFRESH_MS = 3000; // 3초마다 자동 갱신 (ka10079~83 / ka10007, TR당 초당1건 제한에 여유있게 준수)
-
-function openStockModal(item) {
-  // 모달 뜨기 전에 종목코드부터 클립보드로 복사
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(item.code).catch(() => {});
-  }
-  currentModalName = item.name;
-  currentModalCode = item.code;
-  currentModalPeriod = '1';
-  currentModalView = 'chart';
-  modalName.textContent = item.name;
-  modalCodeBadge.textContent = item.code + ' (복사됨)';
-  modalPrice.textContent = fmt(item.price) + '원';
-  const modalRateVal = Number(item.rate) || 0;
-  modalRate.textContent = (modalRateVal >= 0 ? '+' : '') + modalRateVal.toFixed(2) + '%';
-  modalRate.classList.toggle('up', modalRateVal >= 0);
-  modalRate.classList.toggle('down', modalRateVal < 0);
-  renderOrderBook(item.buyReq, item.selReq);
-  renderNewsLinks(item.name, item.code);
-  periodRow.querySelectorAll('.periodBtn').forEach(b => b.classList.toggle('active', b.dataset.period === '1'));
-  modalPriceBtn.onclick = () => { currentModalView = 'quote'; showQuote(item.code); };
-  modalRiskBtn.onclick = () => { currentModalView = 'risk'; showRiskLevels(item.code); };
-  modalAiBtn.onclick = () => { currentModalView = 'ai'; showAiAnalysis(item); };
-  updateStarButton(item.code, item.name, item.price);
-  modalOverlay.classList.add('open');
-  setHeavyButtonsDisabled(true);
-  chartFullPrices = []; chartWindowSize = 0; chartOffsetFromEnd = 0;
-  showChart(item.code, '1');
-  startChartAutoRefresh();
-  if (!history.state || !history.state.modalOpen) {
-    history.pushState({ modalOpen: true }, ''); // 모바일 뒤로가기 버튼으로 모달만 닫히게 하기 위한 히스토리 항목
-  }
-}
-
-function setHeavyButtonsDisabled(disabled) {
-  const patternBtn = document.getElementById('patternScanBtn');
-  if (patternBtn) patternBtn.disabled = disabled;
-}
-
-// ---------- 실시간 WebSocket 관련 코드는 제거됨 ----------
-// Cloudflare Workers의 fetch()/WebSocket 아웃바운드 연결이 비표준 포트(10000)를
-// 프로덕션에서 지원하지 않아(80/443만 허용) 구현이 불가능하다고 확인됨.
-// 3초 폴링(startChartAutoRefresh)만으로 갱신함.
-periodRow.addEventListener('click', (e) => {
-  const btn = e.target.closest('.periodBtn');
-  if (!btn || !currentModalCode) return;
-  periodRow.querySelectorAll('.periodBtn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  currentModalPeriod = btn.dataset.period;
-  currentModalView = 'chart';
-  chartFullPrices = []; chartWindowSize = 0; chartOffsetFromEnd = 0;
-  showChart(currentModalCode, currentModalPeriod);
-  startChartAutoRefresh(); // 기간 바뀌면 갱신 타이머 리셋
-});
-
-// 모달 상단 가격/등락률 + 관심종목 리스트 캐시를 한 값으로 동기화 (모달이랑 리스트가 서로 다른 값 보여주는 것 방지)
-function syncPriceEverywhere(code, price, rate) {
-  if (currentModalCode === code) {
-    modalPrice.textContent = fmt(price) + '원';
-    const rateVal = Number(rate) || 0;
-    modalRate.textContent = (rateVal >= 0 ? '+' : '') + rateVal.toFixed(2) + '%';
-    modalRate.classList.toggle('up', rateVal >= 0);
-    modalRate.classList.toggle('down', rateVal < 0);
-  }
-  liveQuoteCache[code] = { price, rate, fetchedAt: Date.now() };
-  updateWatchlistPriceCells(code);
-}
-
-function refreshModalQuoteAndSync(code) {
-  fetch('/api/quote?code=' + code)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) return;
-      syncPriceEverywhere(code, data.price, data.rate);
-    })
-    .catch(() => {});
-}
-
-function startChartAutoRefresh() {
-  stopChartAutoRefresh();
-  chartRefreshTimer = setInterval(() => {
-    if (!currentModalCode || !modalOverlay.classList.contains('open')) {
-      stopChartAutoRefresh();
-      return;
-    }
-    if (document.hidden) return; // 탭이 백그라운드면 갱신 스킵 (불필요한 API 호출 방지)
-    if (currentModalView === 'quote') {
-      showQuote(currentModalCode, true); // 이 안에서 자체적으로 syncPriceEverywhere 호출함 (중복 조회 방지)
-    } else {
-      refreshModalQuoteAndSync(currentModalCode); // chart/risk 뷰는 별도로 상단 가격만 동기화
-      if (currentModalView === 'chart') {
-        showChart(currentModalCode, currentModalPeriod, true);
-      }
-    }
-  }, CHART_REFRESH_MS);
-}
-
-function stopChartAutoRefresh() {
-  if (chartRefreshTimer) {
-    clearInterval(chartRefreshTimer);
-    chartRefreshTimer = null;
-  }
-}
-
-document.addEventListener('visibilitychange', () => {
-  // 다시 화면으로 돌아왔을 때, 모달이 열려있으면 현재 보고 있던 화면 기준으로 바로 한 번 최신화
-  if (!document.hidden && currentModalCode && modalOverlay.classList.contains('open')) {
-    if (currentModalView === 'quote') {
-      showQuote(currentModalCode, true);
-    } else if (currentModalView === 'chart') {
-      showChart(currentModalCode, currentModalPeriod, true);
-    }
-  }
-});
-
-function closeStockModal() {
-  modalOverlay.classList.remove('open');
-  stopChartAutoRefresh();
-  setHeavyButtonsDisabled(false);
-}
-
-function closeStockModalAndHistory() {
-  closeStockModal();
-  if (history.state && history.state.modalOpen) {
-    history.back(); // 뒤로가기 버튼 눌렀을 때 엉뚱한 페이지로 안 가도록 히스토리 항목 정리
-  }
-}
-
-window.addEventListener('popstate', () => {
-  if (modalOverlay.classList.contains('open')) {
-    closeStockModal(); // 모바일 뒤로가기 버튼으로 도착한 경우 - 히스토리는 이미 넘어갔으니 UI만 닫음
-  }
-});
-
-modalCancelBtn.addEventListener('click', closeStockModalAndHistory);
-document.getElementById('modalTopClose').addEventListener('click', closeStockModalAndHistory);
-modalOverlay.addEventListener('click', (e) => {
-  if (e.target === modalOverlay) closeStockModalAndHistory();
-});
-
-function renderOrderBook(buyReq, selReq) {
-  const el = document.getElementById('modalOrderBook');
-  const total = (buyReq || 0) + (selReq || 0);
-  if (!total) { el.innerHTML = ''; return; }
-  const buyPct = (buyReq / total * 100).toFixed(1);
-  const sellPct = (100 - buyPct).toFixed(1);
-  el.innerHTML =
-    '<div class="orderBookBar">' +
-      '<div class="orderBookBuy" style="width:' + buyPct + '%"></div>' +
-      '<div class="orderBookSell" style="width:' + sellPct + '%"></div>' +
-    '</div>' +
-    '<div class="orderBookLabel">' +
-      '<span class="buyLabel">매수잔량 ' + fmt(buyReq) + ' (' + buyPct + '%)</span>' +
-      '<span class="sellLabel">매도잔량 ' + fmt(selReq) + ' (' + sellPct + '%)</span>' +
-    '</div>';
-}
-
-function renderNewsLinks(name, code) {
-  const el = document.getElementById('modalNewsLinks');
-  const q = encodeURIComponent(name);
-  const dartQ = encodeURIComponent(name + ' 공시 dart');
-  el.innerHTML =
-    '<a class="newsLink" href="https://search.naver.com/search.naver?where=news&query=' + q + '" target="_blank" rel="noopener">📰 뉴스 검색</a>' +
-    '<a class="newsLink" href="https://search.naver.com/search.naver?query=' + dartQ + '" target="_blank" rel="noopener">📋 DART 공시</a>';
-
-  const summaryEl = document.getElementById('modalNewsSummary');
-  summaryEl.innerHTML = '<div class="detailLoading">뉴스 불러오는 중...</div>';
-  fetch('/api/news?q=' + encodeURIComponent(name))
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok || !data.items.length) {
-        summaryEl.innerHTML = '';
-        return;
-      }
-      summaryEl.innerHTML = data.items.map(item => {
-        const tagClass = item.sentiment === '호재' ? 'sentimentUp' : item.sentiment === '악재' ? 'sentimentDown' : 'sentimentNeutral';
-        const tagHtml = item.sentiment ? '<span class="sentimentTag ' + tagClass + '">' + item.sentiment + '</span>' : '';
-        return '<a class="newsItem" href="' + item.link + '" target="_blank" rel="noopener">' +
-          '<div class="newsItemTitle">' + tagHtml + ' ' + item.title + '</div>' +
-          '<div class="newsItemDesc">' + item.description + '</div>' +
-        '</a>';
-      }).join('');
-    })
-    .catch(() => { summaryEl.innerHTML = ''; });
-
-  const dartEl = document.getElementById('modalDartSummary');
-  dartEl.innerHTML = '';
-  fetch('/api/disclosures?code=' + code)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok || !data.items || !data.items.length) return;
-      dartEl.innerHTML = data.items.map(item =>
-        '<a class="newsItem dartItem" href="' + item.link + '" target="_blank" rel="noopener">' +
-          '<div class="newsItemTitle">📋 ' + item.title + '</div>' +
-          '<div class="newsItemDesc">' + item.date + '</div>' +
-        '</a>'
-      ).join('');
-    })
-    .catch(() => {});
-}
-
-function showAiAnalysis(item) {
-  modalDetail.innerHTML = '<div class="detailLoading">🤖 AI가 뉴스·공시·시세 종합 분석 중... (몇 초 소요)</div>';
-  fetch('/api/ai-analysis', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      code: item.code, name: item.name,
-      cntrStr: item.cntrStr, buyReq: item.buyReq, selReq: item.selReq,
-      signalChecks: item.signalChecks,
-    }),
-  })
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) {
-        modalDetail.innerHTML = '<div class="detailError">분석 실패: ' + (data.error || '알 수 없는 오류') + '</div>';
-        return;
-      }
-      modalDetail.innerHTML =
-        '<div class="aiAnalysisCard">' + data.analysis + '</div>' +
-        '<div class="aiAnalysisNote">⚠️ AI가 생성한 참고용 요약이며, 매매 추천이 아닙니다. 데이터 누락·오류 가능성 있음.</div>';
-    })
-    .catch(err => {
-      modalDetail.innerHTML = '<div class="detailError">요청 오류: ' + err.message + '</div>';
-    });
-}
-
-function showRiskLevels(code, silent) {
-  if (!silent) modalDetail.innerHTML = '<div class="detailLoading">변동성(ATR) 계산 중...</div>';
-  fetch('/api/risk-levels?code=' + code)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) {
-        if (!silent) modalDetail.innerHTML = '<div class="detailError">계산 실패: ' + (data.error || '알 수 없는 오류') + '</div>';
-        return;
-      }
-      const riskPct = ((data.currentPrice - data.stopLoss) / data.currentPrice * 100).toFixed(2);
-      const rewardPct = ((data.takeProfit - data.currentPrice) / data.currentPrice * 100).toFixed(2);
-      let gcHtml = '';
-      if (data.goldenCross) {
-        const gc = data.goldenCross;
-        const label = gc.justCrossed ? '🌟 골든크로스 발생 (5일선이 20일선 방금 돌파)'
-          : gc.justCrossedDown ? '💀 데드크로스 발생 (5일선이 20일선 아래로)'
-          : gc.isAligned ? '📈 정배열 (5일선 > 20일선)'
-          : '📉 역배열 (5일선 < 20일선)';
-        gcHtml =
-          '<div class="gcCard ' + (gc.isAligned ? 'gcUp' : 'gcDown') + '">' +
-          label +
-          '<div class="gcDetail">5일선 ' + fmt(Math.round(gc.sma5)) + '원 · 20일선 ' + fmt(Math.round(gc.sma20)) + '원</div>' +
-          '</div>';
-      }
-      modalDetail.innerHTML =
-        '<div class="riskGrid">' +
-        '<div>현재가<b>' + fmt(data.currentPrice) + '원</b></div>' +
-        '<div>14일 ATR<b>' + fmt(Math.round(data.atr)) + '원</b></div>' +
-        '<div class="stopLoss">손절 라인 (-' + riskPct + '%)<b>' + fmt(data.stopLoss) + '원</b></div>' +
-        '<div class="takeProfit">익절 라인 (+' + rewardPct + '%)<b>' + fmt(data.takeProfit) + '원</b></div>' +
-        '</div>' +
-        gcHtml;
-    })
-    .catch(err => {
-      if (!silent) modalDetail.innerHTML = '<div class="detailError">요청 오류: ' + err.message + '</div>';
-    });
-}
-
-function showQuote(code, silent) {
-  if (!silent) modalDetail.innerHTML = '<div class="detailLoading">불러오는 중...</div>';
-  fetch('/api/quote?code=' + code)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) {
-        if (!silent) modalDetail.innerHTML = '<div class="detailError">조회 실패: ' + (data.error || '알 수 없는 오류') + '</div>';
-        return;
-      }
-      syncPriceEverywhere(code, data.price, data.rate);
-      const gapFromHigh = data.high ? (((data.price - data.high) / data.high) * 100) : 0;
-      const now = new Date().toLocaleTimeString('ko-KR');
-      const cntrStr = (byCodeMap[code] && byCodeMap[code].cntrStr) || 0;
-
-      const warnings = [];
-      if (gapFromHigh <= -3) warnings.push('고점 대비 ' + gapFromHigh.toFixed(2) + '% 밀림');
-      if (cntrStr > 0 && cntrStr < 95) warnings.push('체결강도 매도세 전환(' + cntrStr.toFixed(1) + ')');
-      if ((byCodeMap[code] && byCodeMap[code].selReq > byCodeMap[code].buyReq)) warnings.push('매도잔량 우위 전환');
-      const sellWarningHtml = warnings.length
-        ? '<div class="sellWarning">⚠️ 매도 고려 신호: ' + warnings.join(' · ') + '</div>'
-        : '<div class="sellOk">✅ 특별한 매도 경고 신호 없음</div>';
-
-      modalDetail.innerHTML =
-        '<div class="detailGrid">' +
-        '<div>현재가<b>' + fmt(data.price) + '원</b></div>' +
-        '<div>등락률<b class="up">' + data.rate.toFixed(2) + '%</b></div>' +
-        '<div>시가<b>' + fmt(data.open) + '원</b></div>' +
-        '<div>고가<b>' + fmt(data.high) + '원</b></div>' +
-        '<div>저가<b>' + fmt(data.low) + '원</b></div>' +
-        '<div>거래량<b>' + fmt(data.volume) + '</b></div>' +
-        '</div>' +
-        '<div class="highGap">오늘 고점 대비 <b>' + gapFromHigh.toFixed(2) + '%</b></div>' +
-        sellWarningHtml +
-        '<div class="chartRange"><span class="liveDot">●</span> 실시간 · ' + now + '</div>';
-    })
-    .catch(err => {
-      if (!silent) modalDetail.innerHTML = '<div class="detailError">조회 요청 오류: ' + err.message + '</div>';
-    });
-}
-
-const PERIOD_LABEL = { 'T':'틱차트', '1':'1분봉', '5':'5분봉', '15':'15분봉', '30':'30분봉', 'D':'일봉', 'W':'주봉', 'M':'월봉' };
-
-// ---------- 차트 확대/축소/드래그 (구간을 실제로 좁혀서 그 구간의 최고/최저로 y축을 다시 잡음) ----------
-let chartFullPrices = [];       // 서버에서 받은 전체 가격 배열 (과거→최신 순)
-let chartFullTimes = [];        // 가격과 짝을 이루는 시간 배열
-let chartWindowSize = 0;        // 현재 화면에 보여줄 포인트 개수 (작을수록 확대된 상태)
-let chartOffsetFromEnd = 0;     // 최신 시점 기준으로 몇 칸 뒤로 가있는지 (0 = 최신 시점이 오른쪽 끝)
-let chartDragging = false, chartDragStartX = 0, chartDragStartOffset = 0;
-let chartPinchStartDist = 0, chartPinchStartWindow = 0;
-const CHART_MIN_WINDOW = 6; // 이보다 더 좁게는 확대 안 함 (최소 6개 포인트는 보여줌)
-
-function resetChartZoom() {
-  chartWindowSize = chartFullPrices.length;
-  chartOffsetFromEnd = 0;
-  renderCurrentWindow();
-}
-
-function clampChartWindow() {
-  const total = chartFullPrices.length;
-  chartWindowSize = Math.max(CHART_MIN_WINDOW, Math.min(total, Math.round(chartWindowSize)));
-  const maxOffset = Math.max(0, total - chartWindowSize);
-  chartOffsetFromEnd = Math.max(0, Math.min(maxOffset, Math.round(chartOffsetFromEnd)));
-}
-
-function getVisibleSlice() {
-  const total = chartFullPrices.length;
-  const end = total - chartOffsetFromEnd; // 잘라낼 구간의 끝(미포함)
-  const start = Math.max(0, end - chartWindowSize);
-  return {
-    prices: chartFullPrices.slice(start, end),
-    times: chartFullTimes.slice(start, end),
-  };
-}
-
-function renderCurrentWindow() {
-  if (!chartFullPrices.length) return;
-  clampChartWindow();
-  const slice = getVisibleSlice();
-  updateChartDOM(slice.prices, slice.times, currentModalPeriod, chartWindowSize < chartFullPrices.length);
-}
-
-// 시간 문자열(YYYYMMDDHHMMSS 또는 YYYYMMDD)을 기간에 맞게 짧은 라벨로 변환
-function formatChartTime(t, period) {
-  if (!t) return '';
-  if (period === 'D' || period === 'W' || period === 'M') {
-    return t.length >= 8 ? t.slice(4, 6) + '/' + t.slice(6, 8) : t;
-  }
-  const hhmmss = t.length >= 14 ? t.slice(8, 14) : t;
-  return hhmmss.length >= 4 ? hhmmss.slice(0, 2) + ':' + hhmmss.slice(2, 4) : t;
-}
-
-
-// 드래그/핀치 중에는 DOM을 통째로 갈아끼우지 않고 기존 svg의 좌표만 갱신
-// (모바일 터치는 원래 터치한 요소가 사라지면 이후 touchmove가 안 들어옴 -> PC에서만 되던 버그의 원인)
-function pickLabelIndices(len) {
-  if (len <= 1) return [0, 0, 0];
-  return [0, Math.floor((len - 1) / 2), len - 1];
-}
-
-function updateChartDOM(prices, times, period, isZoomed) {
-  const existingWrap = modalDetail.querySelector('#chartWrap');
-  if (!existingWrap) {
-    // 최초 렌더(새 종목/기간/차트 첫 표시)일 때만 전체 새로 그림
-    modalDetail.innerHTML = renderSparkline(prices, times, period, isZoomed);
-    return;
-  }
-
-  const w = 340, h = 120, pad = 6;
-  const min = Math.min(...prices), max = Math.max(...prices);
-  const range = (max - min) || 1;
-  const stepX = prices.length > 1 ? (w - pad * 2) / (prices.length - 1) : 0;
-  const points = prices.map((p, i) => {
-    const x = pad + i * stepX;
-    const y = h - pad - ((p - min) / range) * (h - pad * 2);
-    return x.toFixed(1) + ',' + y.toFixed(1);
-  }).join(' ');
-  const up = prices[prices.length - 1] >= prices[0];
-
-  const polyline = existingWrap.querySelector('polyline');
-  if (polyline) {
-    polyline.setAttribute('points', points);
-    polyline.setAttribute('stroke', up ? '#ff6b6b' : '#4d9fff');
-  }
-
-  const timeLabelSpans = modalDetail.querySelectorAll('.chartTimeLabels span');
-  if (timeLabelSpans.length === 3) {
-    pickLabelIndices(times.length).forEach((idx, i) => {
-      timeLabelSpans[i].textContent = formatChartTime(times[idx], period);
-    });
-  }
-
-  const rangeDiv = modalDetail.querySelector('.chartRange');
-  if (rangeDiv) {
-    const now = new Date().toLocaleTimeString('ko-KR');
-    rangeDiv.innerHTML = fmt(min) + '원 ~ ' + fmt(max) + '원 (' + (PERIOD_LABEL[period] || period) +
-      (isZoomed ? ' · ' + prices.length + '개 구간 확대중' : '') + ')' +
-      ' <span class="liveDot">●</span> 실시간 · ' + now +
-      (isZoomed ? ' · <span class="chartResetBtn" id="chartResetBtn">전체보기</span>' : '');
-  }
-}
-
-
-function touchDist(touches) {
-  const dx = touches[0].clientX - touches[1].clientX;
-  const dy = touches[0].clientY - touches[1].clientY;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-modalDetail.addEventListener('pointerdown', (e) => {
-  if (!e.target.closest('#chartWrap')) return;
-  chartDragging = true;
-  chartDragStartX = e.clientX;
-  chartDragStartOffset = chartOffsetFromEnd;
-});
-modalDetail.addEventListener('pointermove', (e) => {
-  if (!chartDragging || !chartFullPrices.length) return;
-  const wrap = modalDetail.querySelector('#chartWrap');
-  const widthPx = wrap ? wrap.clientWidth : 340;
-  const deltaPx = e.clientX - chartDragStartX;
-  const indicesPerPx = chartWindowSize / widthPx;
-  // 오른쪽으로 드래그(과거를 보고 싶음) -> offset 증가
-  chartOffsetFromEnd = chartDragStartOffset + Math.round(deltaPx * indicesPerPx);
-  renderCurrentWindow();
-});
-['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => {
-  modalDetail.addEventListener(ev, () => { chartDragging = false; });
-});
-
-modalDetail.addEventListener('wheel', (e) => {
-  if (!e.target.closest('#chartWrap') || !chartFullPrices.length) return;
-  e.preventDefault();
-  const zoomFactor = e.deltaY < 0 ? 0.85 : 1 / 0.85; // 위로 스크롤 = 확대(구간 축소)
-  chartWindowSize = chartWindowSize * zoomFactor;
-  renderCurrentWindow();
-}, { passive: false });
-
-modalDetail.addEventListener('touchstart', (e) => {
-  if (!e.target.closest('#chartWrap')) return;
-  if (e.touches.length === 2) {
-    chartPinchStartDist = touchDist(e.touches);
-    chartPinchStartWindow = chartWindowSize;
-  }
-}, { passive: true });
-modalDetail.addEventListener('touchmove', (e) => {
-  if (!e.target.closest('#chartWrap') || !chartFullPrices.length) return;
-  if (e.touches.length === 2) {
-    e.preventDefault();
-    const dist = touchDist(e.touches);
-    if (chartPinchStartDist > 0) {
-      // 손가락을 벌릴수록(dist 커짐) 구간을 좁혀서(확대) 세밀하게 보여줌
-      chartWindowSize = chartPinchStartWindow / (dist / chartPinchStartDist);
-      renderCurrentWindow();
-    }
-  }
-}, { passive: false });
-
-modalDetail.addEventListener('dblclick', (e) => {
-  if (!e.target.closest('#chartWrap')) return;
-  resetChartZoom();
-});
-
-modalDetail.addEventListener('click', (e) => {
-  if (e.target.id === 'chartResetBtn') resetChartZoom();
-});
-
-function showChart(code, period, silent) {
-  if (!silent) modalDetail.innerHTML = '<div class="detailLoading">차트 불러오는 중...</div>';
-  fetch('/api/chart?code=' + code + '&period=' + period)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok || !data.prices || data.prices.length < 2) {
-        if (!silent) {
-          modalDetail.innerHTML = '<div class="detailError">차트 데이터 없음' + (data.error ? (': ' + data.error) : '') + '</div>';
-        }
-        return;
-      }
-      const wasFullView = chartWindowSize === 0 || chartWindowSize >= chartFullPrices.length;
-      chartFullPrices = data.prices;
-      chartFullTimes = data.times || [];
-      if (!silent || wasFullView) {
-        // 새로 열었거나 이전에 확대 안 한 상태였으면 항상 전체 보기 유지
-        chartWindowSize = chartFullPrices.length;
-        chartOffsetFromEnd = 0;
-      }
-      renderCurrentWindow();
-    })
-    .catch(err => {
-      if (!silent) {
-        modalDetail.innerHTML = '<div class="detailError">차트 요청 오류: ' + err.message + '</div>';
-      }
-    });
-}
-
-function renderSparkline(prices, times, period, isZoomed) {
-  const w = 340, h = 120, pad = 6;
-  const min = Math.min(...prices), max = Math.max(...prices);
-  const range = (max - min) || 1;
-  const stepX = prices.length > 1 ? (w - pad * 2) / (prices.length - 1) : 0;
-  const points = prices.map((p, i) => {
-    const x = pad + i * stepX;
-    const y = h - pad - ((p - min) / range) * (h - pad * 2);
-    return x.toFixed(1) + ',' + y.toFixed(1);
-  }).join(' ');
-  const up = prices[prices.length - 1] >= prices[0];
-  const color = up ? '#ff6b6b' : '#4d9fff';
-  const now = new Date().toLocaleTimeString('ko-KR');
-  const labelIdxs = pickLabelIndices(times.length);
-  const timeLabelsHtml = '<div class="chartTimeLabels">' +
-    labelIdxs.map(idx => '<span>' + formatChartTime(times[idx], period) + '</span>').join('') +
-    '</div>';
-  return '<div class="chartWrap" id="chartWrap">' +
-    '<svg viewBox="0 0 ' + w + ' ' + h + '" width="100%" height="' + h + '">' +
-    '<polyline points="' + points + '" fill="none" stroke="' + color + '" stroke-width="1.5" vector-effect="non-scaling-stroke" />' +
-    '</svg>' +
-    '</div>' +
-    timeLabelsHtml +
-    '<div class="chartRange">' + fmt(min) + '원 ~ ' + fmt(max) + '원 (' + (PERIOD_LABEL[period] || period) +
-    (isZoomed ? ' · ' + prices.length + '개 구간 확대중' : '') + ')' +
-    ' <span class="liveDot">●</span> 실시간 · ' + now +
-    (isZoomed ? ' · <span class="chartResetBtn" id="chartResetBtn">전체보기</span>' : '') + '</div>';
-}
-
-let latestList = [];
-let byCodeMap = {};
-let currentSort = 'momentum';
-
-function computeMomentumScores(latest, streak3Codes, streak5Codes) {
-  if (!latest.length) return;
-  const rates = latest.map(r => r.change_rate);
-  const cntrs = latest.map(r => r.cntr_str || 0);
-  const vols = latest.map(r => Math.log((r.volume || 0) + 1));
-  const norm = (v, min, max) => (max > min ? (v - min) / (max - min) : 0.5);
-  const rMin = Math.min(...rates), rMax = Math.max(...rates);
-  const cMin = Math.min(...cntrs), cMax = Math.max(...cntrs);
-  const vMin = Math.min(...vols), vMax = Math.max(...vols);
-
-  latest.forEach(r => {
-    let score =
-      norm(r.change_rate, rMin, rMax) * 0.25 +
-      norm(r.cntr_str || 0, cMin, cMax) * 0.35 +
-      norm(Math.log((r.volume || 0) + 1), vMin, vMax) * 0.20;
-    if (streak3Codes.has(r.code)) score += 0.10;
-    if (streak5Codes.has(r.code)) score += 0.15;
-    r.momentumScore = score;
-  });
-}
-
-// 신호 점수: 4개 조건 체크(검증된 전략 아님, 참고용 필터일 뿐)
-// 1) 체결강도 105 이상  2) 매수잔량>매도잔량  3) 거래량 상위 30% 이내  4) 3연속 이상 상승중
-// 지금까지 만든 지표(신호점수/종합점수/연속상승) + 저가 동전주 감점(작전주 위험, 나무위키 단타매매 기법)
-// TOP20에서 쓰던 것과 똑같은 별표 마크업을 모든 리스트에서 공용으로 사용
-function starHtml(item, boardLabel) {
-  const active = watchlistCodes.has(item.code);
-  const badgesText = activeBadgeLabels(item).join(',');
-  return '<span class="topPickStar noRowClick ' + (active ? 'active' : '') +
-    '" data-code="' + item.code + '" data-name="' + (item.name || '').replace(/"/g, '&quot;') +
-    '" data-board="' + (boardLabel || '').replace(/"/g, '&quot;') +
-    '" data-badges="' + badgesText.replace(/"/g, '&quot;') + '">' +
-    (active ? '★' : '☆') + '</span> ';
-}
-
-function computeTopPicks(latest, streak5Codes) {
-  return [...latest]
-    .map(r => {
-      let score = (r.signalScore || 0) * 10 + (r.momentumScore || 0) * 5 + (streak5Codes.has(r.code) ? 3 : 0);
-      return { ...r, topScore: score };
-    })
-    .sort((a, b) => b.topScore - a.topScore)
-    .slice(0, 20);
-}
-
-// 추천 종목 TOP10: topScore(momentumScore+signalScore+연속상승)에 배지 신호(당일신고가/거래량급증/상대강도)를
-// 더 얹은 것. 매매 추천이 아니라 이미 있는 지표들을 하나로 합친 알고리즘 정렬일 뿐 - UI에도 그렇게 명시함.
-// 추천 종목 TOP10: "지금 얼마나 강해 보이나"가 아니라 "조회 시점 이후로도 이어질 가능성이 있나"를 봄.
-// - 가장 최근 구간(momentum[0], 약 2분전)의 방향/속도를 최우선으로 봄 - 조회 순간 이후를 보려면
-//   과거 누적보다 지금 이 순간의 방향이 훨씬 중요함
-// - 가속 중(최근 구간이 예전 구간보다 빠름)이면 관성이 이어질 가능성으로 가점
-// - 눌림목 재상승 패턴이면 이미 한 번 힘을 보여주고 쉬었다가 다시 도는 것이라 진입 근거가 더 명확 - 가장 크게 가점
-// - 지금 이 순간 이미 꺾이고 있거나(recentDelta<0) 상한가 임박(위쪽 여력 없음)이면 확실히 감점/제외 성격
-// 코스피/코스닥 둘 다 마이너스면 true - renderMarketIndexBar()가 채우고 추천점수 감점에 사용
-// (computeRecommendations보다 먼저 선언되어야 TDZ 에러가 안 남)
-let weakMarket = false;
-let lastGlobalIndex = null; // 해외지수(다우/나스닥/S&P500/원달러) 마지막 값 - SSE/폴링 공용
-let lastKrIndex = null; // 국내지수(코스피/코스닥) 마지막 값 - 해외지수만 갱신될 때도 같이 그리기 위함
-
-function computeRecommendations(latest, pullbackCodes) {
-  // 14:30 이후는 마감까지 시간이 짧아 물렸을 때 회복 기회가 부족 - 신규 진입 후보 점수를 전반적으로 낮춤
-  const kstNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  const kstMinutes = kstNow.getHours() * 60 + kstNow.getMinutes();
-  const isLateSession = kstMinutes >= 14 * 60 + 30;
-  // 09:00~09:30은 나무위키 단타매매 기법 기준 가장 활발한 시간대(골든타임 배너와 동일 기준) -
-  // 지금까지는 배너로 알려주기만 하고 정작 점수엔 반영을 안 하고 있었음
-  const isGoldenTime = kstMinutes >= 9 * 60 && kstMinutes <= 9 * 60 + 30;
-
-  return [...latest]
-    .map(r => {
-      const mom = r.momentum || [];
-      const recentDelta = mom[0] ? mom[0].delta : 0; // 가장 최근 구간(2분전) - 지금 이 순간의 방향
-      const olderDelta = mom.length ? mom[mom.length - 1].delta : recentDelta; // 가장 오래된 구간(약10분전)
-      const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지 (배지 표시용으로만 씀, 아래 참고)
-
-      // ---- 2026-08-10 backtest-signals(ticks=784) + performance-report(실거래 표본208) 재검증 ----
-      // (edgeVsBaseline: 그 신호가 있었을 때 다음 틱 평균 등락이 전체 평균보다 얼마나 높았는지)
-      // 직전 조정(08-09) 이후 overall이 avgPnlPct -0.388%->-0.102%, 승률 34.7%->41.8%로 개선됨.
-      // "실시간포착"도 -0.517%->-0.135% / 승률 29.9%->40%로 크게 나아짐(자동편입 필터 효과로 보임) - 방향 유지.
-      //   bidTurnedPositive +0.050(표본10060) / buyReqSpike +0.040(표본14659) / sellReqThinning +0.043(표본7815)
-      //     -> 셋 다 대표본에서 안정적으로 유효. 다만 실거래 표본에선 매수전환 -0.735%(n=9)/매수잔량급증 -1.692%(n=11)로
-      //        어긋나는데, 표본이 1만건 대 10건 수준이라 백테스트를 신뢰하되 과신은 피해서 소폭 하향 조정.
-      //   comboBuySignal +0.064(표본4087) -> 개별신호보다 일관되게 강함, 유지
-      //   isTodayHigh -0.067(표본14893) + 실거래 -1.676%/승률29.4%(n=17) -> 백테스트·실거래 모두 일치, 감점 유지
-      //   isGoldenTime +0.048(표본5785) -> 08-09에 "3일 연속 역효과"로 판단해 가점을 뺐는데, 그건 표본307짜리
-      //     소표본 편향이었음이 대표본에서 드러남(부호가 반대로 뒤집힘). 가점 복구.
-      //   realPullback +0.017(표본2831) -> 처음으로 안정적 플러스. 단순 pullbackLike(-0.031)와 정반대라
-      //     "수급유입이 동반된 눌림목만 유효하다"는 가설이 실측으로 확인됨. 지금까지 점수에 안 쓰이던 신호라 신규 도입.
-      //   volumeConfirmed +0.027(표본72) -> 표본이 늘며 다시 플러스로 돌아왔으나 그동안 부호가 계속 뒤집혀온
-      //     신호(표본12 -> +, 표본69 -> -, 표본72 -> +)라 아직 신뢰 낮음. 아주 작게만 반영.
-      //   accelerating -0.013 / cntrStrRising +0.001 / pullbackLike -0.031 -> 무효 내지 역효과, 점수 미반영 유지
-      //   repeatDays===2(2일째등장) 실거래 avgPnlPct +0.736%/승률66.7%(n=18) -> 유효, 유지
-      let score = 0;
-      score += recentDelta * 4;
-      if (r.bidTurnedPositive) score += 5; // 실거래 표본이 어긋나 과신 피함 - 5.5 -> 5
-      if (r.buyReqSpike) score += 3; // 위와 동일한 이유 - 3.5 -> 3
-      if (r.sellReqThinning) score += 3.5; // 대표본에서 안정적, 실거래 표본(n=2)은 판단 불가 수준이라 유지
-      // 복합신호(강한매수세): 매수전환+매수잔량급증이 동시에 뜨면 개별 신호보다 훨씬 강한 확인 -
-      // 둘 다 검증된 신호가 동시에 나타나는 거라 우연히 겹칠 확률이 낮고, 방향성 있는 진짜 수급일 가능성이 큼
-      if (r.bidTurnedPositive && r.buyReqSpike) score += 3;
-      // 진짜 눌림목: 되돌림 후 재상승(pullbackLike) 자체는 역효과지만, 거기에 수급유입 신호가 동반되면
-      // 처음으로 뚜렷한 플러스로 바뀜 - 이미 한 번 힘을 보여주고 쉬었다가 실제 수급과 함께 다시 도는 자리
-      const realPullback = pullbackCodes.has(r.code) && (r.bidTurnedPositive || r.buyReqSpike || r.sellReqThinning);
-      if (realPullback) score += 2;
-      // 거래량 동반 확인: 호가잔량 신호가 실제 체결거래량 증가와 같이 온 경우 - 표본이 작아 가중치는 최소로만
-      const volumeConfirmed = (r.bidTurnedPositive || r.buyReqSpike) && r.volumeSpikeRatio && r.volumeSpikeRatio >= 1.5;
-      if (volumeConfirmed) score += 0.5;
-      // 체결강도 절대수준: 100 넘는지(방향)뿐 아니라 얼마나 강한지도 봄 - 150 이상은 "강한 매수세 유입"이 통상적 해석 기준
-      if ((r.cntr_str || 0) >= 150) score += 1.5;
-      // 2일 연속 급등리스트 등장 - 실거래 데이터상 뚜렷한 양의 성과(일회성 반짝보다 지속 관심이 낫다는 근거)
-      if (r.repeatDays === 2) score += 1;
-      // 당일신고가: 지금 이 순간이 오늘 최고치라는 뜻 - 백테스트/실거래 모두 일관되게 역효과 확인됨(추격매수 위험)
-      if (r.isTodayHigh) score -= 4;
-      score += (r.relativeStrength || 0) * 0.5;
-      if ((r.change_rate || 0) >= 28) score -= 5; // 상한가 임박 - 위쪽 여력 거의 없어서 "이후 상승여력" 신호로 부적합
-      // 거래대금 10억 미만은 슬리피지로 수익이 깎일 위험 - 진입 자체를 신중히
-      if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) score -= 2;
-      if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
-      if (isLateSession) score -= 2; // 오후 늦은 시각 - 마감까지 회복 시간이 부족
-      if (isGoldenTime) score += 1.5; // 09:00~09:30 - 대표본 재검증에서 유효 확인되어 가점 복구
-      if (weakMarket) score -= 1.5; // 코스피/코스닥 동반 약세 - 급등주 신호 신뢰도 하락
-      return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: !!volumeConfirmed, realPullback };
-    })
-    .sort((a, b) => b.recoScore - a.recoScore)
-    .slice(0, 10);
-}
-
-function computeSignalScores(latest, streak3Codes, streak5Codes) {
-  if (!latest.length) return;
-  const volSorted = [...latest].map(r => r.volume || 0).sort((a, b) => b - a);
-  const top30Cutoff = volSorted[Math.max(0, Math.floor(volSorted.length * 0.3) - 1)] || 0;
-  const tradeValSorted = [...latest].map(r => (r.price || 0) * (r.volume || 0)).sort((a, b) => b - a);
-  const tradeVal30Cutoff = tradeValSorted[Math.max(0, Math.floor(tradeValSorted.length * 0.3) - 1)] || 0;
-
-  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  const kstMinutes = kst.getHours() * 60 + kst.getMinutes();
-  const isGoldenTime = kstMinutes >= 9 * 60 && kstMinutes <= 9 * 60 + 30;
-
-  latest.forEach(r => {
-    let n = 0;
-    const checks = [];
-    const tradeValue = (r.price || 0) * (r.volume || 0);
-    if ((r.cntr_str || 0) >= 105) { n++; checks.push('체결강도 105+'); }
-    if ((r.buy_req || 0) > (r.sel_req || 0)) { n++; checks.push('매수잔량 우위'); }
-    if ((r.volume || 0) >= top30Cutoff) { n++; checks.push('거래량 상위30%'); }
-    if (streak3Codes.has(r.code) || streak5Codes.has(r.code)) { n++; checks.push('연속상승 중'); }
-    if (tradeValue >= tradeVal30Cutoff) { n++; checks.push('거래대금 상위30%'); }
-    if (isGoldenTime) { n++; checks.push('골든타임(09:00~09:30) 중'); }
-    r.signalScore = n;
-    r.signalChecks = checks;
-    r.tradeValue = tradeValue;
-    r.lowPriceWarning = (r.price || 0) < 2000; // 감점 대신 별도 경고 표시(동전주 위험)
-  });
-}
-
-// 테이블을 통째로 갈아엎지 않고, 바뀐 셀만 업데이트 + 신규/삭제 행만 추가/제거
-// (기존 DOM 노드를 최대한 재사용해서 화면 깜빡임 없이 데이터만 바뀌게)
-function patchTable(tbody, items, renderCells, emptyMessage, onRowClick) {
-  onRowClick = onRowClick || (item => { const mapped = byCodeMap[item.code]; if (mapped) openStockModal(mapped); });
-  if (!items.length) {
-    if (tbody.children.length !== 1 || !tbody.querySelector('.empty')) {
-      tbody.innerHTML = '<tr><td class="empty">' + emptyMessage + '</td></tr>';
-    }
-    return;
-  }
-
-  const existing = {};
-  tbody.querySelectorAll('tr[data-code]').forEach(tr => { existing[tr.dataset.code] = tr; });
-  // 빈 상태 플레이스홀더가 남아있으면 제거
-  const placeholder = tbody.querySelector('td.empty');
-  if (placeholder) placeholder.closest('tr').remove();
-
-  let prevNode = null;
-  items.forEach(item => {
-    const cells = renderCells(item);
-    let tr = existing[item.code];
-    if (tr) {
-      const tds = tr.children;
-      cells.forEach((html, i) => {
-        if (tds[i] && tds[i].innerHTML !== html) tds[i].innerHTML = html;
-      });
-      delete existing[item.code];
-    } else {
-      tr = document.createElement('tr');
-      tr.className = 'clickable';
-      tr.dataset.code = item.code;
-      cells.forEach(html => {
-        const td = document.createElement('td');
-        td.innerHTML = html;
-        tr.appendChild(td);
-      });
-      tr.addEventListener('click', (e) => {
-        if (e.target.closest('.noRowClick')) return;
-        onRowClick(item);
-      });
-    }
-    const wantedNext = prevNode ? prevNode.nextSibling : tbody.firstChild;
-    if (wantedNext !== tr) tbody.insertBefore(tr, wantedNext);
-    prevNode = tr;
-  });
-
-  Object.values(existing).forEach(tr => tr.remove());
-}
-
-// 거래량급증/당일신고가/상한가임박/반복출현/상대강도 배지 - 서버가 계산해준 값 그대로 표시만 함
-function renderBadges(r) {
-  const badges = [];
-  if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) {
-    badges.push('<span class="badge badgeVolume">💥거래량 ' + r.volumeSpikeRatio.toFixed(1) + '배</span>');
-  }
-  if (r.isTodayHigh) badges.push('<span class="badge badgeHigh">🆕당일신고가</span>');
-  if ((r.change_rate || 0) >= 28) badges.push('<span class="badge badgeLimit">🔺상한가 임박</span>');
-  if (r.repeatDays > 1) badges.push('<span class="badge badgeRepeat">' + r.repeatDays + '일째 등장</span>');
-  if (r.bidTurnedPositive) badges.push('<span class="badge badgeBid">🔄매수전환</span>');
-  if (r.cntrStrRising) badges.push('<span class="badge badgeCntr">💪체결강도개선</span>');
-  if (r.buyReqSpike) badges.push('<span class="badge badgeBid">📥매수잔량급증</span>');
-  if (r.sellReqThinning) badges.push('<span class="badge badgeBid">📤매도잔량급감</span>');
-  if (r.freshEntry) badges.push('<span class="badge badgeFresh">✨신규진입</span>');
-  // 거래대금이 너무 작으면 사고팔 때 슬리피지로 수익이 깎임 (동전주 필터와 별개 문제)
-  if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) {
-    badges.push('<span class="badge badgeLimit">💧거래대금 ' + Math.round(r.tradeValue / 100000000) + '억</span>');
-  }
-  if (typeof r.relativeStrength === 'number' && r.relativeStrength !== 0) {
-    const cls = r.relativeStrength > 0 ? 'up' : 'down';
-    badges.push('<span class="badge">RS <span class="' + cls + '">' + (r.relativeStrength >= 0 ? '+' : '') + r.relativeStrength.toFixed(2) + '</span></span>');
-  }
-  return badges.length ? '<div class="badgeRow">' + badges.join('') + '</div>' : '';
-}
-
-// renderBadges와 동일한 조건들을 HTML 없이 순수 텍스트 라벨 배열로 반환
-// - 관심종목에 추가하는 "그 순간"의 신호 상태를 기록해서 나중에 왜 담았는지 되돌아볼 때 씀
-function activeBadgeLabels(r) {
-  const labels = [];
-  if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 2) labels.push('거래량' + r.volumeSpikeRatio.toFixed(1) + '배');
-  if (r.isTodayHigh) labels.push('당일신고가');
-  if ((r.change_rate || 0) >= 28) labels.push('상한가임박');
-  if (r.repeatDays > 1) labels.push(r.repeatDays + '일째등장');
-  if (r.bidTurnedPositive) labels.push('매수전환');
-  if (r.cntrStrRising) labels.push('체결강도개선');
-  if (r.buyReqSpike) labels.push('매수잔량급증');
-  if (r.sellReqThinning) labels.push('매도잔량급감');
-  if (r.freshEntry) labels.push('신규진입');
-  if (r.accelerating) labels.push('가속중'); // 추천종목 보드에서만 존재하는 필드
-  if (r.realPullback) labels.push('눌림목수급동반'); // 추천종목 보드에서만 존재 - 이번에 새로 도입한 신호라 실거래 검증용으로 기록
-  return labels;
-}
-
-// 최근 5틱(약 2/4/6/8/10분전) 대비 등락률 변화를 buildLine2 다음 줄에 공용으로 표시
-function renderMomentumLine(momentum) {
-  if (!momentum || !momentum.length) return '';
-  const parts = momentum.map(m => {
-    const cls = m.delta > 0 ? 'up' : m.delta < 0 ? 'down' : '';
-    const sign = m.delta > 0 ? '+' : '';
-    return m.minutesAgo + '분전 <span class="' + cls + '">' + sign + m.delta.toFixed(2) + '%p</span>';
-  });
-  return '<div class="momentumLine">' + parts.join(' · ') + '</div>';
-}
-
-// 1줄: 별표+종목명+현재가, 2줄: 나머지 정보 — 모든 리스트(TOP20/연속상승/전체목록)가 공용으로 사용
-// 종합신호등: 배지 9개를 일일이 조합해서 읽지 않아도, 한눈에 강세/중립/주의를 판단할 수 있게 함.
-// 백테스트로 검증된 방향(매수전환/매수잔량급증 = 긍정, 당일신고가 = 부정)에 가중치를 크게 두고,
-// 검증 안 된 신호(가속중 등)는 아예 안 씀 - 확실한 근거만 반영.
-function computeVerdict(r) {
-  let score = 0;
-  const mom = r.momentum || [];
-  const recentDelta = mom[0] ? mom[0].delta : 0;
-  score += recentDelta * 2; // 지금 이 순간의 방향
-  if (r.bidTurnedPositive) score += 2;
-  if (r.buyReqSpike) score += 1.5;
-  if (r.sellReqThinning) score += 1.5; // bidTurnedPositive와 동급 효과 재확인(2026-08-09 백테스트) - 1 -> 1.5
-  if (r.isTodayHigh) score -= 2; // 백테스트/실거래 모두 일관되게 역효과 확인됨 - 1.5 -> 2
-  if ((r.change_rate || 0) >= 28) score -= 3; // 상한가 임박 - 여력 없음
-  if (recentDelta < 0) score -= 2; // 지금 꺾이는 중
-
-  if (score >= 3) return { emoji: '🟢', cls: 'verdictUp' };
-  if (score <= -3) return { emoji: '🔴', cls: 'verdictDown' };
-  return { emoji: '🟡', cls: 'verdictMid' };
-}
-
-function renderTwoLineList(tbody, items, buildLine2, emptyMessage, onRowClick, boardLabel) {
-  onRowClick = onRowClick || (item => {
-    const mapped = byCodeMap[item.code];
-    if (mapped) {
-      currentModalSourceBoard = boardLabel || ''; // 모달 안 별표를 눌렀을 때도 어디서 열었는지 알 수 있게
-      currentModalAddedState = activeBadgeLabels(item).join(',');
-      openStockModal(mapped);
-    }
-  });
-  if (!items.length) {
-    if (tbody.children.length !== 1 || !tbody.querySelector('.empty')) {
-      tbody.innerHTML = '<tr><td class="empty">' + emptyMessage + '</td></tr>';
-    }
-    return;
-  }
-
-  const existingMain = {};
-  tbody.querySelectorAll('tr.twoLineRow[data-code]').forEach(tr => { existingMain[tr.dataset.code] = tr; });
-  const placeholder = tbody.querySelector('td.empty');
-  if (placeholder) placeholder.closest('tr').remove();
-
-  let prevNode = null; // 직전 항목의 sub row (다음 항목의 main row가 이 바로 뒤에 와야 함)
-  items.forEach(item => {
-    const verdict = computeVerdict(item);
-    const nameHtml = '<span class="verdictIcon ' + verdict.cls + '">' + verdict.emoji + '</span>' +
-      starHtml(item, boardLabel) + item.name + '<span class="rowPrice">' + fmt(item.price) + '원</span>';
-    const line2Html = buildLine2(item) + renderMomentumLine(item.momentum) + renderBadges(item);
-    let mainTr = existingMain[item.code];
-    let subTr;
-
-    if (mainTr) {
-      const td = mainTr.children[0];
-      if (td.innerHTML !== nameHtml) td.innerHTML = nameHtml; // 안 바뀌었으면 손 안 댐 (깜빡임 방지)
-      subTr = mainTr.nextElementSibling;
-      if (!subTr || !subTr.classList.contains('twoLineSubRow')) {
-        subTr = document.createElement('tr');
-        subTr.className = 'twoLineSubRow';
-        subTr.appendChild(document.createElement('td'));
-      }
-      const subTd = subTr.children[0];
-      if (subTd.innerHTML !== line2Html) subTd.innerHTML = line2Html;
-      delete existingMain[item.code];
-    } else {
-      mainTr = document.createElement('tr');
-      mainTr.className = 'clickable twoLineRow';
-      mainTr.dataset.code = item.code;
-      const td = document.createElement('td');
-      td.innerHTML = nameHtml;
-      mainTr.appendChild(td);
-      mainTr.addEventListener('click', (e) => {
-        if (e.target.closest('.noRowClick')) return;
-        onRowClick(item);
-      });
-
-      subTr = document.createElement('tr');
-      subTr.className = 'twoLineSubRow';
-      const subTd = document.createElement('td');
-      subTd.innerHTML = line2Html;
-      subTr.appendChild(subTd);
-    }
-
-    const wantedMainNext = prevNode ? prevNode.nextSibling : tbody.firstChild;
-    if (wantedMainNext !== mainTr) tbody.insertBefore(mainTr, wantedMainNext);
-    if (mainTr.nextSibling !== subTr) tbody.insertBefore(subTr, mainTr.nextSibling);
-    prevNode = subTr;
-  });
-
-  Object.values(existingMain).forEach(tr => {
-    const sub = tr.nextElementSibling;
-    if (sub && sub.classList.contains('twoLineSubRow')) sub.remove();
-    tr.remove();
-  });
-}
-
-function renderAllTable() {
-  const sorted = [...latestList].sort((a, b) =>
-    currentSort === 'volumeDesc' ? b.volume - a.volume
-    : currentSort === 'volumeAsc' ? a.volume - b.volume
-    : currentSort === 'cntrStr' ? (b.cntr_str || 0) - (a.cntr_str || 0)
-    : currentSort === 'momentum' ? (b.momentumScore || 0) - (a.momentumScore || 0)
-    : currentSort === 'signal' ? (b.signalScore || 0) - (a.signalScore || 0)
-    : currentSort === 'tradeValue' ? (b.tradeValue || 0) - (a.tradeValue || 0)
-    : b.change_rate - a.change_rate
-  );
-  const allBody = document.querySelector('#all tbody');
-  renderTwoLineList(allBody, sorted, r =>
-    '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
-    ' · 거래량 ' + fmt(r.volume) +
-    ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
-    ' · <span title="' + ((r.signalChecks || []).join(', ') || '조건 없음') + '">' + '🔥'.repeat(r.signalScore || 0) + (r.lowPriceWarning ? ' ⚠️' : '') + '</span>',
-  '데이터 없음', undefined, '전체목록');
-}
-
-document.getElementById('sortByMomentum').addEventListener('click', (e) => {
-  currentSort = 'momentum';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-document.getElementById('sortByRate').addEventListener('click', (e) => {
-  currentSort = 'rate';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-document.getElementById('sortByVolumeDesc').addEventListener('click', (e) => {
-  currentSort = 'volumeDesc';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-document.getElementById('sortByVolumeAsc').addEventListener('click', (e) => {
-  currentSort = 'volumeAsc';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-document.getElementById('sortByCntrStr').addEventListener('click', (e) => {
-  currentSort = 'cntrStr';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-document.getElementById('sortBySignal').addEventListener('click', (e) => {
-  currentSort = 'signal';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-document.getElementById('sortByTradeValue').addEventListener('click', (e) => {
-  currentSort = 'tradeValue';
-  document.querySelectorAll('.sortBtn').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderAllTable();
-});
-
-let realtimeListCodes = []; // 실시간 구독 대상 종목 - load()에서 화면에 렌더된 종목들로 채워짐
-let conditionCodes = []; // 조건검색으로 실시간 포착된 종목 - renderConditionDock()에서 채워짐
-
-async function load() {
-  // 미니차트 전체 조회를 관심종목 조회와 동시에 시작 - 어느 쪽이 먼저 끝나든 서로 안 기다림.
-  let miniDataArrived = null; // 도착하면 여기에 채워짐 (아직이면 null)
-  const miniPromise = fetch('/api/mini-candles-all')
-    .then(r => r.json())
-    .then(mcData => { miniDataArrived = mcData; return mcData; })
-    .catch(() => ({ ok: false }));
-
-  // 관심종목은 /api/latest(연속상승/눌림목/TOP5 등 무거운 계산 포함)와 별개로,
-  // 초경량 전용 엔드포인트(KV 60초 캐시)에서 가장 먼저 가져와서 최우선으로 그림.
-  const watchlistQuotesPromise = fetch('/api/watchlist-quotes')
-    .then(r => r.json())
-    .then(wq => {
-      if (wq.ok) {
-        watchlistLastKnownMap = {};
-        (wq.watchlistLastKnown || []).forEach(r => { watchlistLastKnownMap[r.code] = r; });
-        watchlistRiskMap = {};
-        watchlistRiskLevelMap = {};
-        (wq.watchlistRisk || []).forEach(r => {
-          watchlistRiskMap[r.code] = r.status;
-          watchlistRiskLevelMap[r.code] = { stopLoss: r.stop_loss, takeProfit: r.take_profit };
-        });
-        watchlistExitMap = {};
-        (wq.watchlistExitSignals || []).forEach(r => { watchlistExitMap[r.code] = r.reasons; });
-
-        // 미니차트가 이미 도착해 있으면 바로 합쳐서 그림 - 기다리지 않고 텍스트를 즉시 그림.
-        // 차트가 늦게 오면 아래 miniPromise.then에서 별도로(5개씩 순서대로) 최대한 빨리 채움.
-        if (miniDataArrived && miniDataArrived.ok && miniDataArrived.cache) {
-          Object.keys(miniDataArrived.cache).forEach(code => {
-            if (!(code in miniCandleCache)) miniCandleCache[code] = miniDataArrived.cache[code].candles;
-          });
-        }
-        renderWatchlist(wq.watchlist || []);
-
-        // D1에도 시세가 없던 관심종목(막 추가된 종목 등)은 별도 요청으로 채움
-        if (Array.isArray(wq.watchlistMissingCodes) && wq.watchlistMissingCodes.length > 0) {
-          fetch('/api/watchlist-fill-missing', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ codes: wq.watchlistMissingCodes })
-          })
-            .then(r => r.json())
-            .then(json => {
-              if (json.ok && json.filled && json.filled.length > 0) {
-                json.filled.forEach(f => { watchlistLastKnownMap[f.code] = f; });
-                renderWatchlist(wq.watchlist || []);
-              }
-            })
-            .catch(() => {});
-        }
-
-        // 미니차트도 /api/latest를 기다리지 않고 관심종목 목록이 확보되는 즉시 채움 -
-        // 예전엔 /api/latest(무거운 쿼리) 완료까지 기다렸다가 미니차트를 채워서, mini-candles-all이
-        // 이미 도착해 있어도 화면 반영이 그만큼 늦어지는 게 체감 지연의 원인이었음.
-        miniPromise.then(mcData => {
-          const cache = (mcData && mcData.ok && mcData.cache) || {};
-          Object.keys(cache).forEach(code => {
-            if (!(code in miniCandleCache)) {
-              miniCandleCache[code] = cache[code].candles;
-            }
-          });
-          const rowMap = new Map();
-          document.querySelectorAll('#watchlist tr.miniChartRow').forEach(tr => {
-            rowMap.set(tr.getAttribute('data-code'), tr);
-          });
-          const renderOne = (code) => {
-            const tr = rowMap.get(code);
-            if (!tr || !(code in miniCandleCache)) return;
-            const td = tr.querySelector('td');
-            const w = watchlistItems.find(x => x.code === code);
-            td.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
-          };
-          // 관심종목 등록 순서(1~15번, 16~30번...) 그대로 15개씩 끊어서 프레임마다 렌더 -
-          // 첫 청크는 지연 없이 즉시 그리고, 나머지만 다음 프레임들에 이어서 채움.
-          const orderedCodes = (wq.watchlist || []).map(w => w.code);
-          const MINI_CHUNK = 15;
-          let idx = 0;
-          const renderNextMiniChunk = () => {
-            const next = orderedCodes.slice(idx, idx + MINI_CHUNK);
-            next.forEach(renderOne);
-            idx += MINI_CHUNK;
-            if (idx < orderedCodes.length) requestAnimationFrame(renderNextMiniChunk);
-          };
-          renderNextMiniChunk();
-          const stillMissing = (wq.watchlist || []).map(w => w.code).filter(code => !(code in miniCandleCache));
-          if (stillMissing.length) queueMiniCandleFetches(stillMissing);
-        });
-      }
-      return wq;
-    })
-    .catch(() => ({ ok: false }));
-  const res = await fetch('/api/latest');
-  const data = await res.json();
-  await watchlistQuotesPromise; // 이미 끝나 있을 가능성이 높음(더 가벼운 쿼리라서) - 렌더 순서만 보장
-
-  document.getElementById('ts').textContent = data.capturedAt
-    ? '기준 시각: ' + new Date(data.capturedAt).toLocaleString('ko-KR')
-    : '아직 저장된 데이터가 없습니다';
-
-  const streak5Body = document.querySelector('#streak5 tbody');
-  renderTwoLineList(streak5Body, data.streak5, r =>
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
-    ' · <span class="delta">5연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
-  '5연속 상승 종목 없음', undefined, '5연속상승');
-
-  const streak3Body = document.querySelector('#streak3 tbody');
-  renderTwoLineList(streak3Body, data.streak3, r =>
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
-    ' · <span class="delta">3연속<span class="streakBadge">▲' + r.totalGain.toFixed(2) + '%p</span></span>',
-  '3연속 상승 종목 없음', undefined, '3연속상승');
-
-  const top5Body = document.querySelector('#top5 tbody');
-  renderTwoLineList(top5Body, data.risingTop5, r =>
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
-    ' · <span class="delta">▲' + r.delta.toFixed(2) + '%p</span>',
-  '직전 스냅샷 대비 상승 종목 없음', undefined, '2분전보다TOP5');
-
-  const pullbackBody = document.querySelector('#pullback tbody');
-  renderTwoLineList(pullbackBody, data.pullbackCandidates || [], r =>
-    '<span class="up">+' + r.change_rate.toFixed(2) + '%</span>' +
-    ' · 고점 ' + r.todayMaxRate.toFixed(2) + '%에서 <span class="down">-' + r.pullbackPct.toFixed(2) + '%p</span> 조정 후 재상승중',
-  '눌림목 후보 없음', undefined, '눌림목후보');
-
-  latestList = data.latest;
-  const streak3Codes = new Set(data.streak3.map(r => r.code));
-  const streak5Codes = new Set(data.streak5.map(r => r.code));
-  computeMomentumScores(latestList, streak3Codes, streak5Codes);
-  computeSignalScores(latestList, streak3Codes, streak5Codes);
-
-  const pullbackCodes = new Set((data.pullbackCandidates || []).map(r => r.code));
-  const recommended = computeRecommendations(latestList, pullbackCodes);
-  const recommendedBody = document.querySelector('#recommended tbody');
-  renderTwoLineList(recommendedBody, recommended, r =>
-    '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
-    ' · 거래량 ' + fmt(r.volume) +
-    ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
-    ((r.accelerating || r.comboBuySignal || r.volumeConfirmed || r.realPullback)
-      ? '<div class="momentumLine">' +
-        (r.comboBuySignal ? '<span class="delta">🔥강한매수세</span>' : '') +
-        (r.comboBuySignal && (r.volumeConfirmed || r.accelerating || r.realPullback) ? ' · ' : '') +
-        (r.volumeConfirmed ? '<span class="delta">✅거래량동반확인</span>' : '') +
-        (r.volumeConfirmed && (r.accelerating || r.realPullback) ? ' · ' : '') +
-        (r.accelerating ? '<span class="delta">⚡가속중</span>' : '') +
-        (r.accelerating && r.realPullback ? ' · ' : '') +
-        (r.realPullback ? '<span class="delta">🌊눌림목재상승(수급동반)</span>' : '') +
-        '</div>'
-      : ''),
-  '데이터 없음', undefined, '추천종목TOP10');
-
-  const topPicks = computeTopPicks(latestList, streak5Codes);
-  const topPicksBody = document.querySelector('#topPicks tbody');
-  renderTwoLineList(topPicksBody, topPicks, r =>
-    '<span class="' + (r.change_rate >= 0 ? 'up' : 'down') + '">' + (r.change_rate >= 0 ? '+' : '') + r.change_rate.toFixed(2) + '%</span>' +
-    ' · 거래량 ' + fmt(r.volume) +
-    ' · 체결강도 <span class="' + (r.cntr_str >= 100 ? 'up' : 'down') + '">' + (r.cntr_str || 0).toFixed(1) + '</span>' +
-    ' · ' + '🔥'.repeat(Math.max(1, Math.min(5, Math.round(r.topScore / 10)))),
-  '데이터 없음', undefined, '오늘의TOP20');
-
-  // 클릭용 종목 정보 매핑 (streak5 + streak3 + top5 + all 합쳐서)
-  byCodeMap = {};
-  [...data.streak5, ...data.streak3, ...data.risingTop5, ...data.latest].forEach(r => {
-    byCodeMap[r.code] = {
-      code: r.code, name: r.name, price: r.price, rate: r.change_rate, change_rate: r.change_rate,
-      buyReq: r.buy_req || 0, selReq: r.sel_req || 0, cntrStr: r.cntr_str || 0,
-      signalChecks: r.signalChecks || [], volume: r.volume || 0,
-      // 신호등(computeVerdict) 계산에 필요한 필드들 - 실시간포착 패널에서도 신호등 쓰려고 같이 담아둠
-      momentum: r.momentum || [], isTodayHigh: r.isTodayHigh, bidTurnedPositive: r.bidTurnedPositive,
-      buyReqSpike: r.buyReqSpike, sellReqThinning: r.sellReqThinning,
-    };
-  });
-
-  renderAllTable();
-
-  // 실시간 구독 대상: 실제로 자주 보는 리스트 우선 (그룹당 200종목 제한이라 우선순위 필요)
-  // 추천TOP10 -> 눌림목 -> 5연속 -> 3연속 -> 2분전TOP5 -> TOP20 -> 전체목록 순
-  const priorityCodes = [];
-  const pushCodes = (arr) => (arr || []).forEach(r => {
-    if (r && r.code && !priorityCodes.includes(r.code)) priorityCodes.push(r.code);
-  });
-  // 조건검색으로 방금 포착된 종목이 최우선 (아직 cron 스냅샷에 없을 수 있어서 시세가 꼭 필요)
-  conditionCodes.forEach(c => { if (!priorityCodes.includes(c)) priorityCodes.push(c); });
-  pushCodes(recommended);
-  pushCodes(data.pullbackCandidates);
-  pushCodes(data.streak5);
-  pushCodes(data.streak3);
-  pushCodes(data.risingTop5);
-  pushCodes(topPicks);
-  pushCodes(latestList);
-  realtimeListCodes = priorityCodes.slice(0, 180);
-}
-
-// ---------- 내 매매 기록 ----------
-// ---------- 관심종목(즐겨찾기) ----------
-let watchlistCodes = new Set();
-let watchlistItems = []; // 관심종목 원본 데이터 (낙관적 업데이트 시 이 배열을 직접 조작)
-let watchlistSort = 'added'; // 'added' | 'pnlDesc' | 'pnlAsc'
-
-// 실질 수익률 계산: 정수 주식 매수, 매수/매도 수수료 각 0.015%, 매도 시 증권거래세 0.20%(2026년 기준, 코스피/코스닥 동일)
-const KIWOOM_FEE_RATE = 0.00015;
-const SELL_TAX_RATE = 0.0020;
-
-function computeRealisticPnl(entryPrice, currentPrice, budget) {
-  const qty = Math.floor(budget / entryPrice); // 소수점 주식 매수 불가능
-  if (qty <= 0) return null;
-  const investedAmount = qty * entryPrice;
-  const buyFee = investedAmount * KIWOOM_FEE_RATE;
-  const currentValue = qty * currentPrice;
-  const sellFee = currentValue * KIWOOM_FEE_RATE;
-  const sellTax = currentValue * SELL_TAX_RATE;
-  const netProceeds = currentValue - sellFee - sellTax;
-  const totalCost = investedAmount + buyFee;
-  const netPnlAmount = Math.round(netProceeds - totalCost);
-  const netPnlPct = (netPnlAmount / totalCost) * 100;
-  return { qty, investedAmount, netPnlAmount, netPnlPct };
-}
-
-function formatAddedDate(isoString) {
-  const d = new Date(isoString);
-  const kst = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  const mm = String(kst.getMonth() + 1).padStart(2, '0');
-  const dd = String(kst.getDate()).padStart(2, '0');
-  const hh = String(kst.getHours()).padStart(2, '0');
-  const min = String(kst.getMinutes()).padStart(2, '0');
-  return mm + '/' + dd + ' ' + hh + ':' + min + ' 추가';
-}
-
-let watchlistLastKnownMap = {}; // 밴드 밖 종목의 D1 마지막 저장 시세 (load()에서 채워짐)
-let watchlistRiskMap = {}; // { code: 'safe'|'stop_loss_hit'|'take_profit_hit' } - cron이 미리 체크해둔 것 (load()에서 채워짐)
-let watchlistRiskLevelMap = {}; // { code: { stopLoss, takeProfit } } - 손절/익절 라인 인라인 표시용 (load()에서 채워짐)
-let prevRiskState = {}; // { code: status } - 손절/익절 알림 중복 방지용
-let watchlistExitMap = {}; // { code: [이탈신호 사유들] } - 손절선 전 미리 나타나는 약세 징후 (load()에서 채워짐)
-
-// ---------- 관심종목 미니 캔들차트 (1분봉) ----------
-const miniCandleCache = {}; // { code: candles[] }
-
-function queueMiniCandleFetches(codes) {
-  // relay(Oracle VM)가 미리 갱신해둔 캐시를 즉시 반환하므로 순차대기 없이 병렬요청.
-  // 실패(relay 캐시 미스 + 폴백 조회까지 실패)했을 땐 빈 배열로 영구 고정하지 않고 재시도 대상으로
-  // 남겨둠 - 그래야 relay가 다음 갱신 주기(최대 1분)에 캐시를 채운 뒤 자동으로 회복됨.
-  const toFetch = codes.filter(c => !(c in miniCandleCache));
-  if (!toFetch.length) return;
-  toFetch.forEach(code => {
-    fetch('/api/mini-candles?code=' + code)
-      .then(res => res.json())
-      .then(data => {
-        if (data.ok) {
-          miniCandleCache[code] = data.candles;
-          updateMiniChartCell(code);
-        } else {
-          // 실패는 캐싱하지 않음 - 다음 renderWatchlist 때 다시 시도됨
-          setTimeout(() => { if (!(code in miniCandleCache)) queueMiniCandleFetches([code]); }, 5000);
-        }
-      })
-      .catch(() => {
-        setTimeout(() => { if (!(code in miniCandleCache)) queueMiniCandleFetches([code]); }, 5000);
-      });
-  });
-}
-
-function updateMiniChartCell(code) {
-  const row = document.querySelector('#watchlist tr.miniChartRow[data-code="' + code + '"] td');
-  const w = watchlistItems.find(x => x.code === code);
-  if (row) row.innerHTML = renderMiniCandles(miniCandleCache[code], w ? w.added_at : null);
-}
-
-// 관심종목 실시간 시세 캐시 - refreshRealtimeWatchlist()가 relay 웹소켓 값으로 채움
-const liveQuoteCache = {}; // { code: { price, rate, fetchedAt } }
-const liveSignalCache = {}; // { code: { cntrStr, isTodayHigh, bidTurnedPositive, buyReqSpike, sellReqThinning } }
-// relay가 이제 체결(0B)뿐 아니라 호가잔량(0D)도 구독해서, 배치(2분 cron)로만 계산하던
-// isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 relay 쪽에서 틱마다 즉시 계산해서
-// stocks 페이로드에 실어보냄 - 진짜 실시간 신호를 그대로 캐시해두고 자동편입 필터 등에서 씀.
-
-function updateWatchlistPriceCells(code) {
-  const tr = document.querySelector('#watchlist tr.watchlistRow[data-code="' + code + '"]');
-  if (!tr) return;
-  const w = watchlistItems.find(x => x.code === code);
-  if (!w) return;
-  const liveQuote = liveQuoteCache[code];
-  const live = byCodeMap[code];
-  const currentPrice = liveQuote ? liveQuote.price : (live ? live.price : null);
-  const currentRate = liveQuote ? liveQuote.rate : (live ? live.rate : null);
-  const entryPrice = w.entry_price || 0;
-  const pnl = (currentPrice !== null && entryPrice > 0) ? computeRealisticPnl(entryPrice, currentPrice, 1000000) : null;
-  const tds = tr.children;
-  tds[1].innerHTML = currentPrice !== null ? fmt(currentPrice) : '<span class="empty">시세 없음</span>';
-  tds[2].innerHTML = currentRate !== null
-    ? '<span class="' + (currentRate >= 0 ? 'up' : 'down') + '">' + (currentRate >= 0 ? '+' : '') + currentRate.toFixed(2) + '%</span>'
-    : '<span class="empty">-</span>';
-  tds[4].innerHTML = pnl
-    ? '<span class="' + (pnl.netPnlPct >= 0 ? 'pnlPositive' : 'pnlNegative') + '">' +
-      (pnl.netPnlPct >= 0 ? '+' : '') + pnl.netPnlPct.toFixed(2) + '% (' + (pnl.netPnlAmount >= 0 ? '+' : '') + fmt(pnl.netPnlAmount) + '원)</span>'
-    : '<span class="empty">시세 없음</span>';
-
-  updatePeakDrawdown(code, currentPrice, entryPrice);
-}
-
-// 담은 뒤 실시간 최고가 대비 지금 몇 % 빠졌는지 - 문턱값(-2% 등) 넘기 전부터 항상 보여줌.
-// 기존 이탈신호는 문턱값을 넘어야만 뜨는데, 정작 중요한 건 "꺾이기 시작하는 그 순간"이라
-// 매 3초 실시간 틱마다 고점을 갱신하며 지금 낙폭을 계속 노출함 (2분 cron보다 훨씬 빠른 반응).
-const watchlistPeakPrice = {}; // { code: peakPriceSinceTracking } - 페이지를 새로고침하면 그 시점부터 다시 추적됨
-function updatePeakDrawdown(code, currentPrice, entryPrice) {
-  const el = document.querySelector('.peakDrawdownLine[data-code="' + code + '"]');
-  if (!el || !currentPrice) return;
-
-  const baseline = entryPrice > 0 ? entryPrice : currentPrice; // 진입가가 있으면 진입가부터, 없으면 지금 가격부터 추적 시작
-  if (!watchlistPeakPrice[code] || currentPrice > watchlistPeakPrice[code]) {
-    watchlistPeakPrice[code] = Math.max(watchlistPeakPrice[code] || baseline, currentPrice);
-  }
-  const peak = watchlistPeakPrice[code];
-  const drawdownPct = ((currentPrice - peak) / peak) * 100;
-
-  if (drawdownPct >= -0.15) {
-    // 고점 근처(0.15% 이내)면 굳이 안 보여줌 - 노이즈만 되니까
-    el.style.display = 'none';
-    return;
-  }
-  el.style.display = '';
-  const cls = drawdownPct <= -2 ? 'down' : drawdownPct <= -1 ? 'peakWarnMid' : 'peakWarnLight';
-  el.innerHTML = '<span class="' + cls + '">고점(' + fmt(peak) + ') 대비 ' + drawdownPct.toFixed(2) + '%</span>';
-}
-
-// watchlist.added_at(UTC ISO) -> 키움 차트 시간 포맷(KST YYYYMMDDHHMMSS)으로 변환
-// (candle.time이 이 포맷이라 위치 비교하려면 같은 포맷으로 맞춰야 함)
-function isoToKstYYYYMMDDHHMMSS(iso) {
-  const d = new Date(iso);
-  const kst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  return (
-    kst.getUTCFullYear() +
-    pad(kst.getUTCMonth() + 1) +
-    pad(kst.getUTCDate()) +
-    pad(kst.getUTCHours()) +
-    pad(kst.getUTCMinutes()) +
-    pad(kst.getUTCSeconds())
-  );
-}
-
-function renderMiniCandles(candles, addedAt) {
-  if (!candles || candles.length < 2) return '<div class="miniChartSkeleton"></div>';
-  const w = 220, h = 70, pad = 2;
-  const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
-  const min = Math.min(...lows), max = Math.max(...highs);
-  const range = (max - min) || 1;
-  const candleW = (w - pad * 2) / candles.length;
-  let bars = '', hitAreas = '';
-  candles.forEach((c, i) => {
-    const x = pad + i * candleW;
-    const yOpen = h - pad - ((c.open - min) / range) * (h - pad * 2);
-    const yClose = h - pad - ((c.close - min) / range) * (h - pad * 2);
-    const yHigh = h - pad - ((c.high - min) / range) * (h - pad * 2);
-    const yLow = h - pad - ((c.low - min) / range) * (h - pad * 2);
-    const up = c.close >= c.open;
-    const color = up ? '#ff6b6b' : '#4d9fff';
-    const bodyTop = Math.min(yOpen, yClose);
-    const bodyH = Math.max(1, Math.abs(yClose - yOpen));
-    const cx = x + candleW / 2;
-    bars += '<line x1="' + cx + '" y1="' + yHigh.toFixed(1) + '" x2="' + cx + '" y2="' + yLow.toFixed(1) + '" stroke="' + color + '" stroke-width="1"/>' +
-      '<rect x="' + x.toFixed(1) + '" y="' + bodyTop.toFixed(1) + '" width="' + (candleW * 0.7).toFixed(1) + '" height="' + bodyH.toFixed(1) + '" fill="' + color + '"/>';
-    // 캔들 하나당 투명 히트영역을 전체 높이로 깔아서 몸통이 짧아도(거의 안 움직인 구간) 호버/터치가 잘 잡히게 함.
-    // data-tip에 시간/가격/거래량을 미리 문자열로 담아둠 - 이벤트 위임 핸들러가 그대로 꺼내 씀.
-    // data-cx는 이 캔들의 중심 x좌표(SVG viewBox 기준) - 호버 시 크로스헤어 세로선을 정확히 그 위치에 그리는 데 씀.
-    const tip = formatChartTime(c.time, '1') + '  ' + fmt(c.close) + '원  거래량 ' + fmt(c.volume || 0);
-    hitAreas += '<rect class="miniChartHit" data-tip="' + tip.replace(/"/g, '&quot;') + '" data-cx="' + cx.toFixed(1) + '" ' +
-      'x="' + x.toFixed(1) + '" y="0" width="' + candleW.toFixed(1) + '" height="' + h + '" fill="transparent"/>';
-  });
-
-  // 즐겨찾기에 추가된 순간을 세로 점선으로 표시 (그 시각과 가장 가까운 캔들 위치를 찾아서)
-  let addedMarkerHtml = '';
-  if (addedAt) {
-    const addedKst = isoToKstYYYYMMDDHHMMSS(addedAt);
-    let nearestIdx = -1, nearestDiff = Infinity;
-    candles.forEach((c, i) => {
-      const diff = Math.abs(Number(c.time) - Number(addedKst));
-      if (diff < nearestDiff) { nearestDiff = diff; nearestIdx = i; }
-    });
-    // 추가 시점이 차트 범위 안이면 정확한 위치에, 범위를 벗어나면(장마감 후 추가 등)
-    // 가장 가까운 쪽 끝 캔들에 표시 - 정확한 시각은 아니어도 "그 근처에 추가됐다"는 사실은 전달됨
-    const firstTime = Number(candles[0].time), lastTime = Number(candles[candles.length - 1].time);
-    const addedNum = Number(addedKst);
-    if (nearestIdx >= 0) {
-      const clampedIdx = addedNum < firstTime ? 0 : (addedNum > lastTime ? candles.length - 1 : nearestIdx);
-      const markerX = pad + clampedIdx * candleW + candleW / 2;
-      addedMarkerHtml =
-        '<line x1="' + markerX.toFixed(1) + '" y1="0" x2="' + markerX.toFixed(1) + '" y2="' + h + '" stroke="#ffd43b" stroke-width="1" stroke-dasharray="3,2"/>' +
-        '<text x="' + markerX.toFixed(1) + '" y="9" fill="#ffd43b" font-size="8" text-anchor="middle">★</text>';
-    }
-  }
-
-  const labelIdxs = pickLabelIndices(candles.length);
-  const timeLabelsHtml = '<div class="chartTimeLabels">' +
-    labelIdxs.map(idx => '<span>' + formatChartTime(candles[idx].time, '1') + '</span>').join('') +
-    '</div>';
-  // 크로스헤어(현재 커서/터치 위치 세로선) - 미리 그려두고 숨겨놓은 뒤, 호버 시 x좌표만 갱신해서 보여줌.
-  // 매 mousemove마다 새 엘리먼트를 만들지 않고 속성만 바꾸는 방식이라 가벼움.
-  const crosshairHtml = '<line class="miniChartCrosshair" x1="0" y1="0" x2="0" y2="' + h + '" stroke="#fff" stroke-width="1" stroke-dasharray="2,2" opacity="0" pointer-events="none"/>';
-
-  // 현재가(마지막 캔들 종가)가 오늘 차트 구간의 최고가/최저가 대비 몇 % 위치인지, 실제 최고가/최저가
-  // 캔들이 있는 y좌표 옆에 라벨로 표시(하단 별도 텍스트가 아니라 그 값이 실제로 찍힌 자리에).
-  // SVG <text>는 preserveAspectRatio="none"으로 가로가 늘어날 때 글자도 같이 옆으로 늘어나 보이는
-  // 문제가 있어서, 비율 왜곡 없는 HTML 절대위치 오버레이로 그림(퍼센트 좌표라 컨테이너 크기 무관).
-  const currentPrice = candles[candles.length - 1].close;
-  const fromHighPct = ((currentPrice - max) / max) * 100;
-  const fromLowPct = ((currentPrice - min) / min) * 100;
-  // 최고가/최저가가 여러 캔들에 걸쳐 있으면(동률) 가장 최근(오른쪽) 캔들을 대표로 삼음
-  let highIdx = 0, lowIdx = 0;
-  candles.forEach((c, i) => {
-    if (c.high >= candles[highIdx].high) highIdx = i;
-    if (c.low <= candles[lowIdx].low) lowIdx = i;
-  });
-  const highXPct = ((pad + highIdx * candleW + candleW / 2) / w) * 100;
-  const lowXPct = ((pad + lowIdx * candleW + candleW / 2) / w) * 100;
-  // 최고가는 차트 맨 위, 최저가는 차트 맨 아래 - 라벨이 서로 가까운 x위치에 있으면(구간이 짧은 차트)
-  // 위아래로 확실히 벌려서 겹치지 않게 함. 화면 오른쪽 끝에 붙지 않도록 clamp.
-  const highLeftPct = Math.min(88, Math.max(2, highXPct));
-  const lowLeftPct = Math.min(88, Math.max(2, lowXPct));
-  const closeX = Math.abs(highXPct - lowXPct) < 15;
-  const rangeLabelsHtml =
-    '<div class="miniChartRangeLabel down" style="left:' + highLeftPct.toFixed(1) + '%; top:' + (closeX ? '14px' : '1px') + ';">' +
-    fmt(max) + '(' + fromHighPct.toFixed(1) + '%)</div>' +
-    '<div class="miniChartRangeLabel up" style="left:' + lowLeftPct.toFixed(1) + '%; bottom:' + (closeX ? '12px' : '1px') + ';">' +
-    fmt(min) + '(+' + fromLowPct.toFixed(1) + '%)</div>';
-
-  return '<div class="miniChartWrap"><div class="miniChartTip" style="display:none;"></div>' + rangeLabelsHtml +
-    '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
-    bars + addedMarkerHtml + crosshairHtml + hitAreas + '</svg>' + timeLabelsHtml + '</div>';
-}
-
-// 관심종목 삭제는 낙관적 업데이트(서버 응답 기다리지 않고 화면 먼저 반영)라 실패해도 사용자가
-// 모를 수 있음(화면엔 지워졌는데 서버엔 남아있어서 다음 새로고침 때 도로 나타남) - 실패 시
-// 로컬 배열에 되돌리고 사용자에게 알려서 D1과 화면 상태가 어긋난 채로 방치되지 않게 함.
-function deleteWatchlistItem(code, removedItem, removedIndex) {
-  fetch('/api/watchlist?code=' + code, { method: 'DELETE' })
-    .then(res => {
-      if (!res.ok) throw new Error('삭제 실패 (' + res.status + ')');
-    })
-    .catch(() => {
-      if (removedItem && !watchlistItems.some(w => w.code === code)) {
-        const idx = Math.min(removedIndex, watchlistItems.length);
-        watchlistItems.splice(idx, 0, removedItem);
-        renderWatchlist(watchlistItems);
-      }
-      alert('관심종목 삭제에 실패했습니다. 네트워크를 확인하고 다시 시도해주세요.');
-    });
-}
-
-function renderWatchlist(items) {
-  watchlistItems = items;
-  watchlistCodes = new Set(items.map(w => w.code));
-  const tbody = document.querySelector('#watchlist tbody');
-  const rows = items.map(w => {
-    const live = byCodeMap[w.code];
-    const liveQuote = liveQuoteCache[w.code];
-    const lastKnown = watchlistLastKnownMap[w.code];
-    // 관심종목은 전용 실시간 재조회(liveQuote)가 배치 데이터(live)보다 항상 정확도가 높음
-    // (배치 데이터는 오늘자 마지막 5~15% 스냅샷일 뿐이라, 그 이후 밴드를 벗어나며 크게 움직이면 낡은 값일 수 있음)
-    const currentPrice = liveQuote ? liveQuote.price : (live ? live.price : (lastKnown ? lastKnown.price : null));
-    const currentRate = liveQuote ? liveQuote.rate : (live ? live.rate : (lastKnown ? lastKnown.change_rate : null));
-    // 진입가가 0(신규 편입 당시 조회 실패로 아직 미확정)이고 현재가는 있으면, 현재가를
-    // 진입가로 대신 써서 "시세 없음"으로 방치되지 않게 함 (서버에도 같은 값이 곧 확정 저장됨).
-    let entryPrice = w.entry_price; // null(확정중)과 0(조회실패)을 구분하기 위해 그대로 둠
-    if (entryPrice === 0 && currentPrice !== null && currentPrice > 0) {
-      entryPrice = currentPrice;
-    }
-    let pnl = null;
-    if (currentPrice !== null && entryPrice > 0) {
-      pnl = computeRealisticPnl(entryPrice, currentPrice, 1000000);
-    }
-    return {
-      code: w.code, name: w.name,
-      price: currentPrice, rate: currentRate, volume: live ? live.volume : (lastKnown ? lastKnown.volume : null),
-      entryPrice, pnl, addedAt: w.added_at,
-      sourceBoard: w.source_board, addedState: w.added_state,
-    };
-  });
-
-  if (watchlistSort === 'pnlDesc') {
-    rows.sort((a, b) => (b.pnl ? b.pnl.netPnlPct : -Infinity) - (a.pnl ? a.pnl.netPnlPct : -Infinity));
-  } else if (watchlistSort === 'pnlAsc') {
-    rows.sort((a, b) => (a.pnl ? a.pnl.netPnlPct : Infinity) - (b.pnl ? b.pnl.netPnlPct : Infinity));
-  }
-
-  if (!rows.length) {
-    tbody.innerHTML = '<tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr>';
-  } else {
-    const buildRowHtml = (r) => {
-      const rateHtml = r.rate !== null
-        ? '<span class="' + (r.rate >= 0 ? 'up' : 'down') + '">' + (r.rate >= 0 ? '+' : '') + r.rate.toFixed(2) + '%</span>'
-        : '<span class="empty">-</span>';
-      const pnlHtml = r.pnl
-        ? '<span class="' + (r.pnl.netPnlPct >= 0 ? 'pnlPositive' : 'pnlNegative') + '">' +
-          (r.pnl.netPnlPct >= 0 ? '+' : '') + r.pnl.netPnlPct.toFixed(2) + '% (' + (r.pnl.netPnlAmount >= 0 ? '+' : '') + fmt(r.pnl.netPnlAmount) + '원)</span>'
-        : (r.entryPrice === null ? '<span class="empty">진입가 확정중</span>' : '<span class="empty">시세 없음</span>');
-      const riskStatus = watchlistRiskMap[r.code];
-      prevRiskState[r.code] = riskStatus;
-      const riskBadgeHtml = riskStatus === 'stop_loss_hit'
-        ? '<div class="riskBadge riskBadgeDown">⚠️ 손절선 도달</div>'
-        : riskStatus === 'take_profit_hit'
-        ? '<div class="riskBadge riskBadgeUp">🎯 익절선 도달</div>'
-        : '';
-      const exitReasons = watchlistExitMap[r.code];
-      const exitBadgeHtml = exitReasons && exitReasons.length
-        ? '<div class="riskBadge riskBadgeExit">🔻이탈신호: ' + exitReasons.join(' · ') + '</div>'
-        : '';
-      const levels = watchlistRiskLevelMap[r.code];
-      const riskLevelHtml = (levels && levels.stopLoss && levels.takeProfit)
-        ? '<div class="riskLevelLine">손절 ' + fmt(levels.stopLoss) + ' · 익절 ' + fmt(levels.takeProfit) + '</div>'
-        : '';
-      const addedContextHtml = (r.sourceBoard || r.addedState)
-        ? '<div class="addedContext">' +
-          (r.sourceBoard || '') +
-          (r.sourceBoard && r.addedState ? ' · ' : '') +
-          (r.addedState ? r.addedState.split(',').filter(Boolean).join(', ') : '') +
-          '</div>'
-        : '';
-      return (
-        '<tr class="clickable watchlistRow" data-code="' + r.code + '">' +
-          '<td>' + r.name + (r.addedAt ? '<div class="addedDate">' + formatAddedDate(r.addedAt) + '</div>' : '') + addedContextHtml + riskLevelHtml + riskBadgeHtml + exitBadgeHtml +
-          '<div class="riskBadge riskBadgeExit realtimeExitBadge" data-code="' + r.code + '" style="display:none;"></div>' +
-          '<div class="peakDrawdownLine" data-code="' + r.code + '" style="display:none;"></div>' +
-          '</td>' +
-          '<td>' + (r.price !== null ? fmt(r.price) : '<span class="empty">시세 없음</span>') + '</td>' +
-          '<td>' + rateHtml + '</td>' +
-          '<td>' + (r.entryPrice ? fmt(r.entryPrice) + '원' : (r.entryPrice === null ? '<span class="empty">확정중</span>' : '-')) + '</td>' +
-          '<td>' + pnlHtml + '</td>' +
-          '<td><span class="tradeDelBtn noRowClick" data-code="' + r.code + '">🗑️</span></td>' +
-        '</tr>' +
-        '<tr class="miniChartRow" data-code="' + r.code + '"><td colspan="6">' + renderMiniCandles(miniCandleCache[r.code], r.addedAt) + '</td></tr>'
-      );
-    };
-
-    // 5개씩 처리 - 최상위 5개는 즉시 그리고, 그 다음 5개, 또 그 다음 5개... 순으로
-    // 프레임마다 이어붙임. 종목을 대량으로 넣어도(수백개) 맨 위쪽부터 순서대로 바로바로
-    // 채워지는 걸 눈으로 확인할 수 있음.
-    const FIRST_CHUNK = 5, CHUNK_SIZE = 5;
-    tbody.innerHTML = rows.slice(0, FIRST_CHUNK).map(buildRowHtml).join('');
-    if (rows.length > FIRST_CHUNK) {
-      let idx = FIRST_CHUNK;
-      const renderNextChunk = () => {
-        if (idx >= rows.length) return;
-        const next = rows.slice(idx, idx + CHUNK_SIZE);
-        tbody.insertAdjacentHTML('beforeend', next.map(buildRowHtml).join(''));
-        idx += CHUNK_SIZE;
-        if (idx < rows.length) requestAnimationFrame(renderNextChunk);
-      };
-      requestAnimationFrame(renderNextChunk);
-    }
-
-    if (!tbody.dataset.clickBound) {
-      tbody.dataset.clickBound = '1';
-      tbody.addEventListener('click', (e) => {
-        const delBtn = e.target.closest('.tradeDelBtn');
-        if (delBtn) {
-          e.stopPropagation();
-          const code = delBtn.dataset.code;
-          const removedIndex = watchlistItems.findIndex(w => w.code === code);
-          const removedItem = removedIndex >= 0 ? watchlistItems[removedIndex] : null;
-          watchlistItems = watchlistItems.filter(w => w.code !== code);
-          renderWatchlist(watchlistItems); // 즉시 반영, 응답 안 기다림
-          if (currentModalCode === code) updateStarButton(code, currentModalName);
-          deleteWatchlistItem(code, removedItem, removedIndex);
-          return;
-        }
-        if (e.target.closest('.noRowClick')) return;
-        const tr = e.target.closest('tr.watchlistRow');
-        if (!tr) return;
-        const code = tr.dataset.code;
-        const item = watchlistItems.find(w => w.code === code);
-        const live = byCodeMap[code];
-        const liveQuote = liveQuoteCache[code];
-        const lastKnown = watchlistLastKnownMap[code];
-        const fallbackPrice = liveQuote ? liveQuote.price : (lastKnown ? lastKnown.price : 0);
-        const fallbackRate = liveQuote ? liveQuote.rate : (lastKnown ? lastKnown.change_rate : 0);
-        openStockModal(live || { code, name: item ? item.name : code, price: fallbackPrice, rate: fallbackRate, buyReq: 0, selReq: 0 });
-      });
-    }
-  }
-
-  // 미니차트는 여기서 개별조회하지 않음 - load()의 일괄조회(mini-candles-all) 하나가 전담.
-  // 예전엔 renderWatchlist가 다시 그려질 때마다(15초마다) 캐시 없는 종목 전부를 동시에
-  // fetch해서, 일괄조회와 겹치며 수십 개 동시요청이 쌓이는 게 체감 렉의 진짜 원인이었음.
-  refreshRealtimeWatchlist(); // 실시간 시세 즉시 1회 (이후는 3초 타이머가 담당)
-}
-
-document.getElementById('wlSortByAdded').addEventListener('click', (e) => {
-  watchlistSort = 'added';
-  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderWatchlist(watchlistItems);
-});
-document.getElementById('wlSortByPnlDesc').addEventListener('click', (e) => {
-  watchlistSort = 'pnlDesc';
-  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderWatchlist(watchlistItems);
-});
-document.getElementById('wlSortByPnlAsc').addEventListener('click', (e) => {
-  watchlistSort = 'pnlAsc';
-  document.querySelectorAll('#wlSortByAdded, #wlSortByPnlDesc, #wlSortByPnlAsc').forEach(b => b.classList.remove('active'));
-  e.target.classList.add('active');
-  renderWatchlist(watchlistItems);
-});
-
-// 관심종목 단독 새로고침 (별표 토글 직후처럼 즉시 반영이 필요할 때만 사용,
-// 평상시 10초 주기 갱신은 /api/latest 응답에 묻어오는 데이터로 처리해서 별도 요청 안 나감)
-function loadWatchlist() {
-  fetch('/api/watchlist')
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) return;
-      renderWatchlist(data.items);
-    })
-    .catch(() => {});
-}
-
-function updateStarButton(code, name, price) {
-  const starBtn = document.getElementById('modalStarBtn');
-  const isStarred = watchlistCodes.has(code);
-  starBtn.textContent = isStarred ? '★' : '☆';
-  starBtn.classList.toggle('active', isStarred);
-  starBtn.onclick = () => {
-    if (watchlistCodes.has(code)) {
-      const removedIndex = watchlistItems.findIndex(w => w.code === code);
-      const removedItem = removedIndex >= 0 ? watchlistItems[removedIndex] : null;
-      watchlistItems = watchlistItems.filter(w => w.code !== code);
-      renderWatchlist(watchlistItems); // 서버 응답 기다리지 않고 로컬에서 즉시 반영 (깜빡임 없음)
-      updateStarButton(code, name, price);
-      deleteWatchlistItem(code, removedItem, removedIndex);
-    } else {
-      // entry_price는 아직 미확정(null) — 화면엔 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
-      const sourceBoard = currentModalSourceBoard;
-      const addedState = currentModalAddedState;
-      watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString(), source_board: sourceBoard, added_state: addedState }, ...watchlistItems];
-      renderWatchlist(watchlistItems);
-      updateStarButton(code, name, price);
-      fetch('/api/watchlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, name, sourceBoard, addedState }),
-      })
-        .then(res => res.json())
-        .then(data => {
-          if (data.ok) {
-            const w = watchlistItems.find(x => x.code === code);
-            if (w) { w.entry_price = data.entryPrice; renderWatchlist(watchlistItems); }
-          }
-        })
-        .catch(() => {});
-    }
-  };
-}
-
-// (초기 관심종목 표시는 아래 load() 최초 호출에 포함되어 처리됨 - 중복 요청 방지)
-
-// TOP10 표 안 별표 클릭 (행 전체 클릭인 코드복사+앱실행과 분리)
-document.body.addEventListener('click', (e) => {
-  const star = e.target.closest('.topPickStar');
-  if (!star) return;
-  e.stopPropagation();
-  const code = star.dataset.code, name = star.dataset.name;
-  const sourceBoard = star.dataset.board || '';
-  const addedState = star.dataset.badges || '';
-
-  if (watchlistCodes.has(code)) {
-    const removedIndex = watchlistItems.findIndex(w => w.code === code);
-    const removedItem = removedIndex >= 0 ? watchlistItems[removedIndex] : null;
-    watchlistItems = watchlistItems.filter(w => w.code !== code);
-    star.classList.remove('active');
-    star.textContent = '☆';
-    renderWatchlist(watchlistItems); // 서버 재조회 없이 로컬에서 즉시 반영
-    deleteWatchlistItem(code, removedItem, removedIndex);
-  } else {
-    // entry_price는 아직 미확정(null) — 별표만 즉시 반영, 진입가는 서버 응답 오면 정확한 값으로 채움
-    watchlistItems = [{ code, name, entry_price: null, added_at: new Date().toISOString(), source_board: sourceBoard, added_state: addedState }, ...watchlistItems];
-    star.classList.add('active');
-    star.textContent = '★';
-    renderWatchlist(watchlistItems);
-    fetch('/api/watchlist', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, name, sourceBoard, addedState }),
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.ok) {
-          const w = watchlistItems.find(x => x.code === code);
-          if (w) { w.entry_price = data.entryPrice; renderWatchlist(watchlistItems); }
-        }
-      })
-      .catch(() => {});
-  }
-});
-
-document.getElementById('patternScanBtn').addEventListener('click', (e) => {
-  const btn = e.target;
-  const tbody = document.querySelector('#patternScan tbody');
-  btn.disabled = true;
-  btn.textContent = '스캔 중...';
-  tbody.innerHTML = '<tr><td class="empty">지난 1주일 데이터와 비교 중... (20~30초 소요)</td></tr>';
-
-  fetch('/api/pattern-scan')
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) {
-        tbody.innerHTML = '<tr><td class="empty">스캔 실패: ' + (data.error || '알 수 없는 오류') + '</td></tr>';
-        return;
-      }
-      const results = data.results.filter(r => r.score >= 0.5);
-      tbody.innerHTML = results.length
-        ? results.map(r => {
-            const d = r.matchDate;
-            const dateLabel = d.slice(4,6) + '/' + d.slice(6,8);
-            const pct = (r.score * 100).toFixed(1);
-            return '<tr class="clickable" data-code="' + r.code + '">' +
-              '<td>' + r.name + '</td>' +
-              '<td>' + dateLabel + '</td>' +
-              '<td class="' + (r.score >= 0.8 ? 'up' : '') + '">' + pct + '%</td>' +
-            '</tr>';
-          }).join('')
-        : '<tr><td class="empty">유사도 50% 이상인 종목 없음 (' + data.scanned + '종목 스캔)</td></tr>';
-
-      tbody.querySelectorAll('tr.clickable').forEach(tr => {
-        tr.addEventListener('click', () => {
-          const item = byCodeMap[tr.dataset.code];
-          if (item) openStockModal(item);
-        });
-      });
-    })
-    .catch(err => {
-      tbody.innerHTML = '<tr><td class="empty">스캔 요청 오류: ' + err.message + '</td></tr>';
-    })
-    .finally(() => {
-      btn.disabled = false;
-      btn.textContent = '스캔 시작';
-    });
-});
-
-// 조건검색 실시간 포착 - 조건에 편입되는 순간 즉시 화면에 뜸 (2분 cron 대기 없음)
-// 키움 실시간 시각은 "125003"(HHMMSS) 형태로 옴
-function fmtHHMM(t) {
-  const s = String(t || '');
-  return s.length >= 4 ? s.slice(0, 2) + ':' + s.slice(2, 4) : s;
-}
-
-// 조건검색 신규편입 종목 관심종목 자동추가 - "이미 충족중이던 것"(initial)은 새 신호가 아니라서 제외,
-// 이번 세션에서 한 번 처리한 code는 autoAddedCondCodes에 남겨서 재편입/재렌더링 때 중복 추가 안 되게 함.
-const autoAddedCondCodes = new Set();
-const AUTO_ADD_MAX = 10; // 관심종목 무한정 늘어나는 것 방지 - 동시 보유 상한
-function autoAddConditionHits(history, condName) {
-  const label = '자동편입' + (condName ? '(' + condName + ')' : '');
-  for (const h of history) {
-    if (h.initial || !h.time) continue; // 최초 스냅샷부터 있던 건 "신규 편입"이 아님
-    if (watchlistCodes.has(h.code)) {
-      // 이미 관심종목에 있으면 새로 담지 않고 매번 리스트 맨 위로 이동 (재편입마다 반복 실행)
-      // (클라이언트만 올리면 15초 주기 load()가 서버 added_at 기준으로 되돌려버리므로 서버도 같이 갱신)
-      const idx = watchlistItems.findIndex(w => w.code === h.code);
-      if (idx > 0) {
-        const [w] = watchlistItems.splice(idx, 1);
-        w.added_at = new Date().toISOString();
-        watchlistItems.unshift(w);
-        renderWatchlist(watchlistItems);
-      }
-      if (!autoAddedCondCodes.has(h.code + ':' + h.time)) {
-        autoAddedCondCodes.add(h.code + ':' + h.time); // 같은 편입 이벤트로 중복 POST 방지 (편입시각 단위)
-        const existing = watchlistItems.find(w => w.code === h.code);
-        const nm = existing ? existing.name : h.code;
-        fetch('/api/watchlist', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code: h.code, name: nm, sourceBoard: '실시간포착', addedState: label, touchOnly: true }),
-        }).catch(() => {});
-      }
+  // 1) 데이터랩 트렌드 키워드로 실제 인기 상품명 발굴 (분야 목록 자체는 소수라 순차, 키워드별 검색은 병렬)
+  for (const c of NAVER_SHOPPING_CID_LIST) {
+    const { keywords, error: kwErr } = await naverShoppingHotKeywords(env, c.cid, 8);
+    if (kwErr) {
+      console.log(`네이버 인기검색어(${c.name}) 실패: ${kwErr}`);
       continue;
     }
-    if (autoAddedCondCodes.has(h.code + ':' + h.time)) continue;
-    autoAddedCondCodes.add(h.code + ':' + h.time);
-    if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
-    // "실시간포착" 보드가 실거래 손실의 대부분(2026-08-09 performance-report: 117건 중 81패, -604,970원)을
-    // 차지한 원인이 필터 없는 무조건 자동편입이었음. relay가 이제 체결(0B)뿐 아니라 호가잔량(0D)도
-    // 구독해서 isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 틱마다 즉시 계산해서
-    // 내려주므로(2분 cron 배치가 아니라 진짜 실시간) - 당일신고가(백테스트 edge -0.075로 가장 일관된
-    // 악재 신호)인데 수급유입 신호가 하나도 없으면 추격매수 위험이 크다고 판단해서 자동편입만 거름.
-    // 편입 직후 몇백ms~몇 초는 relay 구독이 아직 안 붙어 데이터가 없을 수 있는데, 이 경우엔 판단
-    // 근거가 없으니 보수적으로 그냥 담음(막지 않음).
-    const liveSig = liveSignalCache[h.code];
-    if (liveSig && liveSig.isTodayHigh && !liveSig.bidTurnedPositive && !liveSig.buyReqSpike && !liveSig.sellReqThinning) continue;
-
-    const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
-    watchlistCodes.add(h.code);
-    watchlistItems = [{ code: h.code, name, entry_price: null, added_at: new Date().toISOString(), source_board: '실시간포착', added_state: label }, ...watchlistItems];
-    renderWatchlist(watchlistItems);
-    fetch('/api/watchlist', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: h.code, name, sourceBoard: '실시간포착', addedState: label }),
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.ok) {
-          const w = watchlistItems.find(x => x.code === h.code);
-          if (w) { w.entry_price = data.entryPrice; renderWatchlist(watchlistItems); }
-        } else {
-          // 서버 저장 실패 시 로컬 상태도 되돌림
-          watchlistCodes.delete(h.code);
-          watchlistItems = watchlistItems.filter(x => x.code !== h.code);
-          renderWatchlist(watchlistItems);
-        }
-      })
-      .catch(() => {
-        watchlistCodes.delete(h.code);
-        watchlistItems = watchlistItems.filter(x => x.code !== h.code);
-        renderWatchlist(watchlistItems);
-      });
-  }
-}
-
-function renderConditionDock(cond) {
-  const board = document.getElementById('conditionDock');
-  if (!cond || !cond.seq) { board.style.display = 'none'; return; }
-  board.style.display = 'block';
-
-  const tbody = document.querySelector('#conditionList tbody');
-  const codes = cond.codes || [];
-  conditionCodes = codes.slice(0, 50); // 실시간 시세 구독 우선순위에 쓰임
-  conditionCodes.forEach(c => {
-    if (!realtimeListCodes.includes(c)) realtimeListCodes.unshift(c);
-  });
-  if (realtimeListCodes.length > 180) realtimeListCodes.length = 180;
-
-  // 편입 이력 기준으로 표시 - 조건에서 금방 빠져나간 종목도 사라지지 않고 남음
-  const history = cond.history || [];
-  autoAddConditionHits(history, cond.name);
-  const countEl = document.getElementById('conditionDockCount');
-  if (countEl) countEl.textContent = history.length ? '(' + history.length + '건 · 현재 조건 ' + (cond.count || 0) + ')' : '';
-  if (!history.length) {
-    tbody.innerHTML = '<tr><td class="empty">아직 포착된 종목 없음 (감시 중)</td></tr>';
-    return;
-  }
-
-  // 한 줄 표시: 별표 · 종목명(+신호아이콘) · 등락률 · 포착시각
-  tbody.innerHTML = history.slice(0, 25).map(h => {
-    const live = liveQuoteCache[h.code];
-    const rate = live ? live.rate : h.rate;
-    const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
-    const rateHtml = (rate !== null && rate !== undefined)
-      ? '<span class="' + (rate >= 0 ? 'up' : 'down') + '">' + (rate >= 0 ? '+' : '') + Number(rate).toFixed(2) + '%</span>'
-      : '<span class="empty">-</span>';
-    // 다음 2분 cron이 이 종목을 한 번이라도 스캔해서 byCodeMap에 들어왔으면, 그 신호들을 압축 아이콘으로 붙임
-    // (한 줄 레이아웃이라 전체 배지는 못 넣고, 강한 신호 몇 개만 아이콘 하나씩)
-    const info = byCodeMap[h.code];
-    let icons = '';
-    if (info) {
-      if (info.cntrStr >= 105) icons += '💪';
-      if (info.buyReq > info.selReq) icons += '🔄';
-    }
-    const verdictHtml = info ? '<span class="verdictIcon">' + computeVerdict(info).emoji + '</span>' : '';
-    return '<tr class="clickable dockRow' + (h.stillIn ? '' : ' dockRowOut') + '" data-code="' + h.code + '">' +
-      '<td class="dockStar">' + starHtml({ code: h.code, name: name }, '실시간포착') + '</td>' +
-      '<td class="dockName">' + verdictHtml + name + (icons ? ' <span class="dockIcons">' + icons + '</span>' : '') + '</td>' +
-      '<td class="dockRate">' + rateHtml + '</td>' +
-      '<td class="dockTime">' + (h.initial ? '<span class="empty">충족중</span>' : '⚡' + fmtHHMM(h.time)) + '</td>' +
-      '</tr>';
-  }).join('');
-
-  tbody.querySelectorAll('tr.dockRow').forEach(tr => {
-    tr.addEventListener('click', (e) => {
-      if (e.target.closest('.noRowClick')) return;
-      const code = tr.dataset.code;
-      const h = history.find(x => x.code === code);
-      const live = liveQuoteCache[code];
-      const item = byCodeMap[code] || {
-        code: code,
-        name: (h && h.name) || code,
-        price: live ? live.price : (h ? h.price : 0),
-        rate: live ? live.rate : (h ? h.rate : 0),
-        buyReq: 0, selReq: 0, cntrStr: 0, signalChecks: [], volume: 0,
-      };
-      currentModalSourceBoard = '실시간포착';
-      currentModalAddedState = '';
-      openStockModal(item);
-    });
-  });
-}
-
-function renderMarketIndexBar(index, globalIndex) {
-  const hasKr = index && index.kospi && index.kosdaq;
-  const hasGlobal = globalIndex && globalIndex.ok;
-  if (!hasKr && !hasGlobal) return;
-  const bar = document.getElementById('marketIndexBar');
-  const track = document.getElementById('marketIndexBarTrack');
-  const fmtIdx = (label, d) => {
-    const cls = d.rate >= 0 ? 'up' : 'down';
-    return '<span class="tickerItem">' + label + ' <b>' + d.price.toFixed(2) + '</b> ' +
-      '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
-  };
-  const fmtFx = (label, d, multiplier, decimals) => {
-    const cls = d.rate >= 0 ? 'up' : 'down';
-    const price = multiplier ? d.price * multiplier : d.price;
-    return '<span class="tickerItem">' + label + ' <b>' + price.toFixed(decimals) + '</b> ' +
-      '<span class="' + cls + '">' + (d.rate >= 0 ? '+' : '') + d.rate.toFixed(2) + '%</span></span>';
-  };
-  const fmtUsdKrw = (d) => fmtFx('USD/KRW', d, 1, 1);
-  weakMarket = hasKr && index.kospi.rate < 0 && index.kosdaq.rate < 0;
-  let krHtml = '';
-  if (hasKr) {
-    krHtml = fmtIdx('KOSPI', index.kospi) + fmtIdx('KOSDAQ', index.kosdaq) +
-      '';
-  }
-  let globalHtml = '';
-  if (hasGlobal) {
-    if (globalIndex.dow) globalHtml += fmtIdx('다우', globalIndex.dow);
-    if (globalIndex.nasdaq) globalHtml += fmtIdx('나스닥', globalIndex.nasdaq);
-    if (globalIndex.sp500) globalHtml += fmtIdx('S&P500', globalIndex.sp500);
-    if (globalIndex.usdkrw) globalHtml += fmtUsdKrw(globalIndex.usdkrw);
-    if (globalIndex.eurkrw) globalHtml += fmtFx('EUR/KRW', globalIndex.eurkrw, 1, 1);
-    if (globalIndex.jpykrw) globalHtml += fmtFx('JPY/KRW(100엔)', globalIndex.jpykrw, 100, 1);
-    if (globalIndex.cnykrw) globalHtml += fmtFx('CNY/KRW', globalIndex.cnykrw, 1, 1);
-  }
-  const oneSet = krHtml + globalHtml;
-  // 내용을 2번 이어붙이고 -50% 지점까지만 이동시키면(CSS keyframes) 이음새 없이 계속 흐르는 것처럼 보임.
-  track.innerHTML = oneSet + oneSet;
-  bar.style.visibility = 'visible';
-}
-
-function applyRealtimeStocks(stocks) {
-  if (!stocks) return;
-  for (const code of Object.keys(stocks)) {
-    const s = stocks[code];
-    if (!s) continue;
-    // 가격이 아직 없어도(0D 호가 틱만 먼저 도착한 경우) 신호 자체는 캐시해둠 - 자동편입 필터 등에서 씀
-    liveSignalCache[code] = {
-      cntrStr: typeof s.cntrStr === 'number' ? s.cntrStr : (liveSignalCache[code] && liveSignalCache[code].cntrStr),
-      isTodayHigh: typeof s.isTodayHigh === 'boolean' ? s.isTodayHigh : (liveSignalCache[code] && liveSignalCache[code].isTodayHigh),
-      bidTurnedPositive: !!s.bidTurnedPositive,
-      buyReqSpike: !!s.buyReqSpike,
-      sellReqThinning: !!s.sellReqThinning,
-    };
-    if (!s.price) continue;
-    liveQuoteCache[code] = { price: s.price, rate: s.rate, fetchedAt: Date.now() };
-    updateWatchlistPriceCells(code);
-    updateListRowRealtime(code, s);
-    updateRealtimeExitSignal(code, s);
-    if (currentModalCode === code) syncPriceEverywhere(code, s.price, s.rate);
-    updateMiniChartLastCandle(code, s.price);
-  }
-}
-
-// 관심종목 미니차트의 마지막 캔들을 실시간 체결가로 즉시 갱신 - 60~150초 캐시된 캔들 데이터를
-// 매번 다시 받아오지 않고, 이미 그려진 캔들의 종가/고가/저가만 실시간으로 갱신해서 다시 그림.
-// 분봉이 넘어가는 시점 판단은 하지 않음(다음 캐시 갱신 때 relay가 새 분봉을 만들어 자연히 반영됨) -
-// 이 함수는 "현재 진행 중인 마지막 분봉"이 실시간으로 살아 움직이는 느낌만 주는 용도.
-function updateMiniChartLastCandle(code, price) {
-  const candles = miniCandleCache[code];
-  if (!candles || candles.length === 0) return;
-  const last = candles[candles.length - 1];
-  last.close = price;
-  if (price > last.high) last.high = price;
-  if (price < last.low) last.low = price;
-  updateMiniChartCell(code);
-}
-
-// 지수/실시간포착/관심종목시세 - 예전엔 API 3개를 따로(2~3초 간격씩) 폴링했는데, 전부 relay 메모리에서
-// 읽는 거라 나눌 이유가 없어서 하나로 합침 (Cloudflare Worker 호출 3회 -> 1회, relay 왕복도 3회 -> 1회)
-function pollRealtimeAll() {
-  const listParam = realtimeListCodes.slice(0, 180).join(',');
-  fetch('/api/realtime-all?list=' + encodeURIComponent(listParam))
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) return;
-      if (data.index && data.index.kospi) lastKrIndex = data.index;
-      if (data.globalIndex) lastGlobalIndex = data.globalIndex;
-      renderMarketIndexBar((data.index && data.index.kospi) ? data.index : lastKrIndex, lastGlobalIndex);
-      renderConditionDock(data.condition);
-      applyRealtimeStocks(data.stocks);
-    })
-    .catch(() => {});
-}
-
-// SSE(진짜 실시간 스트리밍)를 우선 시도 - relay가 값을 받는 즉시(최대 200ms 지연) push해줌.
-// 기존 2초 폴링보다 최대 10배 빠름. 연결 실패/중간에 끊기면 2초 폴링으로 자동 폴백해서
-// 화면이 멈추지 않게 함(폴백은 페이지 새로고침 전까지 유지 - 재연결 폭주 방지).
-let sseFailedPermanently = false;
-let realtimePollTimer = null;
-let currentEventSource = null; // 화면 hidden/visible 전환 시 완전히 끊고 재연결하기 위해 전역 참조 보관
-function stopRealtimePolling() {
-  if (realtimePollTimer) { clearInterval(realtimePollTimer); realtimePollTimer = null; }
-}
-function startRealtimePolling() {
-  if (realtimePollTimer) return;
-  pollRealtimeAll();
-  realtimePollTimer = setInterval(() => { if (!document.hidden) pollRealtimeAll(); }, 2000);
-}
-function stopRealtimeStream() {
-  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
-  stopRealtimePolling();
-}
-function startRealtimeStream() {
-  if (sseFailedPermanently || !('EventSource' in window)) { startRealtimePolling(); return; }
-  const listParam = realtimeListCodes.slice(0, 180).join(',');
-  const es = new EventSource('/api/realtime-stream?list=' + encodeURIComponent(listParam));
-  currentEventSource = es;
-  let gotFirstMessage = false;
-  es.onmessage = (e) => {
-    gotFirstMessage = true;
-    if (document.hidden) return; // 화면이 꺼지면 stopRealtimeStream()이 연결 자체를 끊으므로 이 경로는 사실상 안 탐
-    try {
-      const data = JSON.parse(e.data);
-      if (data.index && data.index.kospi) lastKrIndex = data.index;
-      renderMarketIndexBar((data.index && data.index.kospi) ? data.index : lastKrIndex, lastGlobalIndex);
-      renderConditionDock(data.condition);
-      applyRealtimeStocks(data.stocks);
-    } catch (err) {}
-  };
-  es.onerror = () => {
-    if (currentEventSource !== es) return; // 이미 stopRealtimeStream()으로 정리된 연결의 뒤늦은 에러 콜백 무시
-    es.close();
-    currentEventSource = null;
-    if (!gotFirstMessage) {
-      // 연결 자체가 안 됐으면(구조 문제) 폴백으로 완전히 전환하고 재시도 안 함
-      sseFailedPermanently = true;
-      startRealtimePolling();
-    } else {
-      // 한 번이라도 받았다면 일시적 끊김일 수 있으니 3초 뒤 재연결 시도
-      setTimeout(startRealtimeStream, 3000);
-    }
-  };
-}
-
-// 해외지수(다우/나스닥/S&P500/원달러) - SSE는 relay가 국내 실시간체결만 보내므로 별도로 60초마다
-// 가져옴. SSE/폴링 둘 다에서 재사용할 수 있게 마지막 값을 변수에 저장해둠.
-function pollGlobalIndex(isRetry) {
-  fetch('/api/global-index')
-    .then(res => res.json())
-    .then(data => {
-      if (data.ok) {
-        lastGlobalIndex = data;
-        if (data.krIndex && (!lastKrIndex || lastKrIndex.stale)) {
-          lastKrIndex = data.krIndex;
-        }
-        try {
-          renderMarketIndexBar(lastKrIndex, lastGlobalIndex);
-        } catch (e) {
-          console.error('[지수바 렌더 에러]', e.message || e);
-        }
-      } else if (!isRetry) {
-        // 응답은 왔지만 ok:false - 일시적 오류일 수 있으니 5초 뒤 한 번만 재시도
-        setTimeout(() => pollGlobalIndex(true), 5000);
+    const results = await Promise.all(keywords.map((kw) => naverShoppingSearch(kw, env, 3, "sim")));
+    for (const { items: found, error: searchErr } of results) {
+      if (searchErr) continue;
+      for (const f of found) {
+        if (isTechRelated(f.name)) items.push({ category: `네이버트렌드(${c.name})`, name: f.name });
       }
-    })
-    .catch(() => {
-      // 네트워크 실패도 동일하게 5초 뒤 한 번만 재시도 - 다음 60초 정기폴링까지 끊긴 채로 방치되지 않게 함
-      if (!isRetry) setTimeout(() => pollGlobalIndex(true), 5000);
-    });
-}
-pollGlobalIndex();
-setInterval(() => { if (!document.hidden) pollGlobalIndex(); }, 60000);
-
-// 지수 티커를 터치로 스크롤하는 동안엔 자동 애니메이션을 멈춰서 두 움직임이 서로 싸우지 않게 함.
-// 손을 뗀 뒤 1.5초간 추가 조작이 없으면 자동으로 다시 흐르기 시작.
-(() => {
-  const bar = document.getElementById('marketIndexBar');
-  const track = document.getElementById('marketIndexBarTrack');
-  let resumeTimer = null;
-  const pause = () => {
-    track.classList.add('paused');
-    clearTimeout(resumeTimer);
-  };
-  const scheduleResume = () => {
-    clearTimeout(resumeTimer);
-    resumeTimer = setTimeout(() => track.classList.remove('paused'), 0);
-  };
-  bar.addEventListener('touchstart', pause, { passive: true });
-  bar.addEventListener('touchend', scheduleResume, { passive: true });
-  bar.addEventListener('scroll', () => { pause(); scheduleResume(); }, { passive: true });
-
-  // 매 프레임 바 중앙에 가장 가까운 항목에만 확대 클래스를 부여
-  let lastCentered = null;
-  const updateCentered = () => {
-    const barRect = bar.getBoundingClientRect();
-    const centerX = barRect.left + barRect.width / 2;
-    const items = track.querySelectorAll('.tickerItem');
-    let closest = null, closestDist = Infinity;
-    items.forEach(el => {
-      const r = el.getBoundingClientRect();
-      const itemCenter = r.left + r.width / 2;
-      const dist = Math.abs(itemCenter - centerX);
-      if (dist < closestDist) { closestDist = dist; closest = el; }
-    });
-    if (closest !== lastCentered) {
-      if (lastCentered) lastCentered.classList.remove('centered');
-      if (closest) closest.classList.add('centered');
-      lastCentered = closest;
-    }
-    requestAnimationFrame(updateCentered);
-  };
-  requestAnimationFrame(updateCentered);
-})();
-// ---------- 클라이언트 장시간 판단 (D1/relay 불필요 폴링 억제용) ----------
-// 장마감 후에도 탭을 계속 켜놨을 때 15초/30초/2분 주기 폴링들이 D1을 계속 두드리는 낭비를 막기 위해,
-// 장중이 아니면 각 타이머 콜백 자체를 스킵함(타이머는 유지, 실행만 건너뜀 - 장 시작하면 자동 재개).
-// cutoffMinute 기본값은 15:50이지만, mainRefreshTimer만 15:50 일괄정리 결과를 화면에 반영해야 해서
-// 15:52까지 살려둠(다른 타이머보다 2분 늦게 꺼짐).
-function isMarketHoursClient(cutoffMinute) {
-  const kst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  const day = kst.getDay();
-  if (day === 0 || day === 6) return false;
-  const minutes = kst.getHours() * 60 + kst.getMinutes();
-  return minutes >= 9 * 60 + 1 && minutes <= (cutoffMinute ?? 15 * 60 + 50);
-}
-
-startRealtimeStream();
-// SSE는 연결 시점의 종목 목록으로 구독이 고정되므로, 목록이 바뀔 수 있는 상황(조건검색 신규편입 등)에
-// 대응하기 위해 구독 갱신만 별도로 가볍게 유지 (실시간값 자체는 SSE로 이미 받고 있으므로 이 요청은
-// subscribe만 하고 응답은 버림 - 서버 부하 거의 없음).
-setInterval(() => {
-  if (document.hidden || !isMarketHoursClient()) return;
-  const listParam = realtimeListCodes.slice(0, 180).join(',');
-  fetch('/api/realtime-resubscribe?list=' + encodeURIComponent(listParam)).catch(() => {});
-}, 5000);
-
-// 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
-// cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
-// "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
-const prevCntrStrMap = {}; // 직전 체결강도 - 급락 감지에 씀
-// 브라우저 알림 - 탭을 안 보고 있어도 강한 신호(관심종목 이탈신호, 손절/익절 도달)를 놓치지 않게 함.
-// 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
-
-// 하단 실시간 포착 패널 접기/펼치기 (화면 좁을 때 방해되지 않게)
-document.getElementById('conditionDockHead').addEventListener('click', () => {
-  const dock = document.getElementById('conditionDock');
-  dock.classList.toggle('collapsed');
-  document.getElementById('conditionDockToggle').textContent =
-    dock.classList.contains('collapsed') ? '▲' : '▼';
-  // 접으면 본문 여백도 줄여서 화면을 넓게 씀
-  document.body.style.paddingBottom = dock.classList.contains('collapsed') ? '80px' : '195px';
-});
-
-// 시장 전체 지수 표시 - 지수가 빠지는 날엔 급등주 신호 신뢰도가 떨어지므로 그 맥락을 같이 보여줌
-// (렌더링은 renderMarketIndexBar가 담당, 폴링은 아래 통합 pollRealtimeAll이 담당)
-
-
-// 지난 24시간 안에 확인할 이상상황(relay 끊김/cron실패/메모리경고 등)이 있으면 상단에 배너로 알려줌.
-// 사람이 매번 system-events를 열어보지 않아도 되게 하는 게 목적.
-// Cloudflare 사용량 바로가기 - GraphQL API 인증이 계속 막혀서(계정 권한 이슈),
-// 커스텀 패널 대신 Cloudflare가 이미 잘 보여주는 실제 대시보드로 바로 이동하는 링크로 대체함.
-// 평소엔 숨겨두고 탭하면 펼쳐짐.
-document.getElementById('cfUsageToggle').addEventListener('click', (e) => {
-  e.stopPropagation();
-  const panel = document.getElementById('cfUsagePanel');
-  if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
-  panel.style.display = 'block';
-  panel.innerHTML =
-    '<div style="color:#eee; font-weight:600; margin-bottom:6px;">Cloudflare 사용량 바로가기</div>' +
-    '<a href="https://dash.cloudflare.com/709dcc6af36c8ee7b6d3d99e7a9fe422/workers/services/view/kiwoomapi/production" target="_blank" rel="noopener" class="cfUsageLink">📈 Workers 요청/CPU 사용량</a>' +
-    '<a href="https://dash.cloudflare.com/709dcc6af36c8ee7b6d3d99e7a9fe422/workers/d1" target="_blank" rel="noopener" class="cfUsageLink">🗄️ D1 데이터베이스 사용량</a>';
-});
-// 패널 바깥 아무 곳이나 탭하면 닫힘 (패널 자체 클릭은 예외 처리)
-document.addEventListener('click', (e) => {
-  const panel = document.getElementById('cfUsagePanel');
-  if (panel.style.display === 'block' && !panel.contains(e.target)) {
-    panel.style.display = 'none';
-  }
-});
-
-function loadSystemStatusBanner() {
-  fetch('/api/system-status-summary')
-    .then(res => res.json())
-    .then(data => {
-      const banner = document.getElementById('systemStatusBanner');
-      if (!data.ok || !data.hasIssues) { banner.style.display = 'none'; return; }
-      const summary = data.kinds.map(k => k.kind + ' ' + k.count + '건').join(' · ');
-      banner.textContent = '⚠️ 최근 24시간 확인 필요: ' + summary;
-      banner.style.display = 'block';
-    })
-    .catch(() => {});
-}
-loadSystemStatusBanner();
-setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadSystemStatusBanner(); }, 120000); // 2분마다
-
-function loadWatchlistDailyStats() {
-  fetch('/api/watchlist-daily-stats')
-    .then(res => res.json())
-    .then(data => {
-      const tag = document.getElementById('autoRemovedTag');
-      const topBar = document.getElementById('netPnlBar');
-      const topBarValue = document.getElementById('netPnlBarValue');
-      if (!data.ok) { tag.style.visibility = 'hidden'; topBar.style.visibility = 'hidden'; return; }
-      const netWon = data.netWon || 0;
-      const netColor = netWon > 0 ? '#e03131' : (netWon < 0 ? '#1971c2' : 'inherit'); // 국내 관례: 상승/이익 빨강, 하락/손실 파랑
-      // 팝업이 daily-stats와 같은 날짜를 보도록 statsDate를 그대로 넘김 (statsDate가 'today'면
-      // 팝업 쪽에서 date 파라미터 없이 오늘로 조회)
-      const popupDate = (data.statsDate && data.statsDate !== 'today') ? data.statsDate : '';
-      const dateLabel = popupDate ? '(' + popupDate + ' 기준) ' : '';
-      tag.innerHTML =
-        dateLabel + '오늘 추가 ' + data.added + '종목 · 자동삭제 ' + data.removed + '종목' +
-        ' (<span class="exitCountBtn" data-type="profit" data-date="' + popupDate + '" style="color:#e03131">익절 ' + (data.removedProfit || 0) + '</span> / ' +
-        '<span class="exitCountBtn" data-type="loss" data-date="' + popupDate + '" style="color:#1971c2">손절 ' + (data.removedLoss || 0) + '</span>)' +
-        ' · 실현손익 <span style="color:' + netColor + '">' + (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원</span>' +
-        ' (<span style="color:#e03131">익 +' + (data.profitWon || 0).toLocaleString() + '</span> / <span style="color:#1971c2">손 ' + (data.lossWon || 0).toLocaleString() + '</span>)';
-      tag.style.visibility = 'visible';
-
-      // 최상단 요약바 - 스크롤해도 항상 보이는 위치라 한눈에 오늘 성적 확인용
-      topBarValue.textContent = (netWon >= 0 ? '+' : '') + netWon.toLocaleString() + '원';
-      topBarValue.className = netWon > 0 ? 'up' : (netWon < 0 ? 'down' : '');
-      topBar.style.visibility = 'visible';
-    })
-    .catch(() => {});
-}
-loadWatchlistDailyStats();
-setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadWatchlistDailyStats(); }, 5000); // 5초마다 - 관심종목 자동삭제(익절/손절/정원초과)가 일어나는 즉시에 가깝게 반영
-
-// 익절/손절 카운트 버튼 - 눌렀을 때 그날 실제로 익절/손절된 종목 목록을 팝업으로 보여줌
-const exitListOverlay = document.getElementById('exitListOverlay');
-const exitListTitle = document.getElementById('exitListTitle');
-const exitListBody = document.getElementById('exitListBody');
-
-function closeExitListPopup() {
-  exitListOverlay.classList.remove('open');
-}
-document.getElementById('exitListClose').addEventListener('click', closeExitListPopup);
-exitListOverlay.addEventListener('click', (e) => {
-  if (e.target === exitListOverlay) closeExitListPopup();
-});
-
-let exitListCurrentItems = []; // 클릭 시 openStockModal에 넘길 데이터를 code로 찾기 위한 캐시
-
-function openExitListPopup(type, dateStr) {
-  const isProfit = type === 'profit';
-  exitListTitle.textContent = (isProfit ? '🔴 오늘 익절 종목' : '🔵 오늘 손절 종목') + (dateStr ? ' (' + dateStr + ')' : '');
-  exitListBody.innerHTML = '<div class="detailLoading">불러오는 중...</div>';
-  exitListOverlay.classList.add('open');
-  const qs = dateStr ? ('?date=' + encodeURIComponent(dateStr)) : '';
-  fetch('/api/watchlist-exit-list' + qs)
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) { exitListBody.innerHTML = '<div class="detailError">불러오기 실패</div>'; return; }
-      const list = isProfit ? data.profitList : data.lossList;
-      exitListCurrentItems = list;
-      if (!list.length) {
-        exitListBody.innerHTML = '<div class="empty">' + (isProfit ? '익절' : '손절') + '된 종목이 없습니다</div>';
-        return;
-      }
-      exitListBody.innerHTML = list.map((item, idx) => {
-        const pctCls = item.pnlPct >= 0 ? 'up' : 'down';
-        const timeLabel = new Date(item.recordedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
-        return '<div class="exitListRow clickable" data-idx="' + idx + '">' +
-          '<div><div class="exitListName">' + item.name + '</div>' +
-          '<div class="exitListMeta">' + item.code + ' · ' + fmt(item.entryPrice) + '원 → ' + fmt(item.exitPrice) + '원 · ' + timeLabel + '</div></div>' +
-          '<div class="exitListPct ' + pctCls + '">' + (item.pnlPct >= 0 ? '+' : '') + item.pnlPct.toFixed(2) + '%</div>' +
-          '</div>';
-      }).join('');
-    })
-    .catch(() => { exitListBody.innerHTML = '<div class="detailError">요청 오류</div>'; });
-}
-
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest('.exitCountBtn');
-  if (!btn) return;
-  openExitListPopup(btn.dataset.type, btn.dataset.date || '');
-});
-
-// 리스트 항목 클릭 -> 다른 화면(관심종목/추천종목 등)과 동일한 종목 상세 모달(차트/뉴스/호가/AI분석)을
-// 그대로 열어줌. exit-list 응답엔 실시간 현재가/등락률/호가잔량이 없으므로 청산가를 현재가 자리에
-// 임시로 넣어두면, 모달이 열리면서 실시간 시세로 바로 갱신되므로 문제없음.
-document.getElementById('exitListBody').addEventListener('click', (e) => {
-  const row = e.target.closest('.exitListRow');
-  if (!row) return;
-  const item = exitListCurrentItems[+row.dataset.idx];
-  if (!item) return;
-  closeExitListPopup();
-  openStockModal({
-    code: item.code, name: item.name,
-    price: item.exitPrice, rate: item.pnlPct,
-    buyReq: 0, selReq: 0,
-  });
-});
-
-// 일별 실현손익 히스토리 - SVG 막대그래프, 외부 라이브러리 없이 자체 렌더링.
-// PC(hover)/모바일(tap) 둘 다 지원하도록 각 막대에 마우스/터치 이벤트를 이벤트 위임으로 붙임(.pnlBarHit).
-function renderPnlHistoryChart(history) {
-  const el = document.getElementById('pnlHistoryChart');
-  if (!history || !history.length) { el.style.display = 'none'; return; }
-
-  const W = 320, H = 90, padTop = 8, padBottom = 18, barGap = 3;
-  const barW = Math.max(4, (W - barGap * (history.length - 1)) / history.length);
-  const maxAbs = Math.max(1, ...history.map(d => Math.abs(d.netWon)));
-  const zeroY = padTop + (H - padTop - padBottom) / 2;
-  const halfH = (H - padTop - padBottom) / 2;
-
-  let bars = '';
-  history.forEach((d, i) => {
-    const x = i * (barW + barGap);
-    const h = Math.max(1, Math.abs(d.netWon) / maxAbs * halfH);
-    const y = d.netWon >= 0 ? zeroY - h : zeroY;
-    const color = d.netWon > 0 ? '#e03131' : (d.netWon < 0 ? '#1971c2' : '#666');
-    const mmdd = d.date.slice(5).replace('-', '/');
-    const tip = mmdd + ' ' + (d.netWon >= 0 ? '+' : '') + d.netWon.toLocaleString() + '원 (' + d.count + '건)';
-    bars += '<rect class="pnlBarHit" data-tip="' + tip + '" x="' + x.toFixed(1) + '" y="' + y.toFixed(1) +
-      '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + color + '" rx="1"></rect>';
-  });
-
-  el.innerHTML =
-    '<div style="font-size:11px; color:#999; margin:4px 0 2px;">일별 실현손익 추이 (최근 ' + history.length + '일)</div>' +
-    '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%; height:' + H + 'px; display:block;">' +
-    '<line x1="0" y1="' + zeroY.toFixed(1) + '" x2="' + W + '" y2="' + zeroY.toFixed(1) + '" stroke="#444" stroke-width="1"></line>' +
-    bars +
-    '</svg>' +
-    '<div id="pnlBarTip" style="font-size:11px; color:#ccc; min-height:14px; margin-top:2px;"></div>';
-  el.style.display = 'block';
-}
-
-function loadPnlHistoryChart() {
-  fetch('/api/watchlist-pnl-history?days=14')
-    .then(res => res.json())
-    .then(data => {
-      if (!data.ok) return;
-      renderPnlHistoryChart(data.history);
-    })
-    .catch(() => {});
-}
-loadPnlHistoryChart();
-setInterval(() => { if (!document.hidden && isMarketHoursClient()) loadPnlHistoryChart(); }, 120000); // 2분마다
-
-// 막대 hover(PC)/tap(모바일) 공통 처리 - 이벤트 위임이라 매 렌더링마다 리스너 재등록 불필요
-document.addEventListener('mouseover', (e) => {
-  const bar = e.target.closest('.pnlBarHit');
-  if (!bar) return;
-  const tip = document.getElementById('pnlBarTip');
-  if (tip) tip.textContent = bar.getAttribute('data-tip') || '';
-});
-document.addEventListener('click', (e) => {
-  const bar = e.target.closest('.pnlBarHit');
-  if (!bar) return;
-  const tip = document.getElementById('pnlBarTip');
-  if (tip) tip.textContent = bar.getAttribute('data-tip') || '';
-});
-
-// 관심종목 미니차트 캔들 hover(PC)/touch(모바일) - 커서/손가락이 지나가는 캔들의 시간·가격·거래량을
-// 차트 위 툴팁에 표시. 이벤트 위임이라 renderMiniCandles가 몇 번을 다시 그려도 리스너 재등록 불필요.
-let lastShownMiniChartTip = null; // 매 mousemove마다 document.querySelectorAll로 전체를 훑지 않기 위해 마지막 표시된 툴팁만 추적
-function showMiniChartTip(hitEl) {
-  const wrap = hitEl.closest('.miniChartWrap');
-  if (!wrap) return;
-  const tip = wrap.querySelector('.miniChartTip');
-  const crosshair = wrap.querySelector('.miniChartCrosshair');
-  if (tip) {
-    tip.textContent = hitEl.getAttribute('data-tip') || '';
-    tip.style.display = 'block';
-  }
-  if (crosshair) {
-    const cx = hitEl.getAttribute('data-cx');
-    crosshair.setAttribute('x1', cx);
-    crosshair.setAttribute('x2', cx);
-    crosshair.setAttribute('opacity', '0.6');
-  }
-  lastShownMiniChartTip = tip;
-}
-function hideMiniChartTip(wrapEl) {
-  const tip = wrapEl && wrapEl.querySelector('.miniChartTip');
-  const crosshair = wrapEl && wrapEl.querySelector('.miniChartCrosshair');
-  if (tip) tip.style.display = 'none';
-  if (crosshair) crosshair.setAttribute('opacity', '0');
-}
-document.addEventListener('mousemove', (e) => {
-  const hit = e.target.closest('.miniChartHit');
-  if (hit) { showMiniChartTip(hit); return; }
-  // 차트 영역 밖이면 마지막으로 보여준 툴팁 하나만 숨김 - 관심종목이 많아도 매번 전체 DOM을
-  // 훑지 않으므로(document.querySelectorAll을 mousemove마다 호출하던 게 체감 렉의 원인이었음) 가벼움.
-  if (lastShownMiniChartTip) {
-    hideMiniChartTip(lastShownMiniChartTip.closest('.miniChartWrap'));
-    lastShownMiniChartTip = null;
-  }
-});
-document.addEventListener('mouseleave', (e) => {
-  if (e.target.classList && e.target.classList.contains('miniChartWrap')) hideMiniChartTip(e.target);
-}, true);
-// 모바일 터치 - 손가락으로 눌러서 이동하며 값 확인 (스크롤과 충돌 방지를 위해 차트 영역 내 터치만 preventDefault)
-document.addEventListener('touchstart', (e) => {
-  const wrap = e.target.closest('.miniChartWrap');
-  if (!wrap) return;
-  const touch = e.touches[0];
-  const el = document.elementFromPoint(touch.clientX, touch.clientY);
-  const hit = el && el.closest('.miniChartHit');
-  if (hit) { showMiniChartTip(hit); e.preventDefault(); }
-}, { passive: false });
-document.addEventListener('touchmove', (e) => {
-  const wrap = e.target.closest('.miniChartWrap');
-  if (!wrap) return;
-  const touch = e.touches[0];
-  const el = document.elementFromPoint(touch.clientX, touch.clientY);
-  const hit = el && el.closest('.miniChartHit');
-  if (hit) { showMiniChartTip(hit); e.preventDefault(); }
-}, { passive: false });
-document.addEventListener('touchend', (e) => {
-  const wrap = e.target.closest('.miniChartWrap');
-  if (wrap) setTimeout(() => hideMiniChartTip(wrap), 1500); // 손 뗀 뒤 1.5초 보여주다가 사라짐
-});
-
-// 나무위키 단타매매 기법: "장 개장~9시30분이 가장 활발한 시간대"
-load();
-let mainRefreshTimer = setInterval(() => {
-  if (document.hidden) return; // 백그라운드면 새로고침 스킵
-  if (!isMarketHoursClient(15 * 60 + 52)) return; // 장마감 후엔 스킵(D1 부하 방지) - 15:50 일괄정리 결과 반영까지는 살려둠
-  load();
-}, 15000); // 10초->15초 (momentum/연속상승 등 D1 지표는 cron이 2분마다만 갱신하므로 이보다 자주 당겨도 새 데이터가 없음 - 그만큼 아낀 여유를 실시간쪽에 씀)
-
-// 관심종목 + 화면 리스트 종목 실시간 시세 - relay가 웹소켓으로 물고 있는 체결값을 읽어옴.
-// 키움 TR 호출 0건이라 3초마다 갱신 가능. 리스트 종목은 지금 화면에 떠 있는 것만 보냄(그룹당 200 제한).
-// 관심종목 추가 직후 즉시 1회 조회용 (그 뒤 주기적 갱신은 pollRealtimeAll이 담당)
-function refreshRealtimeWatchlist() {
-  const listParam = realtimeListCodes.slice(0, 180).join(',');
-  fetch('/api/realtime-watchlist?list=' + encodeURIComponent(listParam))
-    .then(res => res.json())
-    .then(data => { if (data.ok) applyRealtimeStocks(data.stocks); })
-    .catch(() => {});
-}
-
-// 관심종목의 실시간 이탈신호 - 2분 cron을 기다리지 않고 3초 주기로 즉시 감지.
-// cron 기반 이탈신호(체결강도꺾임/매도잔량역전/3틱연속하락)를 대체하는 게 아니라,
-// "진입가 대비 손실"과 "체결강도 급락"만 더 빠르게 잡아서 추가로 보여줌 (서로 다른 판단 근거이므로 병행).
-// 브라우저 알림 - 탭을 안 보고 있어도 강한 신호(관심종목 이탈신호, 손절/익절 도달)를 놓치지 않게 함.
-// 매매 자동실행은 안 함 - 알림만 주고 판단/실행은 사람이 함.
-function updateRealtimeExitSignal(code, s) {
-  const badge = document.querySelector('.realtimeExitBadge[data-code="' + code + '"]');
-  if (!badge) return; // 관심종목이 아니면(리스트 종목이면) 해당 없음
-
-  const w = watchlistItems.find(x => x.code === code);
-  const reasons = [];
-
-  if (w && w.entry_price > 0 && s.price) {
-    const pnlPct = ((s.price - w.entry_price) / w.entry_price) * 100;
-    if (pnlPct <= -2) reasons.push('진입가대비 ' + pnlPct.toFixed(2) + '%');
-  }
-
-  const prevCntr = prevCntrStrMap[code];
-  if (prevCntr !== undefined && prevCntr >= 105 && (s.cntrStr || 0) < 100) {
-    reasons.push('체결강도 급락(' + prevCntr.toFixed(0) + '→' + (s.cntrStr || 0).toFixed(0) + ')');
-  }
-  if (typeof s.cntrStr === 'number') prevCntrStrMap[code] = s.cntrStr;
-
-  if (reasons.length) {
-    badge.style.display = '';
-    badge.innerHTML = '⚡실시간: ' + reasons.join(' · ');
-    prevRealtimeExitState[code] = true;
-  } else {
-    badge.style.display = 'none';
-    prevRealtimeExitState[code] = false;
-  }
-}
-const prevRealtimeExitState = {}; // { code: true|false } - 뱃지 신규발생 판단용 (과거엔 알림 중복방지에도 썼음)
-
-// 리스트(전체목록/추천/TOP20 등)에 이미 그려진 행의 가격·등락률만 실시간 값으로 갈아끼움.
-// 행 전체를 다시 그리지 않아서 스크롤/깜빡임 없음.
-function updateListRowRealtime(code, s) {
-  const rows = document.querySelectorAll('tr.twoLineRow[data-code="' + code + '"]');
-  rows.forEach(tr => {
-    const priceEl = tr.querySelector('.rowPrice');
-    if (priceEl) priceEl.textContent = fmt(s.price) + '원';
-    const sub = tr.nextElementSibling;
-    if (!sub || !sub.classList.contains('twoLineSubRow')) return;
-    const rateEl = sub.querySelector('td > span:first-child');
-    if (rateEl && typeof s.rate === 'number') {
-      rateEl.textContent = (s.rate >= 0 ? '+' : '') + s.rate.toFixed(2) + '%';
-      rateEl.className = s.rate >= 0 ? 'up' : 'down';
-    }
-  });
-}
-
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    stopRealtimeStream(); // 화면 꺼지면 실시간 연결(SSE/폴링) 완전히 끊음 - 배터리/데이터 절약
-  } else {
-    load(); // 화면 복귀 시 즉시 최신화
-    pollGlobalIndex(); // 해외지수/환율도 60초 정기폴링을 기다리지 않고 즉시 갱신
-    sseFailedPermanently = false; // 이전에 폴백 전환됐었어도 복귀 시 SSE부터 다시 시도
-    startRealtimeStream();
-  }
-});
-
-// 서비스워커는 사용하지 않음 - 실시간 시세 앱에 오프라인 캐싱은 불필요하고,
-// 예전에 등록된 서비스워커가 새 배포를 가로막는 문제가 있었음(캐시된 예전 페이지 계속 서빙).
-// 혹시 과거에 등록된 서비스워커가 남아있다면 자동으로 해제.
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then(regs => {
-    regs.forEach(reg => reg.unregister());
-  }).catch(() => {});
-}
-
-// 홈 화면에 설치되어 standalone/fullscreen으로 실행 중일 때만 시스템 내비게이션 바 숨김 재시도
-const isStandalone = window.matchMedia('(display-mode: standalone)').matches
-  || window.matchMedia('(display-mode: fullscreen)').matches
-  || window.navigator.standalone === true;
-
-if (isStandalone && document.documentElement.requestFullscreen) {
-  const tryFullscreen = () => {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch(() => {});
-    }
-    document.removeEventListener('click', tryFullscreen);
-  };
-  document.addEventListener('click', tryFullscreen, { once: true });
-}
-
-// 크롬이 자동으로 띄우는 PWA 설치 배너 억제 (설치 유도 기능 자체를 없앰)
-window.addEventListener('beforeinstallprompt', (e) => e.preventDefault());
-`;
-}
-
-// ---------- 대시보드 HTML ----------
-function renderDashboard() {
-  return `<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>급등주 스크리너 (5~15%)</title>
-<link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#111111">
-<meta name="apple-mobile-web-app-title" content="급등주">
-<link rel="icon" href="/icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/icon.svg">
-<style>
-  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:0 16px 80px; }
-  #marketIndexBar { margin-left:-16px; margin-right:-16px; }
-  #netPnlBar { margin-left:-16px; margin-right:-16px; }
-  h1 { font-size:18px; margin:0 0 4px; }
-  .sub { color:#888; font-size:12px; margin-bottom:16px; }
-  .freshnessLegend { color:#666; font-size:10px; margin-bottom:14px; }
-  .board { background:#1c1c1c; border-radius:12px; padding:12px; margin-bottom:20px; }
-  .board h2 { font-size:14px; margin:0 0 8px; color:#ff6b6b; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { padding:6px 4px; text-align:right; border-bottom:1px solid #2a2a2a; }
-  th:first-child, td:first-child { text-align:left; }
-  tr.twoLineRow td { padding-bottom:2px; font-size:14px; }
-  tr.twoLineRow .rowPrice { float:right; font-weight:700; font-size:15px; color:#eee; }
-  tr.twoLineSubRow td { padding-top:0; padding-bottom:10px; border-bottom:1px solid #232323; font-size:12px; color:#999; }
-  tr.twoLineSubRow { cursor:default; }
-  .up { color:#ff6b6b; }
-  .down { color:#4d9fff; }
-  .delta { color:#ffd43b; }
-  .momentumLine { font-size:11px; color:#888; margin-top:2px; }
-  .badgeRow { margin-top:3px; display:flex; flex-wrap:wrap; gap:4px; }
-  .badge { font-size:10px; background:#232323; color:#aaa; padding:2px 6px; border-radius:6px; }
-  .badgeVolume { background:#2a2110; color:#ffa94d; }
-  .badgeHigh { background:#16241c; color:#69db7c; }
-  .badgeLimit { background:#2a1616; color:#ff8787; }
-  .badgeRepeat { background:#1a1c2a; color:#8ea8ff; }
-  .badgeBid { background:#1c1a2a; color:#c48eff; }
-  .badgeCntr { background:#2a1a24; color:#ff8ec4; }
-  .badgeFresh { background:#132a1a; color:#5ce0a0; }
-  .empty { color:#666; padding:12px 0; }
-  tr.clickable { cursor:pointer; }
-  tr.clickable:active { background:#2a2a2a; }
-
-  /* 익절/손절 카운트 버튼 */
-  .exitCountBtn {
-    cursor:pointer; text-decoration:underline dotted; padding:1px 2px; border-radius:4px;
-  }
-  .exitCountBtn:active { background:rgba(255,255,255,0.12); }
-
-  /* 익절/손절 리스트 팝업 */
-  #exitListOverlay {
-    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
-    z-index:105; align-items:flex-end; justify-content:center;
-  }
-  #exitListOverlay.open { display:flex; }
-  #exitListBox {
-    background:#1c1c1c; width:100%; max-width:420px; max-height:78vh; overflow-y:auto;
-    border-radius:16px 16px 0 0; padding:16px 16px 20px; animation:slideUp .15s ease-out;
-  }
-  .exitListHeadRow { display:flex; align-items:center; margin-bottom:10px; }
-  #exitListTitle { margin:0; font-size:17px; font-weight:700; flex:1; }
-  #exitListClose {
-    color:#888; font-size:20px; cursor:pointer;
-    display:inline-flex; align-items:center; justify-content:center;
-    min-width:36px; min-height:36px;
-  }
-  #exitListClose:active { color:#eee; }
-  .exitListRow {
-    display:flex; justify-content:space-between; align-items:center;
-    padding:10px 4px; border-bottom:1px solid #2a2a2a;
-  }
-  .exitListRow.clickable { cursor:pointer; }
-  .exitListRow.clickable:active { background:#2a2a2a; }
-  .exitListRow:last-child { border-bottom:none; }
-  .exitListName { font-size:14px; color:#eee; }
-  .exitListMeta { font-size:11px; color:#888; margin-top:2px; }
-  .exitListPct { font-size:15px; font-weight:700; text-align:right; white-space:nowrap; }
-
-  /* 모달 */
-  #modalOverlay {
-    display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6);
-    z-index:100; align-items:flex-end; justify-content:center;
-  }
-  #modalOverlay.open { display:flex; }
-  #modalBox {
-    background:#1c1c1c; width:100%; max-width:420px; border-radius:16px 16px 0 0;
-    padding:20px 16px 24px; animation:slideUp .15s ease-out;
-  }
-  @keyframes slideUp { from{ transform:translateY(20px); opacity:0; } to{ transform:translateY(0); opacity:1; } }
-  #modalBox h3 { margin:0; font-size:22px; font-weight:700; white-space:nowrap; }
-  .clickableName { cursor:pointer; text-decoration:underline dotted; font-size:12px; color:#999; white-space:nowrap; }
-  .clickableName:active { opacity:0.6; }
-  .modalHeadRow {
-    display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px;
-    margin-bottom:4px;
-  }
-  #modalCodeBadge { font-size:12px; color:#999; white-space:nowrap; }
-  #modalTopClose {
-    margin-left:auto; color:#888; font-size:20px; cursor:pointer;
-    display:inline-flex; align-items:center; justify-content:center;
-    min-width:40px; min-height:40px;
-  }
-  #modalTopClose:active { color:#eee; }
-  .modalPriceRow {
-    display:flex; align-items:baseline; gap:10px;
-    margin-bottom:16px;
-  }
-  .modalPriceInline { font-size:20px; color:#eee; font-weight:700; }
-  .starBtn {
-    font-size:26px; cursor:pointer; color:#666;
-    display:inline-flex; align-items:center; justify-content:center;
-    min-width:40px; min-height:40px; padding:4px;
-  }
-  .starBtn.active { color:#ffd43b; }
-  .topPickStar {
-    font-size:20px; cursor:pointer; color:#666;
-    display:inline-flex; align-items:center; justify-content:center;
-    min-width:36px; min-height:36px; padding:6px; vertical-align:middle;
-  }
-  .topPickStar.active { color:#ffd43b; }
-  .modalPriceRow .up { color:#ff6b6b; font-size:16px; }
-  #modalDetail:empty { display:none; }
-  #modalOrderBook { margin-bottom:12px; }
-  .orderBookBar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#151515; }
-  .orderBookBuy { background:#ff6b6b; }
-  .orderBookSell { background:#4d9fff; }
-  .orderBookLabel { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-top:4px; }
-  .orderBookLabel .buyLabel { color:#ff6b6b; }
-  .orderBookLabel .sellLabel { color:#4d9fff; }
-  #modalNewsLinks { display:flex; gap:8px; margin-bottom:12px; }
-  .newsLink {
-    flex:1; text-align:center; padding:8px 6px; border-radius:8px;
-    background:#2a2a2a; color:#aaa; font-size:12px; text-decoration:none;
-  }
-  #modalNewsSummary { margin-bottom:12px; max-height:78px; overflow-y:auto; }
-  .newsItem {
-    display:block; background:#151515; border-radius:8px; padding:8px 10px;
-    margin-bottom:6px; text-decoration:none;
-  }
-  .newsItemTitle { font-size:12px; color:#eee; font-weight:600; margin-bottom:2px; }
-  .newsItemDesc { font-size:11px; color:#888; line-height:1.4; }
-  .sentimentTag { display:inline-block; font-size:10px; padding:1px 6px; border-radius:8px; font-weight:700; margin-right:2px; }
-  .sentimentTag.sentimentUp { background:#2a1616; color:#ff8787; }
-  .sentimentTag.sentimentDown { background:#16243a; color:#4d9fff; }
-  .sentimentTag.sentimentNeutral { background:#222; color:#999; }
-  #modalDartSummary { margin-bottom:12px; max-height:78px; overflow-y:auto; }
-  .dartItem { border-left:2px solid #ffd43b; }
-  .highGap { font-size:11px; color:#888; margin-top:2px; }
-  .sellWarning { font-size:12px; color:#ff8787; background:#2a1616; border-radius:8px; padding:8px 10px; margin-top:8px; }
-  .sellOk { font-size:12px; color:#69db7c; background:#16241c; border-radius:8px; padding:8px 10px; margin-top:8px; }
-  .highGap b { color:#ffa94d; }
-  #modalDetail { margin-bottom:14px; }
-  .detailLoading, .detailError { color:#888; font-size:13px; padding:8px 0; }
-  .detailError { color:#ff8787; }
-  .detailGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; background:#151515; border-radius:10px; padding:10px 12px; font-size:12px; color:#999; }
-  .detailGrid b { display:block; font-size:14px; color:#eee; margin-top:2px; }
-  .detailGrid b.up { color:#ff6b6b; }
-  .chartRange { font-size:11px; color:#888; text-align:center; margin-top:4px; }
-  .chartTimeLabels { display:flex; justify-content:space-between; font-size:10px; color:#666; padding:2px 6px 0; }
-  .miniChartWrap { position:relative; }
-  .miniChartRangeLabel {
-    position:absolute; font-size:9px; font-weight:600; padding:0 3px; border-radius:2px;
-    background:rgba(10,10,10,0.7); pointer-events:none; z-index:3; white-space:nowrap; line-height:1.4;
-  }
-  .miniChartRangeLabel.down { color:#4d9fff; }
-  .miniChartRangeLabel.up { color:#ff6b6b; }
-  .miniChartTip {
-    position:absolute; top:2px; left:50%; transform:translateX(-50%);
-    background:rgba(20,20,20,0.92); border:1px solid #333; border-radius:6px;
-    padding:3px 8px; font-size:11px; color:#eee; white-space:nowrap; pointer-events:none; z-index:5;
-  }
-  .miniChartHit { cursor:crosshair; }
-  .liveDot { color:#69db7c; animation:blink 1.5s ease-in-out infinite; }
-  @keyframes blink { 0%,100%{ opacity:1; } 50%{ opacity:0.2; } }
-  .chartWrap { overflow:hidden; touch-action:none; cursor:grab; border-radius:8px; background:#151515; }
-  .chartWrap:active { cursor:grabbing; }
-  .chartWrap svg { display:block; will-change:transform; }
-  .chartResetBtn { color:#4d9fff; text-decoration:underline dotted; cursor:pointer; }
-  .periodRow { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
-  .periodBtn {
-    flex:1; min-width:40px; padding:8px 4px; border-radius:8px; border:none;
-    background:#2a2a2a; color:#aaa; font-size:12px; cursor:pointer;
-  }
-  .periodBtn.active { background:#ff6b6b; color:#111; font-weight:600; }
-  .boardHeadRow { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
-  .boardHeadRow h2 { margin:0; }
-  .sortToggle { display:flex; gap:6px; }
-  .sortBtn { background:#2a2a2a; color:#aaa; border:none; border-radius:6px; padding:5px 10px; font-size:11px; cursor:pointer; }
-  .sortBtn.active { background:#ff6b6b; color:#111; font-weight:600; }
-  .tradeDelBtn { color:#666; cursor:pointer; font-size:14px; }
-  .pnlPositive { color:#ff6b6b; }
-  .pnlNegative { color:#4d9fff; }
-  .addedDate { font-size:10px; color:#666; font-weight:normal; }
-  .addedContext { font-size:10px; color:#8ea8ff; font-weight:normal; margin-top:1px; }
-  .riskLevelLine { font-size:10px; color:#888; margin-top:1px; }
-  .peakDrawdownLine { font-size:10px; margin-top:1px; }
-  .peakWarnLight { color:#888; } /* -0.15%~-1% : 아직 크게 걱정할 단계는 아니지만 꺾이는 중 */
-  .peakWarnMid { color:#ffa94d; } /* -1%~-2% : 주의 */
-  .verdictIcon { margin-right:2px; font-size:12px; }
-  .riskBadge { font-size:10px; font-weight:700; margin-top:2px; }
-  .riskBadgeDown { color:#4d9fff; }
-  .riskBadgeUp { color:#ff6b6b; }
-  .riskBadgeExit { color:#ffa94d; }
-  .miniChartRow td { border-bottom:1px solid #2a2a2a; padding:0 4px 8px; }
-  .miniChartSkeleton { height:70px; background:#1a1a1a; border-radius:4px; }
-  .miniChartRow { background:transparent; }
-  .modalBtn {
-    display:block; width:100%; box-sizing:border-box; text-align:center;
-    padding:14px; margin-bottom:10px; border-radius:10px; border:none;
-    font-size:15px; font-weight:600; text-decoration:none; cursor:pointer;
-  }
-  .modalBtn.price { background:#2a2a2a; color:#eee; }
-  .modalBtn.risk { background:#2a2a2a; color:#ffa94d; }
-  .modalBtn.ai { background:#2a2a2a; color:#a78bfa; }
-  .actionRow { display:flex; gap:8px; margin-bottom:10px; }
-  .actionRow .modalBtn {
-    flex:1; width:auto; margin-bottom:0; padding:10px 4px;
-    font-size:12px; white-space:nowrap;
-  }
-  .aiAnalysisCard {
-    background:#17141f; border:1px solid #4c3a80; border-radius:10px;
-    padding:12px; font-size:13px; line-height:1.6; color:#ddd; margin-bottom:12px;
-    white-space:pre-wrap; max-height:340px; overflow-y:auto;
-  }
-  .aiAnalysisNote { font-size:10px; color:#666; margin-top:6px; }
-  .riskGrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; background:#151515; border-radius:10px; padding:10px 12px; font-size:12px; color:#999; margin-bottom:12px; }
-  .riskGrid b { display:block; font-size:15px; margin-top:2px; }
-  .riskGrid .stopLoss b { color:#4d9fff; }
-  .riskGrid .takeProfit b { color:#ff6b6b; }
-  .riskNote { font-size:10px; color:#666; margin-top:6px; grid-column:1 / -1; }
-  .gcCard { border-radius:10px; padding:10px 12px; font-size:13px; font-weight:600; margin-bottom:12px; }
-  .gcCard.gcUp { background:#1c2a1c; color:#69db7c; }
-  .gcCard.gcDown { background:#2a1c1c; color:#ff8787; }
-  .gcDetail { font-size:11px; color:#999; font-weight:normal; margin-top:4px; }
-  .modalBtn.cancel { background:transparent; color:#888; margin-bottom:0; padding:10px; }
-  .streakBoard h2 { color:#ffd43b; }
-  .streakBoard.streak5 h2 { color:#69db7c; }
-  .topPicksBoard { border:1px solid #ffd43b; background:linear-gradient(180deg,#1c1a0f,#1c1c1c); }
-  .topPicksBoard h2 { color:#ffd43b; }
-  .topPicksBoard tr.clickable:active { background:#2a2410; }
-  .intervalTag { font-size:11px; color:#888; font-weight:normal; }
-  #conditionDock {
-    position:fixed; left:0; right:0; bottom:0; z-index:80;
-    background:#17171a; border-top:1px solid #333;
-    box-shadow:0 -2px 10px rgba(0,0,0,0.5);
-  }
-  #conditionDockHead {
-    display:flex; justify-content:space-between; align-items:center;
-    padding:7px 12px; font-size:12px; font-weight:600; color:#ffd43b;
-    cursor:pointer; user-select:none;
-  }
-  #conditionDockCount { color:#888; font-weight:normal; font-size:11px; margin-left:4px; }
-  #conditionDockToggle { color:#888; font-size:11px; }
-  #conditionDockBody {
-    max-height:161px; /* 한 줄 표시 기준 약 7종목, 나머지는 스크롤 */
-    overflow-y:auto; -webkit-overflow-scrolling:touch;
-    padding:0 12px 8px;
-    transition:max-height .15s ease;
-  }
-  #conditionDock.collapsed #conditionDockBody {
-    max-height:24px; /* 접으면 1종목만 보이게 (완전히 숨기지 않음) */
-    overflow:hidden;
-    padding-bottom:2px;
-  }
-  #conditionDockBody table { width:100%; border-collapse:collapse; font-size:13px; }
-  #conditionDockBody td { padding:0px 4px; line-height:1.2; border-bottom:1px solid #232323; }
-  #conditionDockBody tr.dockRow { cursor:pointer; }
-  #conditionDockBody tr.dockRow:active { background:#2a2a2a; }
-  #conditionDockBody tr.dockRowOut { opacity:0.45; } /* 조건에서 이탈한 종목은 흐리게 */
-  .dockStar { width:34px; padding-right:0 !important; }
-  .dockName { text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:0; }
-  .dockRate { text-align:right; white-space:nowrap; width:72px; }
-  .dockTime { text-align:right; white-space:nowrap; width:64px; font-size:11px; color:#888; }
-  .dockIcons { font-size:11px; }
-  #systemStatusBanner {
-    background:#2a1616; color:#ff8787; font-weight:600;
-    font-size:12px; padding:8px 12px; border-radius:10px; margin-bottom:14px;
-    cursor:pointer;
-  }
-  #cfUsageToggle {
-    position:fixed; right:14px; top:44px; z-index:94;
-    width:44px; height:44px; border-radius:50%; background:#232323;
-    display:flex; align-items:center; justify-content:center; font-size:20px;
-    opacity:0.8; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.5);
-  }
-  #cfUsageToggle:active { opacity:1; }
-  #cfUsagePanel {
-    position:fixed; right:14px; top:94px; z-index:94;
-    background:#1c1c1c; border:1px solid #333; border-radius:10px;
-    padding:10px 12px; font-size:11px; color:#aaa; width:220px;
-    box-shadow:0 2px 10px rgba(0,0,0,0.5);
-  }
-  #cfUsagePanel .cfUsageRow { display:flex; justify-content:space-between; margin-top:4px; }
-  #cfUsagePanel .cfUsageBar { background:#333; border-radius:4px; height:4px; margin-top:2px; overflow:hidden; }
-  #cfUsagePanel .cfUsageBarFill { height:100%; background:#69db7c; }
-  #cfUsagePanel .cfUsageBarFill.warn { background:#ffa94d; }
-  #cfUsagePanel .cfUsageBarFill.danger { background:#ff6b6b; }
-  #cfUsagePanel .cfUsageLink {
-    display:block; background:#232323; color:#8ea8ff; text-decoration:none;
-    padding:8px 10px; border-radius:8px; margin-top:6px; font-size:12px;
-  }
-  #cfUsagePanel .cfUsageLink:active { background:#2a2a2a; }
-  #marketIndexBar {
-    display:flex; flex-wrap:nowrap; font-size:13px; color:#ffffff; font-weight:700;
-    background:linear-gradient(180deg,#181d27,#0b0d12); border-radius:0; padding:0; margin-bottom:0;
-    position:sticky; top:0; z-index:95; box-shadow:0 2px 10px rgba(0,0,0,0.7);
-    overflow:hidden; height:34px; align-items:center; white-space:nowrap;
-    border-bottom:2px solid #333c4d;
-  }
-  #netPnlBar {
-    position:sticky; top:34px; z-index:94; height:26px; margin-bottom:14px;
-    display:flex; align-items:center; justify-content:center; gap:6px;
-    font-size:12px; color:#999; background:#17171a; border-bottom:1px solid #2a2a2a;
-    box-shadow:0 2px 6px rgba(0,0,0,0.5);
-  }
-  #netPnlBarValue { font-size:13px; font-weight:800; }
-  #netPnlBarValue.up { color:#ff3b3b; }
-  #netPnlBarValue.down { color:#3d9bff; }
-  #marketIndexBarTrack {
-    display:flex; flex-wrap:nowrap; align-items:center; gap:16px; padding:0 12px; width:max-content;
-    animation: marketTickerScroll 30s linear infinite;
-    animation-delay: 2s;
-  }
-  #marketIndexBar:hover #marketIndexBarTrack,
-  #marketIndexBarTrack.paused { animation-play-state: paused; }
-  @keyframes marketTickerScroll {
-    from { transform: translateX(0); }
-    to { transform: translateX(-50%); }
-  }
-  #marketIndexBar span { flex-shrink:0; }
-  #marketIndexBarTrack .tickerItem {
-    display:inline-block; font-size:1em;
-    transition: font-size 0.25s ease-out, background 0.25s ease-out;
-    padding:3px 7px; border-radius:6px;
-  }
-  #marketIndexBarTrack .tickerItem.centered {
-    font-size:1.4em; position:relative; z-index:2;
-    background:rgba(255,255,255,0.14);
-  }
-  #marketIndexBar b { color:#ffffff; }
-  #marketIndexBar .up { color:#ff3b3b; font-weight:800; }
-  #marketIndexBar .down { color:#3d9bff; font-weight:800; }
-  #marketIndexBar .weakMarketNote { color:#ffa94d; }
-  .streakBadge { color:#ffd43b; font-size:11px; margin-left:6px; }
-  #patternScanBtn:disabled { opacity:0.35; cursor:not-allowed; }
-</style>
-</head>
-<body>
-  <h1 style="display:none;">🔥 급등주 스크리너</h1>
-  <span id="ts" style="display:none;"></span>
-  <div class="sub" style="display:none;"></div>
-  <div class="freshnessLegend" style="display:none;"><span class="liveDot">●</span> 가격·등락률·지수·실시간포착: 실시간(초단위) &nbsp;·&nbsp; momentum/연속상승/신고가 등 지표: 2분 기준</div>
-  <div id="marketIndexBar" style="visibility:hidden; height:34px;"><div id="marketIndexBarTrack"></div></div>
-  <div id="netPnlBar" style="visibility:hidden;">오늘 실현손익 <b id="netPnlBarValue">-</b></div>
-  <div id="cfUsageToggle" title="Cloudflare 사용량 보기">📊</div>
-  <div id="cfUsagePanel" style="display:none;"></div>
-
-  <div id="systemStatusBanner" style="display:none;"></div>
-
-  <div class="board">
-    <h2>⭐ 관심종목 <span class="intervalTag">(100만원 매수 가정, 수수료·세금 반영)</span></h2>
-    <div id="autoRemovedTag" class="intervalTag" style="visibility:hidden; display:block; margin-top:4px; min-height:2.6em; line-height:1.3em;"></div>
-    <div class="sortToggle">
-      <button class="sortBtn active" id="wlSortByAdded">추가순</button>
-      <button class="sortBtn" id="wlSortByPnlDesc">수익률 높은순</button>
-      <button class="sortBtn" id="wlSortByPnlAsc">수익률 낮은순</button>
-    </div>
-    <div id="pnlHistoryChart" style="display:none;"></div>
-    <table id="watchlist">
-      <thead><tr><th>종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>수익률</th><th></th></tr></thead>
-      <tbody><tr><td class="empty">별표 눌러서 종목을 추가해보세요</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board topPicksBoard">
-    <h2>🎯 추천 종목 TOP10 <span class="intervalTag">(알고리즘 종합점수 - 매매 추천 아님, 참고용)</span></h2>
-    <table id="recommended">
-      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board topPicksBoard">
-    <h2>🏆 오늘의 TOP 20</h2>
-    <table id="topPicks">
-      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board">
-    <div class="boardHeadRow">
-      <h2>🔍 지난 1주일 패턴 유사 종목</h2>
-      <button id="patternScanBtn" class="sortBtn">스캔 시작</button>
-    </div>
-    <table id="patternScan">
-      <thead><tr><th>종목</th><th>유사한 날</th><th>유사도</th></tr></thead>
-      <tbody><tr><td class="empty">스캔 시작 버튼을 눌러주세요</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="board streakBoard streak5">
-    <h2>🚀 5연속 상승 종목 <span class="intervalTag">(2분간격)</span></h2>
-    <table id="streak5"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board streakBoard">
-    <h2>⚡ 3연속 상승 종목 <span class="intervalTag">(2분간격)</span></h2>
-    <table id="streak3"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board">
-    <h2>2분 전보다 더 오른 TOP5</h2>
-    <table id="top5"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board">
-    <h2>🌊 눌림목 후보 <span class="intervalTag">(고점대비 1~4%p 조정 후 재상승 시도)</span></h2>
-    <table id="pullback"><tbody><tr><td class="empty">데이터 없음</td></tr></tbody></table>
-  </div>
-
-  <div class="board">
-    <div class="boardHeadRow">
-      <h2>전체 목록 (등락률 5~15%)</h2>
-      <div class="sortToggle">
-        <button class="sortBtn active" id="sortByMomentum">종합점수순</button>
-        <button class="sortBtn" id="sortByRate">등락률순</button>
-        <button class="sortBtn" id="sortByVolumeDesc">거래량 많은순</button>
-        <button class="sortBtn" id="sortByVolumeAsc">거래량 적은순</button>
-        <button class="sortBtn" id="sortByCntrStr">체결강도순</button>
-        <button class="sortBtn" id="sortBySignal">신호점수순</button>
-        <button class="sortBtn" id="sortByTradeValue">거래대금순</button>
-      </div>
-    </div>
-    <table id="all">
-      <tbody><tr><td class="empty">데이터 없음</td></tr></tbody>
-    </table>
-  </div>
-
-  <div id="conditionDock" class="collapsed" style="display:none;">
-    <div id="conditionDockHead">
-      <span>⚡ 실시간 포착 <span id="conditionDockCount"></span></span>
-      <span id="conditionDockToggle">▲</span>
-    </div>
-    <div id="conditionDockBody">
-      <table id="conditionList"><tbody><tr><td class="empty">감시 중...</td></tr></tbody></table>
-    </div>
-  </div>
-
-  <div id="exitListOverlay">
-    <div id="exitListBox">
-      <div class="exitListHeadRow">
-        <h3 id="exitListTitle">-</h3>
-        <span id="exitListClose">✕</span>
-      </div>
-      <div id="exitListBody"></div>
-    </div>
-  </div>
-
-  <div id="modalOverlay">
-    <div id="modalBox">
-      <div class="modalHeadRow">
-        <span id="modalStarBtn" class="starBtn">☆</span>
-        <h3 id="modalName">-</h3>
-        <span id="modalCodeBadge">-</span>
-        <span id="modalTopClose">✕</span>
-      </div>
-      <div class="modalPriceRow">
-        <span id="modalPrice" class="modalPriceInline">-</span>
-        <span class="up" id="modalRate">-</span>
-      </div>
-      <div id="modalOrderBook"></div>
-      <div id="modalNewsLinks"></div>
-      <div id="modalNewsSummary"></div>
-      <div id="modalDartSummary"></div>
-      <div id="modalDetail"></div>
-      <div class="periodRow" id="periodRow">
-        <button class="periodBtn" data-period="T">틱</button>
-        <button class="periodBtn active" data-period="1">1분</button>
-        <button class="periodBtn" data-period="5">5분</button>
-        <button class="periodBtn" data-period="15">15분</button>
-        <button class="periodBtn" data-period="30">30분</button>
-        <button class="periodBtn" data-period="D">일봉</button>
-        <button class="periodBtn" data-period="W">주봉</button>
-        <button class="periodBtn" data-period="M">월봉</button>
-      </div>
-      <div class="actionRow">
-        <button class="modalBtn price" id="modalPriceBtn">💰 현재가</button>
-        <button class="modalBtn risk" id="modalRiskBtn">🎯 손절/익절</button>
-        <button class="modalBtn ai" id="modalAiBtn">🤖 AI 분석</button>
-      </div>
-      <button class="modalBtn cancel" id="modalCancelBtn">닫기</button>
-    </div>
-  </div>
-
-<script src="/app.js"></script>
-</body>
-</html>`;
-}
-
-// 조회(시세/차트/랭킹 등)는 정확도를 위해 실전 서버+실전키를 씀.
-// 매수/매도 주문은 기존 모의투자 키/서버 그대로 유지 (kind === "order"일 때만).
-function kiwoomHost(env, kind) {
-  if (kind === "order") {
-    return env.KIWOOM_MOCK === "false" ? "https://api.kiwoom.com" : "https://mockapi.kiwoom.com";
-  }
-  return "https://api.kiwoom.com"; // 조회는 항상 실전 서버
-}
-
-// 조회(실전) 요청은 고정 IP 중계서버를 거쳐서 나감 (Cloudflare Workers는 IP가 안 고정돼서
-// 키움의 "지정단말기" 제한을 직접 통과할 수 없음 - 대신 고정 IP 서버가 중간에서 대신 요청함)
-async function kiwoomRelayFetch(env, path, options) {
-  if (!env.RELAY_URL || !env.RELAY_SECRET) {
-    throw new Error("RELAY_URL / RELAY_SECRET 시크릿이 설정되지 않았습니다.");
-  }
-  return fetch(`${env.RELAY_URL}${path}`, {
-    ...options,
-    headers: {
-      ...(options && options.headers),
-      "X-Relay-Secret": env.RELAY_SECRET,
-    },
-  });
-}
-
-function kiwoomCreds(env, kind) {
-  if (kind === "order") {
-    return { appkey: env.KIWOOM_APP_KEY, secretkey: env.KIWOOM_APP_SECRET }; // 기존 모의투자 키
-  }
-  return { appkey: env.KIWOOM_APP_KEY_REAL, secretkey: env.KIWOOM_APP_SECRET_REAL }; // 새로 발급받은 실전키
-}
-
-// 토큰 캐시: 조회용(실전)/주문용(모의)을 따로 관리 (키가 다르므로 토큰도 따로 발급받아야 함)
-let cachedToken = null;
-let cachedTokenExpiryMs = 0;
-let cachedOrderToken = null;
-let cachedOrderTokenExpiryMs = 0;
-const TOKEN_CACHE_MS = 3 * 60 * 60 * 1000; // 3시간 (실제 유효기간보다 넉넉히 짧게 잡아 안전마진)
-
-async function kiwoomIssueToken(env, forceRefresh, kind) {
-  const isOrder = kind === "order";
-  if (!isOrder && (!env.KIWOOM_APP_KEY_REAL || !env.KIWOOM_APP_SECRET_REAL)) {
-    throw new Error("KIWOOM_APP_KEY_REAL / KIWOOM_APP_SECRET_REAL 시크릿이 설정되지 않았습니다. (조회는 실전키가 필요합니다)");
-  }
-  const now = Date.now();
-  if (!forceRefresh) {
-    if (isOrder && cachedOrderToken && now < cachedOrderTokenExpiryMs) return cachedOrderToken;
-    if (!isOrder && cachedToken && now < cachedTokenExpiryMs) return cachedToken;
-  }
-  const creds = kiwoomCreds(env, kind);
-  const tokenBody = JSON.stringify({
-    grant_type: "client_credentials",
-    appkey: creds.appkey,
-    secretkey: creds.secretkey,
-  });
-  const res = isOrder
-    ? await fetch(`${kiwoomHost(env, kind)}/oauth2/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json;charset=UTF-8" },
-        body: tokenBody,
-      })
-    : await kiwoomRelayFetch(env, "/oauth2/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json;charset=UTF-8" },
-        body: tokenBody,
-      });
-  const data = await res.json();
-  if (!res.ok || !data.token) {
-    throw new Error(`토큰 발급 실패: ${JSON.stringify(data)}`);
-  }
-  if (isOrder) {
-    cachedOrderToken = data.token;
-    cachedOrderTokenExpiryMs = now + TOKEN_CACHE_MS;
-    return cachedOrderToken;
-  }
-  cachedToken = data.token;
-  cachedTokenExpiryMs = now + TOKEN_CACHE_MS;
-  return cachedToken;
-}
-
-async function kiwoomBuyOrder(env, code) {
-  if (!env.KIWOOM_APP_KEY || !env.KIWOOM_APP_SECRET) {
-    throw new Error("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 시크릿이 설정되지 않았습니다.");
-  }
-  const qty = parseInt(env.KIWOOM_BUY_QTY || "1", 10);
-  const token = await kiwoomIssueToken(env, false, "order");
-
-  const res = await fetch(`${kiwoomHost(env, "order")}/api/dostk/ordr`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      authorization: `Bearer ${token}`,
-      "cont-yn": "N",
-      "next-key": "",
-      "api-id": "kt10000", // 주식 매수주문
-    },
-    body: JSON.stringify({
-      dmst_stex_tp: "KRX",
-      stk_cd: code,
-      ord_qty: String(qty),
-      ord_uv: "0", // 시장가는 주문단가 0
-      trde_tp: "3", // 3: 시장가
-    }),
-  });
-  const data = await res.json();
-  return { ok: res.ok && data.return_code === 0, qty, mock: env.KIWOOM_MOCK !== "false", raw: data };
-}
-
-async function kiwoomSellOrder(env, code) {
-  if (!env.KIWOOM_APP_KEY || !env.KIWOOM_APP_SECRET) {
-    throw new Error("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 시크릿이 설정되지 않았습니다.");
-  }
-  const qty = parseInt(env.KIWOOM_SELL_QTY || env.KIWOOM_BUY_QTY || "1", 10);
-  const token = await kiwoomIssueToken(env, false, "order");
-
-  const res = await fetch(`${kiwoomHost(env, "order")}/api/dostk/ordr`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      authorization: `Bearer ${token}`,
-      "cont-yn": "N",
-      "next-key": "",
-      "api-id": "kt10001", // 주식 매도주문
-    },
-    body: JSON.stringify({
-      dmst_stex_tp: "KRX",
-      stk_cd: code,
-      ord_qty: String(qty),
-      ord_uv: "0", // 시장가는 주문단가 0
-      trde_tp: "3", // 3: 시장가
-    }),
-  });
-  const data = await res.json();
-  return { ok: res.ok && data.return_code === 0, qty, mock: env.KIWOOM_MOCK !== "false", raw: data };
-}
-
-// ---------- 키움 REST API: 현재가(시세표성정보) ----------
-// ---------- 네이버 뉴스 검색 API ----------
-function stripHtml(s) {
-  return String(s || "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#39;/g, "'");
-}
-
-// ---------- DART: corp_code 매핑 동기화 + 공시 조회 ----------
-function parseCorpCodeXml(xmlText) {
-  const entries = [];
-  const re = /<list>\s*<corp_code>([^<]*)<\/corp_code>\s*<corp_name>([^<]*)<\/corp_name>\s*<stock_code>([^<]*)<\/stock_code>/g;
-  let m;
-  while ((m = re.exec(xmlText)) !== null) {
-    const stockCode = m[3].trim();
-    if (stockCode.length === 6) {
-      entries.push({ corp_code: m[1].trim(), corp_name: m[2].trim(), stock_code: stockCode });
     }
   }
-  return entries;
-}
-
-async function syncDartCorpCodes(env) {
-  if (!env.DART_API_KEY) {
-    throw new Error("DART_API_KEY 시크릿이 설정되지 않았습니다.");
-  }
-  const res = await fetch(`https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key=${env.DART_API_KEY}`);
-  if (!res.ok) {
-    throw new Error(`DART corpCode 다운로드 실패: ${res.status}`);
-  }
-  const zipBytes = new Uint8Array(await res.arrayBuffer());
-  const unzipped = unzipSync(zipBytes);
-  const xmlBytes = unzipped["CORPCODE.xml"];
-  if (!xmlBytes) {
-    throw new Error("zip 안에 CORPCODE.xml이 없습니다: " + Object.keys(unzipped).join(", "));
-  }
-  const xmlText = new TextDecoder("utf-8").decode(xmlBytes);
-  const entries = parseCorpCodeXml(xmlText);
-  if (entries.length === 0) {
-    throw new Error("파싱된 종목이 0개입니다. XML 형식이 예상과 다를 수 있습니다.");
-  }
-
-  const stmt = env.DB.prepare(
-    `INSERT OR REPLACE INTO dart_corp_codes (stock_code, corp_code, corp_name) VALUES (?, ?, ?)`
-  );
-  const CHUNK = 50;
-  for (let i = 0; i < entries.length; i += CHUNK) {
-    const chunk = entries.slice(i, i + CHUNK).map((e) => stmt.bind(e.stock_code, e.corp_code, e.corp_name));
-    await env.DB.batch(chunk);
-  }
-  return entries.length;
-}
-
-async function getDartCorpCode(env, stockCode) {
-  const row = await env.DB.prepare(`SELECT corp_code, corp_name FROM dart_corp_codes WHERE stock_code = ?`)
-    .bind(stockCode)
-    .first();
-  return row || null;
-}
-
-async function fetchDartDisclosures(env, corpCode) {
-  const end = todayYYYYMMDD();
-  const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-  const start = startDate.toISOString().slice(0, 10).replace(/-/g, "");
-  const url =
-    `https://opendart.fss.or.kr/api/list.json?crtfc_key=${env.DART_API_KEY}` +
-    `&corp_code=${corpCode}&bgn_de=${start}&end_de=${end}&page_count=5` +
-    `&sort=date&sort_mth=desc`; // 접수일자 기준 최신순
-  const res = await fetch(url);
-  const data = await res.json();
-  if (data.status !== "000" && data.status !== "013") {
-    // 013 = 조회된 데이터 없음 (정상 케이스)
-    throw new Error(`DART 공시 조회 실패: ${JSON.stringify(data)}`);
-  }
-  return (data.list || [])
-    .map((item) => ({
-      title: item.report_nm,
-      date: item.rcept_dt,
-      link: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${item.rcept_no}`,
-    }))
-    .sort((a, b) => b.date.localeCompare(a.date)); // API 응답 순서와 무관하게 서버에서도 최신순 보장
-}
-
-// ---------- 주식 분석 에이전트 (Claude API) ----------
-async function askStockExpert(env, promptText) {
-  if (!env.AI) {
-    throw new Error("AI 바인딩이 설정되지 않았습니다. wrangler.toml에 [ai] binding=\"AI\" 필요.");
-  }
-  const systemPrompt =
-    "당신은 한국 주식시장 데이터를 해석하는 보조 도구입니다. " +
-    "주어진 항목(가격, 등락률, 체결강도, 호가잔량, 뉴스, 공시)을 그대로 다시 나열하지 마세요 — " +
-    "이미 사용자가 화면에서 다 보고 있는 정보입니다. 대신 항목들을 서로 연결지어 깊이 있게 해석하세요. " +
-    "다음 구조로 답하세요:\n" +
-    "**긍정적 신호**: 지금 상황에서 우호적으로 보이는 부분과 그 이유\n" +
-    "**주의할 점**: 앞뒤가 안 맞거나 리스크로 보이는 부분과 그 이유\n" +
-    "**뉴스/공시 연관성**: 최근 뉴스나 공시가 오늘 등락률과 시점상 관련 있어 보이는지, " +
-    "관련 있다면 어떻게 관련 있는지 구체적으로. 관련 없어 보이면 '특별한 연관성 확인 안 됨'이라고 명시\n" +
-    "**참고**: 이런 유형의 급등 이후 통상적으로 나타나는 패턴이나 유의사항\n" +
-    "각 섹션은 2~4문장으로 구체적으로 설명하세요. 애매하게 얼버무리지 말고, " +
-    "왜 그렇게 판단했는지 근거를 같이 말하세요. " +
-    "'사세요', '파세요', '지금이 매수 타이밍입니다' 같은 직접적인 매매 추천이나 " +
-    "확정적인 가격 전망은 절대 하지 마세요. 데이터에 없는 내용은 추측하지 말고, " +
-    "확실하지 않으면 그렇다고 밝히세요. " +
-    "인사말, 서론, '알겠습니다' 같은 도입부나 마무리 멘트 없이 바로 본론만 말하세요. " +
-    "전체 800자 내외로 답하세요.";
-
-  // Cloudflare Workers AI 무료 티어 (하루 1만 뉴런) - Llama 3.1 8B
-  const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fast", {
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: promptText },
-    ],
-    max_tokens: 700,
-  });
-  const text = result && (result.response || result.result || result.text);
-  if (!text) {
-    throw new Error(`Workers AI 응답 이상: ${JSON.stringify(result)}`);
-  }
-  return text;
-}
-
-async function naverNewsSearch(env, query) {
-  if (!env.NAVER_CLIENT_ID || !env.NAVER_CLIENT_SECRET) {
-    throw new Error("NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 시크릿이 설정되지 않았습니다.");
-  }
-  const url = `https://openapi.naver.com/v1/search/news.json?query=${encodeURIComponent(query)}&display=5&sort=date`;
-  const res = await fetch(url, {
-    headers: {
-      "X-Naver-Client-Id": env.NAVER_CLIENT_ID,
-      "X-Naver-Client-Secret": env.NAVER_CLIENT_SECRET,
-    },
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`네이버 뉴스 API 실패: ${JSON.stringify(data)}`);
-  }
-  return (data.items || [])
-    .map((item) => ({
-      title: stripHtml(item.title),
-      description: stripHtml(item.description),
-      link: item.originallink || item.link,
-      pubDate: item.pubDate,
-    }))
-    .sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate)); // API 응답 순서와 무관하게 서버에서도 최신순 보장
-}
-
-// 뉴스 헤드라인들을 한 번에 호재/악재/중립으로 분류 (뉴런 절약을 위해 개별 호출 대신 일괄 처리)
-async function classifyNewsSentiment(env, items) {
-  if (!items.length || !env.AI) return items;
-  const listText = items.map((n, i) => `${i + 1}. ${n.title}`).join("\n");
-  const prompt =
-    `다음 주식 관련 뉴스 제목들을 각각 "호재", "악재", "중립" 중 하나로 분류하세요. ` +
-    `설명 없이 정확히 "번호: 분류" 형식으로 한 줄씩만 답하세요.\n\n${listText}`;
-  try {
-    const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fast", {
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 150,
-    });
-    const text = (result && (result.response || result.result || result.text)) || "";
-    const tags = {};
-    text.split("\n").forEach((line) => {
-      const m = line.match(/(\d+)\s*[:.\-]\s*(호재|악재|중립)/);
-      if (m) tags[m[1]] = m[2];
-    });
-    items.forEach((item, i) => {
-      item.sentiment = tags[String(i + 1)] || null;
-    });
-  } catch (e) {
-    // 감성분석 실패해도 뉴스 자체는 그대로 보여줌 (sentiment: null)
+  // 2) 핫키워드 시드로 네이버쇼핑 신상품(sort=date) 보강 발굴 — 병렬
+  const seedResults = await Promise.all(HOT_KEYWORDS.map((seed) => naverShoppingSearch(seed, env, 4, "date")));
+  for (const { items: found, error } of seedResults) {
+    if (error) continue;
+    for (const f of found) {
+      if (isTechRelated(f.name)) items.push({ category: "네이버쇼핑", name: f.name });
+    }
   }
   return items;
 }
-
-// 키움이 "토큰이 유효하지 않습니다" 류의 인증 에러를 주면 true
-function isTokenInvalidError(data) {
-  return data && (data.return_code === 3 || /토큰|Token/i.test(JSON.stringify(data.return_msg || "")));
-}
-
-// kiwoomQuote/kiwoomChart가 거의 똑같이 반복하던 부분(relay 호출 -> JSON파싱 -> 실패시 토큰 재발급 후 1회 재시도)
-// 을 한 곳으로 모음. path/apiId/body만 다르고 나머지 흐름은 동일해서 여기 고치면 둘 다 적용됨.
-async function kiwoomApiCall(env, token, path, apiId, body, extraHeaders) {
-  const call = async (tok) => {
-    const res = await kiwoomRelayFetch(env, path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json;charset=UTF-8",
-        authorization: `Bearer ${tok}`,
-        "cont-yn": "N",
-        "next-key": "",
-        "api-id": apiId,
-        ...extraHeaders,
-      },
-      body: JSON.stringify(body),
-    });
-    const rawText = await res.text();
-    let data;
-    try {
-      data = JSON.parse(rawText);
-    } catch (parseErr) {
-      // 키움이 JSON 대신 HTML(세션 만료 등)을 준 경우 - 토큰 무효와 동일하게 재시도 대상으로 처리
-      const err = new Error(`${apiId} 응답이 JSON이 아님: ${rawText.slice(0, 200)}`);
-      err.kiwoomData = { return_code: 3, return_msg: "JSON 파싱 실패(비정상 응답)" };
-      throw err;
-    }
-    if (!res.ok || data.return_code !== 0) {
-      const err = new Error(`${apiId} 실패: ${JSON.stringify(data)}`);
-      err.kiwoomData = data;
-      throw err;
-    }
-    return data;
-  };
+__name(scanNaverShoppingProducts, "scanNaverShoppingProducts");
+async function fetchDanawaTrendingKeywords() {
   try {
-    return await call(token);
-  } catch (e) {
-    if (isTokenInvalidError(e.kiwoomData)) {
-      const freshToken = await kiwoomIssueToken(env, true); // 캐시된 토큰이 무효화됐으므로 강제 재발급 후 한 번 더 시도
-      return await call(freshToken);
-    }
-    throw e;
-  }
-}
-
-async function kiwoomQuote(env, token, code) {
-  return kiwoomApiCall(env, token, "/api/dostk/mrkcond", "ka10007", { stk_cd: code });
-}
-
-function abs(v) {
-  return Math.abs(parseInt(String(v ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
-}
-
-function parseKiwoomQuote(json) {
-  return {
-    price: abs(json.cur_prc),
-    rate: parseFloat(json.flu_rt ?? "0") || 0,
-    open: abs(json.open_pric),
-    high: abs(json.high_pric),
-    low: abs(json.low_pric),
-    volume: abs(json.trde_qty ?? json.now_trde_qty),
-    raw: json,
-  };
-}
-
-// ---------- 키움 REST API: 차트 (분/일/주/월봉 통합) ----------
-function todayYYYYMMDD() {
-  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
-  const y = kst.getFullYear();
-  const m = String(kst.getMonth() + 1).padStart(2, "0");
-  const d = String(kst.getDate()).padStart(2, "0");
-  return `${y}${m}${d}`;
-}
-
-// period: "1"|"3"|"5"|"10"|"15"|"30"|"45"|"60" (분봉) 또는 "D"(일봉)|"W"(주봉)|"M"(월봉)
-async function kiwoomChart(env, token, code, period) {
-  let apiId, body;
-  if (period === "T") {
-    apiId = "ka10079"; // 주식틱차트조회요청
-    body = { stk_cd: code, tic_scope: "1", upd_stkpc_tp: "1" };
-  } else if (period === "D") {
-    apiId = "ka10081"; // 주식일봉차트조회요청
-    body = { stk_cd: code, base_dt: todayYYYYMMDD(), upd_stkpc_tp: "1" };
-  } else if (period === "W") {
-    apiId = "ka10082"; // 주식주봉차트조회요청
-    body = { stk_cd: code, base_dt: todayYYYYMMDD(), upd_stkpc_tp: "1" };
-  } else if (period === "M") {
-    apiId = "ka10083"; // 주식월봉차트조회요청
-    body = { stk_cd: code, base_dt: todayYYYYMMDD(), upd_stkpc_tp: "1" };
-  } else {
-    apiId = "ka10080"; // 주식분봉차트조회요청
-    body = { stk_cd: code, tic_scope: period, upd_stkpc_tp: "1" };
-  }
-  return kiwoomApiCall(env, token, "/api/dostk/chart", apiId, body);
-}
-
-// ---------- 손절/익절 라인 계산 (ATR 기반) ----------
-async function kiwoomDailyOHLC(env, token, code) {
-  const raw = await kiwoomChart(env, token, code, "D");
-  let rows = [];
-  for (const key of Object.keys(raw)) {
-    if (Array.isArray(raw[key])) { rows = raw[key]; break; }
-  }
-  return rows
-    .map((r) => ({
-      high: abs(r.high_pric),
-      low: abs(r.low_pric),
-      close: abs(r.cur_prc ?? r.close_pric),
-    }))
-    .filter((r) => r.high > 0 && r.low > 0)
-    .reverse(); // 과거 -> 최신
-}
-
-// 일봉은 당일 캔들 빼고는 하루 종일 안 바뀌므로, 2분마다 매번 새로 받을 필요 없음.
-// 10분 캐싱으로 호출 횟수를 5분의 1로 줄임 (ATR 14일 평균값 특성상 10분 정도 지연은 실질적 영향 없음).
-const DAILY_OHLC_CACHE_MS = 10 * 60 * 1000;
-async function getCachedDailyOHLC(env, token, code) {
-  const cached = await env.DB.prepare(`SELECT ohlc_json, updated_at FROM daily_ohlc_cache WHERE code = ?`)
-    .bind(code)
-    .first()
-    .catch(() => null);
-  if (cached && Date.now() - new Date(cached.updated_at).getTime() < DAILY_OHLC_CACHE_MS) {
-    return JSON.parse(cached.ohlc_json);
-  }
-  const ohlc = await kiwoomDailyOHLC(env, token, code);
-  await sleep(1100); // 키움 TR 초당1건 제한 - 방금 실제로 호출했을 때만 대기 (캐시 히트면 이 함수 자체가 여기까지 안 옴)
-  await env.DB.prepare(
-    `INSERT INTO daily_ohlc_cache (code, ohlc_json, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(code) DO UPDATE SET ohlc_json = excluded.ohlc_json, updated_at = excluded.updated_at`
-  )
-    .bind(code, JSON.stringify(ohlc), new Date().toISOString())
-    .run()
-    .catch(() => {}); // 캐시 저장 실패해도 방금 받아온 ohlc는 그대로 반환하면 됨
-  return ohlc;
-}
-
-function computeATR(ohlc, period) {
-  if (ohlc.length < 2) return null;
-  const trs = [];
-  for (let i = 1; i < ohlc.length; i++) {
-    const cur = ohlc[i], prev = ohlc[i - 1];
-    const tr = Math.max(
-      cur.high - cur.low,
-      Math.abs(cur.high - prev.close),
-      Math.abs(cur.low - prev.close)
-    );
-    trs.push(tr);
-  }
-  const recent = trs.slice(-period);
-  return recent.reduce((s, v) => s + v, 0) / recent.length;
-}
-
-// 5일선/20일선 골든크로스(정배열 전환) 계산
-function computeGoldenCross(ohlc) {
-  if (ohlc.length < 22) return null; // 20일선 계산 + 전날 비교를 위해 최소 22개 필요
-  const sma = (arr, n, endIdx) => {
-    const slice = arr.slice(endIdx - n + 1, endIdx + 1);
-    return slice.reduce((s, v) => s + v.close, 0) / n;
-  };
-  const lastIdx = ohlc.length - 1;
-  const sma5Today = sma(ohlc, 5, lastIdx);
-  const sma20Today = sma(ohlc, 20, lastIdx);
-  const sma5Yesterday = sma(ohlc, 5, lastIdx - 1);
-  const sma20Yesterday = sma(ohlc, 20, lastIdx - 1);
-
-  const isAligned = sma5Today > sma20Today; // 정배열 (5일선이 20일선 위)
-  const justCrossed = sma5Yesterday <= sma20Yesterday && sma5Today > sma20Today; // 어제까지 아니었는데 오늘 처음 뚫음
-  const justCrossedDown = sma5Yesterday >= sma20Yesterday && sma5Today < sma20Today; // 데드크로스
-
-  return { sma5: sma5Today, sma20: sma20Today, isAligned, justCrossed, justCrossedDown };
-}
-
-function parseKiwoomChart(json) {
-  let rows = [];
-  for (const key of Object.keys(json)) {
-    if (Array.isArray(json[key])) {
-      rows = json[key];
-      break;
-    }
-  }
-  return rows
-    .map((row) => ({
-      price: abs(row.cur_prc ?? row.close_pric),
-      time: row.cntr_tm || row.dt || row.stk_dt || row.trde_dt || row.date || "",
-    }))
-    .filter((r) => r.price > 0)
-    .reverse(); // 응답이 최신순이면 시간순으로 뒤집기
-}
-
-// 관심종목 미니 캔들차트용: OHLC 전체 보존
-function parseKiwoomChartOHLC(json) {
-  let rows = [];
-  for (const key of Object.keys(json)) {
-    if (Array.isArray(json[key])) {
-      rows = json[key];
-      break;
-    }
-  }
-  return rows
-    .map((row) => ({
-      open: abs(row.open_pric),
-      high: abs(row.high_pric),
-      low: abs(row.low_pric),
-      close: abs(row.cur_prc ?? row.close_pric),
-      volume: abs(row.trde_qty ?? row.now_trde_qty),
-      time: row.cntr_tm || "",
-    }))
-    .filter((r) => r.close > 0 && r.high > 0 && r.low > 0)
-    .reverse();
-}
-
-// ---------- 오늘 vs 지난 1주일 장중 패턴 유사도 스캔 ----------
-function parseKiwoomMinuteHistory(json) {
-  let rows = [];
-  for (const key of Object.keys(json)) {
-    if (Array.isArray(json[key])) { rows = json[key]; break; }
-  }
-  return rows
-    .map((r) => {
-      const tm = r.cntr_tm || "";
-      return {
-        date: tm.slice(0, 8),
-        time: tm.slice(8, 14),
-        price: abs(r.cur_prc ?? r.close_pric),
-      };
-    })
-    .filter((r) => r.date && r.price > 0)
-    .reverse(); // 응답이 최신순 -> 시간순(과거->현재)으로 뒤집기
-}
-
-function groupByDate(rows) {
-  const map = {};
-  for (const r of rows) {
-    if (!map[r.date]) map[r.date] = [];
-    map[r.date].push(r);
-  }
-  for (const d in map) map[d].sort((a, b) => a.time.localeCompare(b.time));
-  return map;
-}
-
-// 첫 값 대비 %변화율로 정규화 (절대가격이 달라도 '모양'만 비교)
-function normalizeSeries(prices) {
-  if (!prices.length) return [];
-  const base = prices[0] || 1;
-  return prices.map((p) => ((p - base) / base) * 100);
-}
-
-// 피어슨 상관계수 (-1~1, 1에 가까울수록 모양이 비슷)
-function pearsonCorrelation(a, b) {
-  const n = Math.min(a.length, b.length);
-  if (n < 4) return null;
-  a = a.slice(0, n);
-  b = b.slice(0, n);
-  const meanA = a.reduce((s, v) => s + v, 0) / n;
-  const meanB = b.reduce((s, v) => s + v, 0) / n;
-  let num = 0, denomA = 0, denomB = 0;
-  for (let i = 0; i < n; i++) {
-    const da = a[i] - meanA, db = b[i] - meanB;
-    num += da * db;
-    denomA += da * da;
-    denomB += db * db;
-  }
-  if (denomA === 0 || denomB === 0) return null;
-  return num / Math.sqrt(denomA * denomB);
-}
-
-async function scanPatternMatches(env, candidates) {
-  const token = await kiwoomIssueToken(env);
-  const todayStr = todayYYYYMMDD();
-  const results = [];
-  const debugInfo = [];
-
-  for (const c of candidates) {
-    const dbg = { code: c.code, name: c.name, todayStr };
+    const controllerD2 = new AbortController();
+    const timerD2 = setTimeout(() => controllerD2.abort(), 8000);
+    let res;
     try {
-      const raw = await kiwoomChart(env, token, c.code, "5");
-      const rows = parseKiwoomMinuteHistory(raw);
-      const byDate = groupByDate(rows);
-      dbg.availableDates = Object.keys(byDate);
-      const todayRows = byDate[todayStr];
-      dbg.todayRowCount = todayRows ? todayRows.length : 0;
+      res = await fetch("https://search.danawa.com/dsearch.php?query=" + encodeURIComponent("전자기기"), {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; usbkrBot/1.0)" },
+        signal: controllerD2.signal
+      });
+    } finally {
+      clearTimeout(timerD2);
+    }
+    if (!res.ok) return [];
+    let html = await res.text();
+    html = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
+    const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+    const marker = "급상승 키워드";
+    const idx = text.lastIndexOf(marker);
+    if (idx === -1) return [];
+    const segment = text.slice(idx + marker.length, idx + marker.length + 400);
+    const rawItems = segment.split(/순위변경\s*\d+|신규진입/).map((s) => s.trim()).filter(Boolean);
+    const keywords = [];
+    for (const item of rawItems) {
+      if (!item || item.includes("다나와") || item.includes("키워드") || item.length > 20) break;
+      keywords.push(item);
+    }
+    const techOnly = keywords.filter((kw) => isTechRelated(kw));
+    console.log("다나와 트렌드 키워드: " + keywords.join(", ") + " (테크 필터 후: " + techOnly.join(", ") + ")");
+    return techOnly;
+  } catch (e) {
+    console.log("다나와 트렌드 키워드 수집 실패: " + e.message);
+    return [];
+  }
+}
+__name(fetchDanawaTrendingKeywords, "fetchDanawaTrendingKeywords");
+function buildMixedKeywordPool(danawaKeywords, coupangKeywords, size) {
+  const shuffledDanawa = [...new Set(danawaKeywords)].sort(() => Math.random() - 0.5);
+  const danawaSlots = Math.min(shuffledDanawa.length, Math.ceil(size / 2));
+  const picked = shuffledDanawa.slice(0, danawaSlots);
+  const pickedSet = new Set(picked);
+  const remainingCoupang = [...new Set(coupangKeywords)].filter((kw) => !pickedSet.has(kw)).sort(() => Math.random() - 0.5);
+  for (const kw of remainingCoupang) {
+    if (picked.length >= size) break;
+    picked.push(kw);
+  }
+  return picked.sort(() => Math.random() - 0.5);
+}
+__name(buildMixedKeywordPool, "buildMixedKeywordPool");
+// ============================================
+// Danawa 제품 스캔 및 가져오기
+// ============================================
+function extractProductNames(html) {
+  const nameRegex = /class="prod_name"[\s\S]*?<a[^>]*name="productName"[^>]*>([\s\S]*?)<\/a>/g;
+  const matches = [];
+  let m;
+  while ((m = nameRegex.exec(html)) !== null) {
+    matches.push({ index: m.index, end: nameRegex.lastIndex, raw: m[1] });
+  }
+  const results = [];
+  for (let i = 0; i < matches.length; i++) {
+    const clean = matches[i].raw.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (!clean) continue;
+    // 다음 상품 블록 시작 전까지(없으면 3000자 이내)에서 "26.07. 등록" 같은 등록년월 패턴을 찾음
+    const windowEnd = i + 1 < matches.length ? matches[i + 1].index : matches[i].end + 3000;
+    const chunk = html.slice(matches[i].end, windowEnd);
+    const dateMatch = chunk.match(/(\d{2})\.(\d{2})\.\s*등록/);
+    const regYm = dateMatch ? dateMatch[1] + dateMatch[2] : null; // 예: "2607"
+    results.push({ name: clean, regYm });
+  }
+  return results;
+}
+__name(extractProductNames, "extractProductNames");
 
-      if (todayRows && todayRows.length >= 4) {
-        const todaySeries = normalizeSeries(todayRows.map((r) => r.price));
-        let best = null;
-        let comparedDays = 0;
-        for (const d of Object.keys(byDate)) {
-          if (d === todayStr) continue;
-          const histRows = byDate[d];
-          if (histRows.length < todaySeries.length) continue; // 오늘 진행분만큼 데이터 없는 날은 제외
-          comparedDays++;
-          const histSeries = normalizeSeries(histRows.slice(0, todaySeries.length).map((r) => r.price));
-          const score = pearsonCorrelation(todaySeries, histSeries);
-          if (score !== null && (!best || score > best.score)) {
-            best = { date: d, score };
-          }
-        }
-        dbg.comparedDays = comparedDays;
-        if (best) {
-          dbg.bestScore = best.score;
-          results.push({ code: c.code, name: c.name, matchDate: best.date, score: best.score });
-        }
+const IT_NEWS_KEYWORDS = [
+  "노트북", "모니터", "키보드", "마우스", "이어폰", "헤드폰", "스피커", "SSD", "HDD", "그래픽카드",
+  "CPU", "메인보드", "파워", "쿨러", "웹캠", "태블릿", "스마트폰", "휴대폰", "충전기", "보조배터리",
+  "공유기", "NAS", "프린터", "스캐너", "카메라", "캠코더", "드론", "게이밍", "마이크", "VR", "AR",
+  "글래스", "반도체", "메모리", "RAM", "프로세서", "로봇청소기", "청소기", "셋톱박스", "스마트워치",
+  "웨어러블", "전자기기", "가전", "AI", "노이즈 캔슬링"
+];
+function isItRelatedNewsTitle(title) {
+  return IT_NEWS_KEYWORDS.some((k) => title.includes(k));
+}
+__name(isItRelatedNewsTitle, "isItRelatedNewsTitle");
+
+function parseNewsItemText(rawText) {
+  const text = rawText.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const dateMatch = text.match(/(\d{2})\.(\d{2})\.(\d{2})\./);
+  const now = new Date();
+  let regYm = `${String(now.getFullYear()).slice(2)}${String(now.getMonth() + 1).padStart(2, "0")}`;
+  let cutIndex = -1;
+  if (dateMatch) {
+    regYm = dateMatch[1] + dateMatch[2];
+    cutIndex = text.indexOf(dateMatch[0]);
+  } else {
+    const timeMatch = text.match(/\d{2}:\d{2}:\d{2}/); // 오늘 등록된 글은 날짜 대신 시각만 표시됨
+    if (timeMatch) cutIndex = text.indexOf(timeMatch[0]);
+  }
+  const title = (cutIndex > 0 ? text.slice(0, cutIndex) : text).trim();
+  return { title, regYm };
+}
+__name(parseNewsItemText, "parseNewsItemText");
+
+function extractProductNameFromNewsTitle(title) {
+  const brandMatch = title.match(/^([가-힣A-Za-z0-9]+)/);
+  const brand = brandMatch ? brandMatch[1] : "";
+  const modelMatch = title.match(/\b[A-Z][A-Za-z0-9]*-?[A-Za-z0-9]*\d[A-Za-z0-9-]*\b/);
+  const quoted = title.match(/['‘]([^'’]{2,60})['’]/);
+  if (modelMatch && modelMatch[0].replace(/[^A-Za-z0-9]/g, "").length >= 3) {
+    const parts = [brand, modelMatch[0]];
+    if (quoted && quoted[1] !== brand && !modelMatch[0].includes(quoted[1]) && !quoted[1].includes(modelMatch[0])) {
+      parts.push(quoted[1]);
+    }
+    return [...new Set(parts.filter(Boolean))].join(" ").trim();
+  }
+  if (quoted) {
+    const q = quoted[1].trim();
+    return brand && !q.includes(brand) ? `${brand} ${q}` : q;
+  }
+  return title.replace(/\s*(출시|공개|선봬|발표)\.?$/, "").trim();
+}
+__name(extractProductNameFromNewsTitle, "extractProductNameFromNewsTitle");
+
+async function scanDanawaNewProductNews(env, pages = 2) {
+  const items = [];
+  for (let page = 1; page <= pages; page++) {
+    const url = `https://dpg.danawa.com/mobile/news/list?boardSeq=61&page=${page}`;
+    try {
+      const controllerD3 = new AbortController();
+      const timerD3 = setTimeout(() => controllerD3.abort(), 8000);
+      let res;
+      try {
+        res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }, signal: controllerD3.signal });
+      } finally {
+        clearTimeout(timerD3);
+      }
+      if (!res.ok) continue;
+      const html = await res.text();
+      const itemRegex = /<a[^>]+href="[^"]*\/mobile\/news\/view\?boardSeq=61&listSeq=\d+"[^>]*>([\s\S]{0,300}?)<\/a>/g;
+      let m;
+      while ((m = itemRegex.exec(html)) !== null) {
+        const parsed = parseNewsItemText(m[1]);
+        if (!parsed.title || parsed.title.length < 4) continue;
+        if (!isItRelatedNewsTitle(parsed.title)) continue;
+        const productName = extractProductNameFromNewsTitle(parsed.title);
+        if (productName) items.push({ category: "신상품뉴스", name: productName, regYm: parsed.regYm });
       }
     } catch (e) {
-      dbg.error = String(e.message || e);
-    }
-    debugInfo.push(dbg);
-    await sleep(1100); // ka10080 초당 1건 제한
-  }
-
-  results.sort((a, b) => b.score - a.score);
-  return { results, debugInfo };
-}
-
-// ---------- 디버그: 키움 ka10027 응답이 실제로 어떻게 오는지 확인 ----------
-async function debugFetch(env) {
-  const out = {};
-  try {
-    const token = await kiwoomIssueToken(env);
-    out.tokenIssued = true;
-    for (const [mrktTp, market] of [["001", "KOSPI"], ["101", "KOSDAQ"]]) {
-      try {
-        const json = await kiwoomRankingUp(env, token, mrktTp);
-        const rows = parseKiwoomRankingRows(json);
-        out[market] = {
-          returnCode: json.return_code,
-          returnMsg: json.return_msg,
-          parsedRowCount: rows.length,
-          sampleParsedRows: rows.slice(0, 3),
-          rawKeys: Object.keys(json),
-          rawSample: JSON.stringify(json).slice(0, 1000),
-        };
-      } catch (e) {
-        out[market] = { error: String(e.message || e) };
-      }
-      await sleep(1100);
-    }
-  } catch (e) {
-    out.tokenIssued = false;
-    out.tokenError = String(e.message || e);
-  }
-  return out;
-}
-
-// ---------- 관리자 키 검증 (매수/매도/DART 동기화 보호) ----------
-// ADMIN_KEY 시크릿이 설정 안 돼있으면 무조건 거부 (fail closed)
-// 호출 방법: 헤더 X-Admin-Key: <키> 또는 쿼리스트링 ?key=<키>
-function checkAdminKey(request, url, env) {
-  if (!env.ADMIN_KEY) return false;
-  const headerKey = request.headers.get("X-Admin-Key");
-  const queryKey = url.searchParams.get("key");
-  return headerKey === env.ADMIN_KEY || queryKey === env.ADMIN_KEY;
-}
-
-// 실거래 주문(매수/매도) 전용 - 쿼리스트링은 서버 로그/브라우저 히스토리에 그대로 남을 수 있어서
-// 헤더(X-Admin-Key)로만 인증 허용. 위 checkAdminKey보다 엄격한 버전.
-function checkAdminKeyHeaderOnly(request, env) {
-  if (!env.ADMIN_KEY) return false;
-  return request.headers.get("X-Admin-Key") === env.ADMIN_KEY;
-}
-
-// ---------- 엔트리포인트 ----------
-// relay/웹소켓이 죽어있으면 조용히 묻히지 않게 system_events에 기록.
-// 매 틱마다 기록하면 로그가 도배되니, 상태가 "바뀐 순간"에만 남김 (정상->비정상, 비정상->정상).
-let lastKnownRelayHealthy = null;
-let lastKnownMemoryHigh = false; // 메모리 위험 상태도 변화 시점에만 기록 (매 틱마다 도배 방지)
-async function checkRelayHealthForCron(env) {
-  let healthy = false;
-  let detail = "";
-  try {
-    const res = await kiwoomRelayFetch(env, "/realtime/status", { method: "GET" });
-    const data = await res.json();
-    healthy = !!(data.wsConnected && data.wsLoggedIn);
-    detail = `wsConnected=${data.wsConnected} wsLoggedIn=${data.wsLoggedIn} lastMessageAt=${data.lastMessageAt}`;
-
-    // Oracle E2.1.Micro는 메모리 1GB - 상시 웹소켓+REST중계+종목명조회까지 얹혀있어서
-    // 여유 없이 죽을 수 있음. 위험 수준이면 알아채기 전에 미리 기록해둠.
-    const memoryHigh = typeof data.memoryRssMb === "number" && data.memoryRssMb >= 400;
-    if (memoryHigh && !lastKnownMemoryHigh) {
-      await logSystemEvent(env, "relay_memory_high", `relay 메모리 사용량 ${data.memoryRssMb}MB (1GB 중) - 여유 확인 필요`);
-    } else if (!memoryHigh && lastKnownMemoryHigh) {
-      await logSystemEvent(env, "relay_memory_normal", `relay 메모리 정상화: ${data.memoryRssMb}MB`);
-    }
-    lastKnownMemoryHigh = memoryHigh;
-  } catch (e) {
-    const msg = String(e.message || e);
-    // Worker 자체의 subrequest 한도 초과는 relay와 무관 (앞 단계 collectAndStore 등이
-    // 이미 한도를 다 써서 이 헬스체크 호출 자체가 막힌 것) - relay_unhealthy로 오판하지 않고 스킵
-    if (msg.includes("Too many subrequests")) {
-      return;
-    }
-    detail = "relay 접속 실패: " + msg;
-  }
-
-  if (lastKnownRelayHealthy === null) {
-    lastKnownRelayHealthy = healthy; // 최초 1회는 상태만 기억, 로그는 비정상일 때만
-    if (!healthy) await logSystemEvent(env, "relay_unhealthy", detail);
-    return;
-  }
-  if (lastKnownRelayHealthy && !healthy) {
-    await logSystemEvent(env, "relay_unhealthy", "웹소켓이 끊긴 것으로 보임: " + detail);
-  } else if (!lastKnownRelayHealthy && healthy) {
-    await logSystemEvent(env, "relay_recovered", "웹소켓 복구됨: " + detail);
-  }
-  lastKnownRelayHealthy = healthy;
-}
-
-// backtest-signals의 실측 로직 - HTTP 엔드포인트와 매일 자동 실행 cron 둘 다에서 씀
-async function computeSignalBacktest(env, tickLimit) {
-  const timesRes = await env.DB.prepare(
-    `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
-  )
-    .bind(tickLimit)
-    .all();
-  const times = timesRes.results.map((r) => r.captured_at).reverse(); // 과거 -> 최신
-  if (times.length < 4) {
-    return { ok: false, error: "분석할 틱이 부족합니다 (최소 4틱 필요)" };
-  }
-
-  // times는 같은 테이블에서 뽑은 연속된 captured_at 값들이라, IN절 대신 범위(BETWEEN)로 조회해도
-  // 결과가 동일함 - 파라미터를 300개씩 바인딩하면 D1 변수 개수 제한에 걸려서 이렇게 바꿈
-  const rowsRes = await env.DB.prepare(
-    `SELECT code, change_rate, volume, cntr_str, buy_req, sel_req, captured_at
-     FROM snapshots WHERE captured_at >= ? AND captured_at <= ?`
-  )
-    .bind(times[0], times[times.length - 1])
-    .all();
-
-  const byCode = new Map();
-  for (const r of rowsRes.results) {
-    if (!byCode.has(r.code)) byCode.set(r.code, new Map());
-    byCode.get(r.code).set(r.captured_at, r);
-  }
-
-  const signalNames = [
-    "accelerating", "bidTurnedPositive", "cntrStrRising",
-    "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
-    "sellReqThinning", "realPullback", "comboBuySignal", "isGoldenTime", "isLunchLull", "volumeConfirmed", "strongCntrStr",
-  ];
-  const stats = {};
-  signalNames.forEach((name) => {
-    stats[name] = { trueCount: 0, trueForwardSum: 0, falseCount: 0, falseForwardSum: 0 };
-  });
-  let baselineCount = 0, baselineForwardSum = 0;
-
-  for (const [code, rowByTime] of byCode) {
-    let runningMaxRate = -Infinity;
-    for (let i = 2; i < times.length - 1; i++) {
-      const older = rowByTime.get(times[i - 2]);
-      const prev = rowByTime.get(times[i - 1]);
-      const cur = rowByTime.get(times[i]);
-      const next = rowByTime.get(times[i + 1]);
-      if (!older || !prev || !cur) continue;
-      if (cur.change_rate > runningMaxRate) runningMaxRate = cur.change_rate;
-      if (!next) continue;
-
-      const forwardDelta = next.change_rate - cur.change_rate;
-      baselineCount++;
-      baselineForwardSum += forwardDelta;
-
-      const recentDelta = cur.change_rate - prev.change_rate;
-      const olderDelta = prev.change_rate - older.change_rate;
-      // 15:36 마감 정밀조회는 체결강도/매수잔량/매도잔량을 항상 0으로 저장함 - 그 틱이 cur나 prev로 잡히면
-      // 수급신호가 전부 오판되므로(실제값->0을 "급감"으로 착각) 걸러냄
-      const isPlaceholderRow = (row) => row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0;
-      const hasOrderFlowData = !isPlaceholderRow(cur) && !isPlaceholderRow(prev);
-      const bidTurnedPositive = hasOrderFlowData && (cur.buy_req || 0) > (cur.sel_req || 0) && (prev.buy_req || 0) <= (prev.sel_req || 0);
-      const buyReqSpike = hasOrderFlowData && prev.buy_req > 0 && (cur.buy_req || 0) / prev.buy_req >= 1.5;
-      const sellReqThinning = hasOrderFlowData && prev.sel_req > 0 && (cur.sel_req || 0) / prev.sel_req <= 0.5;
-      const pullbackLike = runningMaxRate - cur.change_rate >= 1 && runningMaxRate - cur.change_rate <= 4 && recentDelta > 0;
-      const signals = {
-        accelerating: recentDelta > olderDelta,
-        bidTurnedPositive,
-        cntrStrRising: hasOrderFlowData && (cur.cntr_str || 0) > (prev.cntr_str || 0),
-        buyReqSpike,
-        volumeSpike: prev.volume > 0 && (cur.volume || 0) / prev.volume >= 2,
-        isTodayHigh: cur.change_rate >= runningMaxRate - 0.001,
-        pullbackLike,
-        sellReqThinning,
-        // 개선된 눌림목: 단순 되돌림+재상승이 아니라, 수급 유입 신호(매수전환/매수잔량급증/매도잔량급감) 중
-        // 하나라도 동반됐을 때만 인정 - pullbackLike가 역효과였던 것을 이걸로 보완할 수 있는지 검증용
-        realPullback: pullbackLike && (bidTurnedPositive || buyReqSpike || sellReqThinning),
-        // 복합신호: 매수전환+매수잔량급증이 동시에 뜨는 경우 - 개별보다 강한 확인 신호일 가능성 검증용
-        comboBuySignal: bidTurnedPositive && buyReqSpike,
-        // 허수주문 방어: 호가잔량 신호가 실제 체결거래량 증가와 같이 왔을 때만 "확인된" 신호로 봄
-        volumeConfirmed: (bidTurnedPositive || buyReqSpike) && prev.volume > 0 && (cur.volume || 0) / prev.volume >= 1.5,
-        // 체결강도 150 이상 - "강한 매수세 유입"의 통상적 해석 기준
-        strongCntrStr: hasOrderFlowData && (cur.cntr_str || 0) >= 150,
-        // 09:00~09:30 골든타임에 발생한 신호인지 (그 자체를 하나의 "신호"로 보고 효과 검증)
-        isGoldenTime: (() => {
-          const kst = new Date(new Date(cur.captured_at).getTime() + 9 * 3600 * 1000);
-          const m = kst.getUTCHours() * 60 + kst.getUTCMinutes();
-          return m >= 9 * 60 && m <= 9 * 60 + 30;
-        })(),
-        // 13:00~14:30 - "점심 이후 거래량 감소·슬리피지 증가 구간이라 매매하지 말라"는 주장을 실측으로
-        // 검증하기 위한 신호. edge가 뚜렷한 음수면 그 주장이 맞는 것이고, 0에 가깝거나 양수면 근거 없음.
-        isLunchLull: (() => {
-          const kst = new Date(new Date(cur.captured_at).getTime() + 9 * 3600 * 1000);
-          const m = kst.getUTCHours() * 60 + kst.getUTCMinutes();
-          return m >= 13 * 60 && m <= 14 * 60 + 30;
-        })(),
-      };
-
-      signalNames.forEach((name) => {
-        const bucket = signals[name] ? "true" : "false";
-        stats[name][bucket + "Count"]++;
-        stats[name][bucket + "ForwardSum"] += forwardDelta;
-      });
+      console.log(`신상품뉴스 스캔 오류(page ${page}): ${e.message}`);
     }
   }
-
-  const baselineAvg = baselineCount ? +(baselineForwardSum / baselineCount).toFixed(4) : null;
-  const results = {};
-  signalNames.forEach((name) => {
-    const s = stats[name];
-    const trueAvg = s.trueCount ? +(s.trueForwardSum / s.trueCount).toFixed(4) : null;
-    const falseAvg = s.falseCount ? +(s.falseForwardSum / s.falseCount).toFixed(4) : null;
-    results[name] = {
-      sampleSize: s.trueCount,
-      avgForwardDeltaWhenTrue: trueAvg,
-      avgForwardDeltaWhenFalse: falseAvg,
-      edgeVsBaseline: trueAvg !== null && baselineAvg !== null ? +(trueAvg - baselineAvg).toFixed(4) : null,
-    };
-  });
-
-  return {
-    ok: true,
-    ticksAnalyzed: times.length,
-    baselineAvgForwardDeltaPct: baselineAvg,
-    signals: results,
-  };
+  return items;
 }
+__name(scanDanawaNewProductNews, "scanDanawaNewProductNews");
 
-// 매일 장마감 후 한 번, 그날치 신호 검증 결과를 자동으로 남김 - 사람이 매번 URL 안 열어봐도 이력이 쌓이게 함
-async function runDailySignalBacktest(env) {
-  const result = await computeSignalBacktest(env, 300);
-  if (!result.ok) return;
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO signal_backtest_history (date, result_json, created_at) VALUES (?, ?, ?)`
-  )
-    .bind(new Date().toISOString().slice(0, 10), JSON.stringify(result), new Date().toISOString())
-    .run()
-    .catch(() => {});
-}
-
-// 관심종목 30초 촘촘 기록 - 전체 150~200종목을 이 주기로 D1에 쓰면 하루 쓰기 한도(10만행)를 넘기지만,
-// 관심종목은 보통 15~20개뿐이라 여유 충분함. 새 cron을 안 만들고, 화면이 열려있는 동안 이미 2초마다
-// 도는 실시간 폴링(이 함수를 부르는 /api/realtime-all)에 편승 - 화면 안 보고 있으면 자연히 기록도 안 됨
-// (Cloudflare cron 최소 단위가 1분이라 cron으로는 애초에 30초 주기가 불가능함)
-const FINE_SNAPSHOT_INTERVAL_MS = 30000;
-async function maybeWriteFineWatchlistSnapshot(env, codes, stocks) {
-  if (!codes.length) return;
-  try {
-    // 마지막 기록 시각을 D1에 저장해두고, 이번 요청이 그로부터 30초 이상 지났을 때만 씀
-    // (Worker는 요청마다 새 인스턴스일 수 있어서 메모리로는 상태를 못 지킴 - D1에 저장)
-    const stateRow = await env.DB.prepare(`SELECT last_written_at FROM fine_snapshot_state WHERE id = 1`).first().catch(() => null);
-    const lastWritten = stateRow ? new Date(stateRow.last_written_at).getTime() : 0;
-    if (Date.now() - lastWritten < FINE_SNAPSHOT_INTERVAL_MS) return;
-
-    const now = new Date().toISOString();
-    const validRows = codes.filter((c) => stocks[c] && stocks[c].price).map((c) => ({ code: c, ...stocks[c] }));
-    if (!validRows.length) return;
-
-    const stmt = env.DB.prepare(
-      `INSERT INTO watchlist_fine_snapshots (code, price, rate, cntr_str, buy_req, sel_req, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
-    );
-    await env.DB.batch(validRows.map((r) => stmt.bind(r.code, r.price, r.rate || 0, r.cntrStr || 0, 0, 0, now)));
-
-    await env.DB.prepare(
-      `INSERT INTO fine_snapshot_state (id, last_written_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_written_at = excluded.last_written_at`
-    )
-      .bind(now)
-      .run();
-  } catch (e) {
-    // 기록 실패해도 실시간 화면 표시 자체엔 지장 없어야 하므로 조용히 무시
-  }
-}
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
+async function scanDanawaDailyProducts(env) {
+  const tasks = IT_CATEGORIES.map(async (category) => {
+    const targetUrl = `https://prod.danawa.com/list/?${category.cate}`;
     try {
-      if (url.pathname === "/manifest.json") {
-        return Response.json({
-          name: "급등주 스크리너",
-          short_name: "급등주",
-          description: "5~15% 상승 종목 실시간 스크리너",
-          start_url: "/",
-          scope: "/",
-          display: "browser",
-          display_override: ["browser"],
-          orientation: "portrait",
-          background_color: "#111111",
-          theme_color: "#111111",
-          icons: [
-            { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" },
-            { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" },
-          ],
-        });
-      }
+      const res = await fetch(targetUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      if (!res.ok) return { category: category.name, error: `status ${res.status}` };
+      const html = await res.text();
+      const names = extractProductNames(html);
+      return { category: category.name, count: names.length, names };
+    } catch (e) {
+      return { category: category.name, error: String(e) };
+    }
+  });
 
-      if (url.pathname === "/icon.svg") {
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <rect width="100" height="100" rx="20" fill="#111111"/>
-  <text x="50" y="66" font-size="58" text-anchor="middle">🔥</text>
-</svg>`;
-        return new Response(svg, { headers: { "content-type": "image/svg+xml" } });
-      }
+  const results = await Promise.all(tasks);
+  const allItems = [];
+  for (const r of results) {
+    if (r.names) {
+      for (const item of r.names) allItems.push({ category: r.category, name: item.name, regYm: item.regYm });
+    }
+  }
 
-      if (url.pathname === "/sw.js") {
-        const sw = `
-self.addEventListener('install', (e) => { self.skipWaiting(); });
-self.addEventListener('activate', (e) => { self.clients.claim(); });
-self.addEventListener('fetch', (e) => {
-  // 네트워크 우선, 실패 시 그대로 실패 반환 (실시간 데이터라 캐싱 안 함)
-  e.respondWith(fetch(e.request).catch(() => new Response('오프라인 상태입니다', { status: 503 })));
-});`;
-        return new Response(sw, { headers: { "content-type": "application/javascript" } });
+  // 신상품뉴스 게시판(진짜 "방금 출시된" 상품)도 합쳐서 최신성 보강
+  try {
+    const newsItems = await scanDanawaNewProductNews(env);
+    const seen = new Set(allItems.map((i) => i.name));
+    for (const item of newsItems) {
+      if (!seen.has(item.name)) {
+        allItems.push(item);
+        seen.add(item.name);
       }
-
-      if (url.pathname === "/app.js") {
-        // 클라이언트 스크립트를 HTML에서 분리해서 서빙 (diff/유지보수 편하게)
-        return new Response(clientScript(), {
-          headers: { "content-type": "application/javascript; charset=UTF-8" },
-        });
+    }
+    console.log(`신상품뉴스 스캔: ${newsItems.length}개 (중복제외 후 추가됨)`);
+  } catch (e) {
+    console.log(`신상품뉴스 스캔 실패: ${e.message}`);
+  }
+  
+  // 네이버쇼핑(트렌드 키워드+신상품 검색)도 합쳐서 소스 다양화
+  try {
+    const naverItems = await scanNaverShoppingProducts(env);
+    const seenN = new Set(allItems.map((i) => i.name));
+    let addedN = 0;
+    for (const item of naverItems) {
+      if (!seenN.has(item.name)) {
+        allItems.push(item);
+        seenN.add(item.name);
+        addedN++;
       }
+    }
+    console.log(`네이버쇼핑 스캔: ${naverItems.length}개 (중복제외 후 ${addedN}개 추가됨)`);
+  } catch (e) {
+    console.log(`네이버쇼핑 스캔 실패: ${e.message}`);
+  }
 
-      if (url.pathname === "/api/watchlist" && request.method === "GET") {
+  // KV에 24시간 TTL로 저장
+  if (allItems.length > 0) {
+    await safeKVPut(env, 'danawa-daily-products', JSON.stringify(allItems), { expirationTtl: SCAN_INTERVAL_SECONDS + 86400 });
+    await safeKVPut(env, 'danawa-last-scan-at', String(Date.now()), { expirationTtl: SCAN_INTERVAL_SECONDS + 86400 });
+    console.log(`Danawa+네이버 스캔 완료: ${allItems.length}개 제품 저장`);
+  }
+  return allItems;
+}
+__name(scanDanawaDailyProducts, "scanDanawaDailyProducts");
+var SCAN_INTERVAL_SECONDS = 3 * 24 * 60 * 60; // 3일에 한번만 재스캔
+async function scanDanawaDailyProductsIfDue(env) {
+  const lastScanAt = await env.POSTS.get('danawa-last-scan-at');
+  if (lastScanAt && Date.now() - Number(lastScanAt) < SCAN_INTERVAL_SECONDS * 1000) {
+    const hoursLeft = Math.round((SCAN_INTERVAL_SECONDS * 1000 - (Date.now() - Number(lastScanAt))) / 3600000);
+    console.log(`Danawa+네이버 스캔 스킵 — 마지막 스캔 후 ${SCAN_INTERVAL_SECONDS / 3600}시간 미경과 (약 ${hoursLeft}시간 후 재스캔)`);
+    return null;
+  }
+  return await scanDanawaDailyProducts(env);
+}
+__name(scanDanawaDailyProductsIfDue, "scanDanawaDailyProductsIfDue");
+function checkCronKey(request, env) {
+  if (!env.CRON_SECRET) return true; // 시크릿 미설정시 막지 않음(설정 전 과도기)
+  const url = new URL(request.url);
+  return url.searchParams.get("key") === env.CRON_SECRET;
+}
+__name(checkCronKey, "checkCronKey");
+async function handleExternalDanawaScan(request, env) {
+  // cron-job.org 같은 외부 스케줄러가 호출하는 용도 — Cloudflare 크론 슬롯 한도 초과시 대안
+  if (!checkCronKey(request, env)) return new Response("Unauthorized", { status: 401 });
+  const result = await scanDanawaDailyProductsIfDue(env);
+  const msg = result === null ? "스킵됨 (아직 재스캔 주기 안 됨)" : `스캔 완료 — ${result.length}개 수집`;
+  console.log(`[외부크론] /cron/scan-danawa 호출됨 — ${msg}`);
+  return new Response(msg, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+}
+__name(handleExternalDanawaScan, "handleExternalDanawaScan");
+async function recordCronGenerateResult(env, entry) {
+  try {
+    const raw = await safeKVGet(env, "cron:generate-history");
+    const list = raw ? JSON.parse(raw) : [];
+    list.unshift(entry);
+    await safeKVPut(env, "cron:generate-history", JSON.stringify(list.slice(0, 30)));
+  } catch (e) {}
+}
+__name(recordCronGenerateResult, "recordCronGenerateResult");
+async function handleExternalGeneratePost(request, env) {
+  // cron-job.org 외부 스케줄러용 — 2시간마다 글 자동생성 (구 Cloudflare Cron 대체)
+  if (!checkCronKey(request, env)) return new Response("Unauthorized", { status: 401 });
+  const nowStr = new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
+  try {
+    const result = await generateAndSavePost(env);
+    const msg = result?.ok ? `발행 성공: ${result.post.slug}` : `발행 실패: ${result?.reason || "알 수 없는 오류"}`;
+    console.log(`[외부크론] /cron/generate-post 호출됨 — ${msg}`);
+    await recordCronGenerateResult(env, {
+      ok: !!result?.ok,
+      reason: result?.ok ? null : (result?.reason || "알 수 없는 오류"),
+      slug: result?.ok ? result.post.slug : null,
+      title: result?.ok ? result.post.title : null,
+      at: nowStr
+    });
+    return new Response(msg, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  } catch (e) {
+    console.log(`[외부크론] /cron/generate-post 예외: ${e.message}\n${e.stack}`);
+    await recordCronGenerateResult(env, {
+      ok: false,
+      reason: `예외: ${e.message}`,
+      slug: null,
+      title: null,
+      at: nowStr
+    });
+    return new Response("Error: " + e.message, { status: 500 });
+  }
+}
+__name(handleExternalGeneratePost, "handleExternalGeneratePost");
+async function ensureBrokenLinksTable(env) {
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS broken_links (slug TEXT, product_index INTEGER, product_name TEXT, url TEXT, status_code INTEGER, checked_at INTEGER, fail_count INTEGER DEFAULT 1, PRIMARY KEY (slug, product_index))"
+    ).run();
+    // 기존에 만들어진 테이블이면 IF NOT EXISTS로는 컬럼이 안 생기므로, 없으면 추가 시도(있으면 에러 무시)
+    await env.DB.prepare("ALTER TABLE broken_links ADD COLUMN fail_count INTEGER DEFAULT 1").run().catch(() => {});
+    // 링크체크 진행 커서 등 가벼운 상태값도 D1에 저장 — KV write 한도를 매 5분마다 갉아먹지 않기 위함
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS meta_state (key TEXT PRIMARY KEY, value TEXT)").run();
+  } catch (e) {}
+}
+__name(ensureBrokenLinksTable, "ensureBrokenLinksTable");
+var LINK_CHECK_FAIL_THRESHOLD = 3; // 이 횟수 이상 연속 실패해야 "끊김"으로 간주(오탐 방지 — 쿠팡이 서버요청을 일시적으로 막는 경우가 많음)
+async function checkBrokenLinksBatch(env, batchSize = 8) {
+  // 5분 크론에 얹어서 조금씩(8건) 순환하며 쿠팡 링크 생존 여부 확인 — 한번에 다 검사하면 부하가 크므로 커서로 이어서 진행
+  if (!env.DB) return { checked: 0 };
+  await ensureBrokenLinksTable(env);
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  if (!idx.length) return { checked: 0 };
+  let cursor = 0;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM meta_state WHERE key = 'linkcheck-cursor'").first();
+    cursor = row ? parseInt(row.value, 10) || 0 : 0;
+  } catch (e) {}
+  const slugsToCheck = [];
+  for (let i = 0; i < batchSize && i < idx.length; i++) {
+    slugsToCheck.push(idx[(cursor + i) % idx.length]);
+  }
+  let checked = 0;
+  for (const slug of slugsToCheck) {
+    try {
+      const raw = await safeKVGet(env, `post:${slug}`);
+      if (!raw) continue;
+      const post = JSON.parse(raw);
+      const products = post.products || [];
+      for (let pi = 0; pi < products.length; pi++) {
+        const prod = products[pi];
+        if (!prod?.affiliateUrl) continue;
+        let statusCode = 0;
         try {
-          const res = await env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all();
-          return Response.json({ ok: true, items: res.results });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/watchlist" && request.method === "POST") {
-        try {
-          const { code, name, sourceBoard, addedState, touchOnly } = await request.json();
-          if (!code || !name) return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
-
-          // 15:50 이후 신규 편입 중지 (기존 종목 순서 갱신용 touchOnly는 신규 매매가 아니므로 허용)
-          if (!touchOnly && !isTradingActiveKST(new Date())) {
-            return Response.json({ ok: false, error: "15:50 이후 신규 매매 중지" }, { status: 403 });
-          }
-
-          // 재편입(이미 관심종목에 있는 종목이 조건검색에 다시 걸림) - 진입가/최초편입시각 건드리지 않고
-          // added_at만 지금 시각으로 올려서 리스트 상단 유지 + added_state에 최신 사유 반영
-          if (touchOnly) {
-            const existing = await env.DB.prepare(`SELECT entry_price FROM watchlist WHERE code = ?`).bind(code).first();
-            if (existing) {
-              await env.DB.prepare(
-                `UPDATE watchlist SET added_at = ?, added_state = ? WHERE code = ?`
-              )
-                .bind(new Date().toISOString(), addedState || "", code)
-                .run();
-              // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
-              return Response.json({ ok: true, entryPrice: existing.entry_price });
-            }
-            // D1에 없는데 클라이언트만 있던 상태(레이스) - 아래 일반 경로로 신규 추가 진행
-          }
-
-          let entryPrice = 0;
-
-          // 장 마감 후/휴일에는 실시간 조회가 부정확한 값을 줄 수 있어서(모달과 동일 문제) D1 마지막 시세를 그대로 진입가로 씀
-          if (!isMarketHoursKST(new Date())) {
-            const row = await env.DB.prepare(
-              `SELECT price FROM snapshots WHERE code = ? ORDER BY captured_at DESC LIMIT 1`
-            )
-              .bind(code)
-              .first();
-            if (row) entryPrice = row.price;
-          }
-
-          // 장중이거나(정상 케이스), 위에서 D1에 데이터가 없었던 경우엔 실시간 조회
-          // 진입가는 정확도가 제일 중요한 값이라 항상 키움에 새로 조회 (클라이언트가 들고 있던 캐시 가격은 안 씀)
-          // 첫 시도 실패하면 잠깐 쉬었다가 한 번 더 시도 (일시적 오류로 0원 저장되는 것 방지)
-          for (let attempt = 0; attempt < 2 && entryPrice === 0; attempt++) {
-            try {
-              if (attempt > 0) await sleep(500);
-              const token = await kiwoomIssueToken(env);
-              const quoteRaw = await kiwoomQuote(env, token, code);
-              entryPrice = parseKiwoomQuote(quoteRaw).price || 0;
-            } catch (e) {
-              // 이번 시도 실패, 다음 루프에서 재시도 (마지막 시도까지 실패하면 0으로 저장, 프론트에서 재시도 유도)
-            }
-          }
-          await env.DB.prepare(
-            `INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price, source_board, added_state) VALUES (?, ?, ?, ?, ?, ?)`
-          )
-            .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
-            .run();
-          await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
-          await enforceWatchlistCap(env);
-
-          // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
-          return Response.json({ ok: true, entryPrice });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/watchlist" && request.method === "DELETE") {
-        try {
-          const code = url.searchParams.get("code");
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
-          // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
-          return Response.json({ ok: true });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // relay(오라클 VM) 전용 - relay가 ka10027(KOSPI/KOSDAQ 등락률상위)을 직접 조회/파싱해서
-      // 결과 배열만 여기로 보냄. Worker는 D1 insert만 수행(원래 collectAndStore가 하던 조회+대기를
-      // relay로 옮겨서 Worker CPU 시간 절약). 기존 cron의 collectAndStore는 이 라우트가 안정화되면
-      // scheduled()에서 비활성화하고 purgeOldRows만 별도 유지.
-      if (url.pathname === "/api/ingest/snapshots" && request.method === "POST") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
-        }
-        try {
-          const { items, capturedAt } = await request.json();
-          if (!Array.isArray(items) || !items.length) {
-            return Response.json({ ok: false, error: "items 비어있음" }, { status: 400 });
-          }
-          const ts = capturedAt || new Date().toISOString();
-          const stmt = env.DB.prepare(
-            `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          );
-          const batch = items.map((s) =>
-            stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, ts, s.cntrStr || 0, s.buyReq || 0, s.selReq || 0)
-          );
-          await env.DB.batch(batch);
-          return Response.json({ ok: true, saved: items.length, capturedAt: ts });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // relay(오라클 VM) 전용 - 진입가 목록 조회. relay가 이미 웹소켓으로 들고 있는 실시간가와
-      // 여기서 받은 entry_price를 비교해서 손익률 -1.5% 이하 여부를 relay 쪽에서 즉시 판단함
-      // (2분 cron보다 훨씬 빠르게, 초 단위로 체크 가능).
-      if (url.pathname === "/api/watchlist-entries" && request.method === "GET") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
-        }
-        try {
-          const res = await env.DB.prepare(`SELECT code, entry_price FROM watchlist WHERE entry_price > 0`).all();
-          return Response.json({ ok: true, items: res.results });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // relay 전용 - 15:36 종가 재조회 대상 목록. 마지막 캡처 시각의 전종목 + 관심종목 우선순위.
-      // Worker 서브리퀘스트 한도(약 50개) 때문에 여러 틱에 나눠 재시도하던 걸 relay(한도 없음)로
-      // 이전하기 위한 조회 라우트 - collectFinalAccurateQuotes/retryFinalQuotePending의 relay판.
-      if (url.pathname === "/api/final-quote-targets" && request.method === "GET") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
-        }
-        try {
-          const timesRes = await env.DB.prepare(`SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`).all();
-          if (!timesRes.results.length) return Response.json({ ok: true, targets: [] });
-          const lastTime = timesRes.results[0].captured_at;
-          const codesRes = await env.DB.prepare(`SELECT DISTINCT code, name, market FROM snapshots WHERE captured_at = ?`).bind(lastTime).all();
-          let targets = codesRes.results;
-          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-          const wlCodes = new Set(wlRes.results.map((r) => r.code));
-          if (wlCodes.size) {
-            targets = [...targets].sort((a, b) => (wlCodes.has(b.code) ? 1 : 0) - (wlCodes.has(a.code) ? 1 : 0));
-          }
-          return Response.json({ ok: true, targets, capturedAt: new Date().toISOString() });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // relay 전용 - 최종 종가 재조회 결과 일괄저장. relay가 서브리퀘스트 한도 없이 전종목을
-      // 순차조회(1.1초 간격) 끝낸 뒤 한 번에 전송. Worker는 D1 insert + 후속 일일 백테스트만 수행
-      // (순서 의존성 있는 백테스트를 relay 완료 시점에 맞춰 트리거하기 위해 여기서 실행).
-      if (url.pathname === "/api/ingest/final-quotes" && request.method === "POST") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
-        }
-        try {
-          const { rows, capturedAt, failedCodes } = await request.json();
-          if (!Array.isArray(rows) || !rows.length) {
-            return Response.json({ ok: false, error: "rows 비어있음" }, { status: 400 });
-          }
-          const ts = capturedAt || new Date().toISOString();
-          const stmt = env.DB.prepare(
-            `INSERT INTO snapshots (code, name, price, change_rate, volume, market, captured_at, cntr_str, buy_req, sel_req)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`
-          );
-          const batch = rows.map((s) => stmt.bind(s.code, s.name, s.price, s.rate, s.volume, s.market, ts));
-          await env.DB.batch(batch);
-          if (Array.isArray(failedCodes) && failedCodes.length) {
-            await logSystemEvent(env, "final_quote_partial_failure", `relay 재조회 ${rows.length}종목 성공, ${failedCodes.length}종목 실패: ${failedCodes.slice(0, 15).join(", ")}`);
-          }
-          ctx.waitUntil(
-            runDailySignalBacktest(env).catch((e) => {
-              console.error("일일 신호 백테스트 실패:", e.message || e);
-            })
-          );
-          return Response.json({ ok: true, saved: rows.length, capturedAt: ts });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // relay 전용 - 15:50 일괄정리. 그 시점 관심종목 전체를 훑어서 +3.5%/-1.5% 조건에 걸리는
-      // 종목을 한 번에 익절/손절 확정삭제. 이후(15:50~장마감)엔 다시 매매중지 유지되므로 이 라우트는
-      // 15:50 매매중지 게이트를 우회하는 별도 엔드포인트로 둠 (auto-remove와 게이트 조건이 반대).
-      if (url.pathname === "/api/watchlist/final-sweep" && request.method === "POST") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
-        }
-        try {
-          const { items } = await request.json(); // [{code, pnlPct}, ...] - relay가 실시간가로 이미 계산해서 보냄
-          if (!Array.isArray(items) || !items.length) {
-            return Response.json({ ok: true, removed: 0 });
-          }
-          let removed = 0;
-          const details = [];
-          for (const it of items) {
-            if (typeof it.pnlPct !== "number") continue;
-            // 예전엔 여기서 +3.5%/-1.5% 조건에 걸리는 것만 골라 정리했는데, 그 사이(예: +1.5%) 포지션은
-            // 밤새 그대로 들고 가게 돼서 다음날 개장 갭에 노출되는 문제가 있었음(실측: 09:01 개장 직후
-            // -10%~-5% 대형 손절 무더기 발생). 이제 relay가 보내는 관심종목 전량을 조건과 무관하게
-            // 무조건 청산함 - 이 시스템은 애초에 장중 데이트레이딩 전제라 밤을 넘기지 않는 게 원칙.
-            const w = await env.DB.prepare(
-              `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
-            )
-              .bind(it.code)
-              .first();
-            if (!w) continue;
-            if (w.entry_price > 0) {
-              const exitPrice = w.entry_price * (1 + it.pnlPct / 100);
-              await recordWatchlistExitPerformance(env, w, exitPrice, it.pnlPct); // 라벨(익절삭제/손절삭제)은 실제 부호로 자동 결정됨
-              // daily-stats의 "익절 X / 손절 Y" 카운트는 kind=watchlist_auto_removed 행만 세는데,
-              // 예전엔 여기서 종목별 개별 로그 없이 요약 로그(watchlist_final_sweep) 하나만 남겨서
-              // 15:50 일괄청산분이 그 카운트에서 통째로 빠지는 불일치가 있었음. 다른 청산 경로(cron/relay/
-              // 정원초과)와 동일하게 종목별로 하나씩 남겨서 집계가 일치하게 함.
-              const reason = it.pnlPct >= 0 ? "익절" : "손절";
-              await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${it.code}) 손익률 ${it.pnlPct.toFixed(2)}% 자동삭제[${reason}] [final-sweep]`);
-            }
-            await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(it.code).run();
-            await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(it.code).run();
-            details.push(`${w.name}(${it.code}) ${it.pnlPct.toFixed(2)}%`);
-            removed++;
-          }
-          if (removed > 0) {
-            await logSystemEvent(env, "watchlist_final_sweep", `15:50 장마감 일괄청산 ${removed}종목 - ${details.join(", ")}`);
-          }
-          return Response.json({ ok: true, removed });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // relay 전용 - 손익률 -1.5% 이하 도달 시 관심종목 자동삭제 (2분 cron의 checkWatchlistRiskLevels와
-      // 같은 기준, relay는 실시간가를 이미 들고 있어서 더 빠르게 트리거 가능).
-      if (url.pathname === "/api/watchlist/auto-remove" && request.method === "POST") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요" }, { status: 401 });
-        }
-        try {
-          const { code, pnlPct, name } = await request.json();
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          // 15:50 이후 익절/손절 자동삭제 중지
-          if (!isTradingActiveKST(new Date())) {
-            return Response.json({ ok: false, error: "15:50 이후 자동매매 중지" }, { status: 403 });
-          }
-          // 삭제 전 필요한 필드 확보 - relay는 code/pnlPct/name만 보내므로 나머지는 여기서 조회
-          const w = await env.DB.prepare(
-            `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist WHERE code = ?`
-          )
-            .bind(code)
-            .first();
-          if (w && typeof pnlPct === "number" && w.entry_price > 0) {
-            const exitPrice = w.entry_price * (1 + pnlPct / 100);
-            await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
-          }
-          await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
-          await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
-          const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
-          const reason = typeof pnlPct === "number" && pnlPct >= 3.5 ? "익절" : "손절";
-          await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제[${reason}] [relay]`);
-          console.log(`relay ${reason} 자동삭제: ${code} (${pnlStr}%)`);
-          return Response.json({ ok: true });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // 관심종목 미니차트 전체 일괄조회 - /api/latest와 완전히 분리된 별도 라우트.
-      // 클라이언트가 이 둘을 동시에(병렬) 쏘고, /api/latest는 이 요청을 절대 기다리지 않음.
-      if (url.pathname === "/api/mini-candles-all") {
-        // KV 60초 캐싱 - relay(오라클 VM) 왕복을 없애서 여러 사용자/여러 새로고침이 겹쳐도
-        // 매번 relay를 다시 왕복하지 않게 함. relay 쪽 미니캔들 캐시 자체도 분단위로만 갱신되므로
-        // 60초 캐시로도 신선도 손실이 거의 없음.
-        const MC_CACHE_KEY = "mini-candles-all-v1";
-        if (env.CACHE_KV) {
-          const cached = await env.CACHE_KV.get(MC_CACHE_KEY, "json").catch(() => null);
-          if (cached) {
-            return Response.json(cached);
-          }
-        }
-        if (!env.RELAY_URL || !env.RELAY_SECRET) {
-          console.error("mini-candles-all: RELAY_URL/SECRET 없음");
-          return Response.json({ ok: false, cache: {} });
-        }
-        try {
-          const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
-          if (!mcRes.ok) {
-            const bodyText = await mcRes.text().catch(() => "");
-            console.error("mini-candles-all: relay 응답 실패 status=" + mcRes.status + " body=" + bodyText.slice(0, 300));
-            return Response.json({ ok: false, cache: {} });
-          }
-          const mcData = await mcRes.json();
-          const payload = { ok: !!mcData.ok, cache: mcData.cache || {} };
-          if (env.CACHE_KV && payload.ok) {
-            ctx.waitUntil(env.CACHE_KV.put(MC_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 200 }).catch(() => {}));
-          }
-          return Response.json(payload);
-        } catch (e) {
-          console.error("mini-candles-all: 예외 발생 - " + (e.message || e));
-          return Response.json({ ok: false, cache: {} });
-        }
-      }
-
-      if (url.pathname === "/api/watchlist-fill-missing" && request.method === "POST") {
-        // /api/latest가 응답을 못 채운 관심종목(D1에도 시세없음)만 별도로 relay 즉시조회함.
-        // /api/latest와 완전히 분리된 요청이라 이게 늦어도 관심종목 리스트 자체 표시엔 지장 없음.
-        // relay 즉시조회가 실패하면(장마감 시간대 등) D1에 있는 가장 최근 스냅샷으로 폴백함 -
-        // "시세 없음"으로 방치하는 것보다 마지막으로 알려진 값을 보여주는 게 더 유용함.
-        try {
-          const { codes } = await request.json();
-          if (!Array.isArray(codes) || codes.length === 0) {
-            return Response.json({ ok: true, filled: [] });
-          }
-          let relayFilled = [];
-          if (env.RELAY_URL && env.RELAY_SECRET) {
-            relayFilled = await Promise.all(
-              codes.map((code) =>
-                kiwoomRelayFetch(env, `/realtime/quote-now?code=${code}`, { method: "GET" })
-                  .then((r) => r.json())
-                  .then((d) => (d.ok ? { code, price: d.price, change_rate: d.rate, volume: d.volume } : null))
-                  .catch(() => null)
-              )
-            );
-          } else {
-            relayFilled = codes.map(() => null);
-          }
-          const stillMissing = codes.filter((c, i) => !relayFilled[i]);
-          let fallbackFilled = [];
-          if (stillMissing.length > 0) {
-            const placeholders = stillMissing.map(() => "?").join(",");
-            const fallbackRes = await env.DB.prepare(
-              `SELECT s.code, s.price, s.change_rate, s.volume
-               FROM snapshots s
-               INNER JOIN (
-                 SELECT code, MAX(captured_at) AS max_captured
-                 FROM snapshots WHERE code IN (${placeholders})
-                 GROUP BY code
-               ) m ON s.code = m.code AND s.captured_at = m.max_captured`
-            )
-              .bind(...stillMissing)
-              .all()
-              .catch(() => ({ results: [] }));
-            fallbackFilled = fallbackRes.results || [];
-          }
-          const filled = relayFilled.filter(Boolean).concat(fallbackFilled);
-
-          // 시세는 채워졌는데 진입가가 아직 0(신규 편입 당시 조회 실패)인 종목은,
-          // 지금 채운 시세를 그대로 진입가로 확정 저장함 - "시세 없음"으로 방치하지 않고
-          // 앞으로도 계속 정상적인 진입가/수익률 계산이 되도록 함.
-          if (filled.length > 0) {
-            const zeroEntryRes = await env.DB.prepare(
-              `SELECT code FROM watchlist WHERE code IN (${filled.map(() => "?").join(",")}) AND (entry_price IS NULL OR entry_price = 0)`
-            )
-              .bind(...filled.map((f) => f.code))
-              .all()
-              .catch(() => ({ results: [] }));
-            const zeroEntryCodes = new Set((zeroEntryRes.results || []).map((r) => r.code));
-            if (zeroEntryCodes.size > 0) {
-              await Promise.all(
-                filled
-                  .filter((f) => zeroEntryCodes.has(f.code) && f.price > 0)
-                  .map((f) => env.DB.prepare(`UPDATE watchlist SET entry_price = ? WHERE code = ?`).bind(f.price, f.code).run())
-              );
-              // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
-            }
-          }
-
-          return Response.json({ ok: true, filled });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/watchlist-quotes") {
-        // 관심종목 시세만 초경량으로 반환 - /api/latest의 연속상승/눌림목/TOP5 등 무거운 계산을
-        // 전혀 거치지 않아서 최초 페이지 로딩 시 관심종목이 가장 먼저 뜨게 하는 용도.
-        // KV에 60초 TTL로 캐싱 - D1 왕복(800ms대)을 KV 읽기(수십ms대)로 대체.
-        // (Cloudflare KV는 expirationTtl 최소값이 60초라 더 짧게 못 잡음)
-        // 종목 추가/삭제 시엔 아래에서 캐시를 즉시 delete하므로 실제 반영은 지연 없음.
-        // 시세 자체(가격변동)는 최대 60초 캐시라 화면 자동새로고침 때 갱신됨 - 어차피
-        // 주기(15초)보다 훨씬 짧아서 체감상 문제 없음.
-        const CACHE_KEY = "watchlist-quotes-v1";
-        try {
-          if (env.CACHE_KV) {
-            const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
-            if (cached) {
-              return Response.json(cached);
-            }
-          }
-
-          const watchlistRes = await env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all();
-          const watchlist = watchlistRes.results;
-          if (watchlist.length === 0) {
-            const empty = { ok: true, watchlist: [], watchlistLastKnown: [], watchlistMissingCodes: [], watchlistRisk: [], watchlistExitSignals: [] };
-            if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(empty), { expirationTtl: 60 }).catch(() => {}));
-            return Response.json(empty);
-          }
-          const codes = watchlist.map((w) => w.code);
-          const placeholders = codes.map(() => "?").join(",");
-          const lastKnownRes = await env.DB.prepare(
-            `SELECT s.code, s.price, s.change_rate, s.volume
-             FROM snapshots s
-             INNER JOIN (
-               SELECT code, MAX(captured_at) AS max_captured
-               FROM snapshots WHERE code IN (${placeholders})
-               GROUP BY code
-             ) m ON s.code = m.code AND s.captured_at = m.max_captured`
-          )
-            .bind(...codes)
-            .all();
-          const knownCodes = new Set(lastKnownRes.results.map((r) => r.code));
-          const missingCodes = codes.filter((c) => !knownCodes.has(c));
-
-          let watchlistRisk = [];
-          try {
-            const riskRes = await env.DB.prepare(`SELECT code, status, price, stop_loss, take_profit FROM watchlist_risk_status`).all();
-            watchlistRisk = riskRes.results;
-          } catch (e) { /* 테이블 아직 없을 수 있음 */ }
-
-          const payload = {
-            ok: true,
-            watchlist,
-            watchlistLastKnown: lastKnownRes.results,
-            watchlistMissingCodes: missingCodes,
-            watchlistRisk,
-            watchlistExitSignals: [],
-          };
-          if (env.CACHE_KV) {
-            ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 60 }).catch(() => {}));
-          }
-          return Response.json(payload);
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/latest") {
-        // 미니차트는 여기서 절대 기다리지 않음(완전히 분리된 /api/mini-candles-all이 전담) -
-        // relay 왕복이 조금이라도 늦어지면 가격/종목명 같은 핵심 데이터까지 통째로 지연되던
-        // 문제를 근본적으로 없애기 위해, 이 라우트는 D1 조회만 하고 무조건 빠르게 응답함.
-        const [data, watchlistRes] = await Promise.all([
-          getLatest(env),
-          env.DB.prepare(`SELECT * FROM watchlist ORDER BY added_at DESC`).all(),
-        ]);
-        data.watchlist = watchlistRes.results;
-
-        // 밴드 밖(오늘 5~15% 목록에 없는) 관심종목은 D1에 저장된 가장 최근 시세로 대체
-        // (키움 API 재조회 없이, 이미 수집해둔 데이터만 사용)
-        const inBandCodes = new Set(data.latest.map((r) => r.code));
-        const offBandCodes = data.watchlist.map((w) => w.code).filter((c) => !inBandCodes.has(c));
-        if (offBandCodes.length > 0) {
-          const placeholders = offBandCodes.map(() => "?").join(",");
-          const lastKnownRes = await env.DB.prepare(
-            `SELECT s.code, s.price, s.change_rate, s.volume
-             FROM snapshots s
-             INNER JOIN (
-               SELECT code, MAX(captured_at) AS max_captured
-               FROM snapshots WHERE code IN (${placeholders})
-               GROUP BY code
-             ) m ON s.code = m.code AND s.captured_at = m.max_captured`
-          )
-            .bind(...offBandCodes)
-            .all();
-          data.watchlistLastKnown = lastKnownRes.results;
-        } else {
-          data.watchlistLastKnown = [];
-        }
-
-        // 밴드에도 D1에도 값이 없는 종목은 여기서 즉시조회하지 않음 - relay 왕복(종목당 1.1초+)이
-        // /api/latest 응답 전체를 붙잡아 관심종목 표시가 수 초씩 늦어지는 원인이었음.
-        // 대신 "시세없음" 상태로 즉시 응답하고, 클라이언트가 /api/watchlist-fill-missing을
-        // 별도 병렬 요청으로 쏴서 채움 (미니차트와 동일한 패턴).
-        const knownCodes = new Set(data.watchlistLastKnown.map((r) => r.code));
-        data.watchlistMissingCodes = offBandCodes.filter((c) => !knownCodes.has(c));
-
-        // cron이 미리 체크해둔 손절/익절 도달 상태 (모달 안 열어도 바로 보이게)
-        if (data.watchlist.length) {
-          try {
-            const riskRes = await env.DB.prepare(`SELECT code, status, price, stop_loss, take_profit FROM watchlist_risk_status`).all();
-            data.watchlistRisk = riskRes.results;
-          } catch (e) {
-            data.watchlistRisk = []; // watchlist_risk_status 테이블이 아직 없을 수 있음
-          }
-        } else {
-          data.watchlistRisk = [];
-        }
-
-        // 관심종목 이탈신호(매도 고려): 손절선에 닿기 전에 미리 나타나는 약세 징후들.
-        // 이미 D1에 있는 최근 스냅샷만 사용 - 추가 키움 조회 0건.
-        data.watchlistExitSignals = [];
-        if (data.watchlist.length) {
-          try {
-            const wlCodes = data.watchlist.map((w) => w.code);
-            const ph = wlCodes.map(() => "?").join(",");
-            const recentTimesRes = await env.DB.prepare(
-              `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 4`
-            ).all();
-            const recentTimes = recentTimesRes.results.map((r) => r.captured_at);
-            if (recentTimes.length >= 2) {
-              const tph = recentTimes.map(() => "?").join(",");
-              const histRes = await env.DB.prepare(
-                `SELECT code, change_rate, price, cntr_str, buy_req, sel_req, captured_at
-                 FROM snapshots WHERE code IN (${ph}) AND captured_at IN (${tph})`
-              )
-                .bind(...wlCodes, ...recentTimes)
-                .all();
-              // 고점 기준을 "담은 시점 이후"로 잡음.
-              // 오늘 전체 고점으로 잡으면, 이미 고점 찍고 내려온 종목을 담는 순간 바로 이탈신호가 떠서 무의미함.
-              // 실제로 알고 싶은 건 "내가 담은 뒤로 어떻게 됐는지"이므로 added_at 이후만 집계.
-              // (종목마다 담은 시점이 달라서 correlated subquery로 한 번에 처리 - 예전엔 종목 수만큼 D1 왕복이 순차로 돌았음)
-              const wph = data.watchlist.map(() => "?").join(",");
-              const maxRes = await env.DB.prepare(
-                `SELECT w.code AS code,
-                        (SELECT MAX(s.change_rate) FROM snapshots s WHERE s.code = w.code AND s.captured_at >= w.added_at) AS maxRate
-                 FROM watchlist w WHERE w.code IN (${wph})`
-              )
-                .bind(...data.watchlist.map((w) => w.code))
-                .all()
-                .catch(() => ({ results: [] }));
-              const maxMap = new Map(
-                maxRes.results.filter((r) => r.maxRate !== null).map((r) => [r.code, r.maxRate])
-              );
-              const entryMap = new Map(data.watchlist.map((w) => [w.code, w.entry_price]));
-
-              const byCode = new Map();
-              for (const r of histRes.results) {
-                if (!byCode.has(r.code)) byCode.set(r.code, new Map());
-                byCode.get(r.code).set(r.captured_at, r);
-              }
-
-              for (const code of wlCodes) {
-                const m = byCode.get(code);
-                if (!m) continue;
-                const cur = m.get(recentTimes[0]);
-                const prev = m.get(recentTimes[1]);
-                if (!cur || !prev) continue;
-                const reasons = [];
-
-                // 15:36 마감 정밀조회는 체결강도/매수잔량/매도잔량을 항상 0으로 저장함 - 그 틱이 cur로 잡히면
-                // "체결강도 꺾임"/"매도잔량 역전"이 전 종목에 오판되어 뜸(실제값->0을 급락/역전으로 착각) - 걸러냄
-                const isPlaceholderRow = (row) => row.cntr_str === 0 && row.buy_req === 0 && row.sel_req === 0;
-                const hasOrderFlowData = !isPlaceholderRow(cur) && !isPlaceholderRow(prev);
-
-                // 1) 체결강도가 매수우위(105+)에서 꺾여 내려옴
-                if (hasOrderFlowData && (prev.cntr_str || 0) >= 105 && (cur.cntr_str || 0) < 100) reasons.push("체결강도 꺾임");
-                // 2) 매수잔량 우위 -> 매도잔량 우위로 역전 ("매수전환"의 정반대)
-                if (hasOrderFlowData && (prev.buy_req || 0) > (prev.sel_req || 0) && (cur.buy_req || 0) <= (cur.sel_req || 0)) {
-                  reasons.push("매도잔량 역전");
-                }
-                // 3) 담은 뒤 고점 대비 3%p 이상 밀림 (내가 담은 이후 기준)
-                const maxRate = maxMap.get(code);
-                if (maxRate !== undefined && maxRate - cur.change_rate >= 3) {
-                  reasons.push("담은후고점대비 -" + (maxRate - cur.change_rate).toFixed(2) + "%p");
-                }
-                // 4) 최근 3틱 연속 하락 (recentTimes[0]이 최신이라 0<1<2 순서로 비교)
-                const t2 = m.get(recentTimes[2]);
-                const t3 = m.get(recentTimes[3]);
-                if (t2 && t3 && cur.change_rate < prev.change_rate && prev.change_rate < t2.change_rate && t2.change_rate < t3.change_rate) {
-                  reasons.push("3틱 연속 하락");
-                }
-                // 5) 진입가 대비 2% 이상 하락 - 실제 내 손실이 커지는 중이라는 가장 직접적인 신호
-                // (cur는 위에서 이미 byCode 맵으로 구해둔 값이라 재사용 - 예전엔 histRes.results 전체를 매번 find()로 훑었음)
-                const entryPrice = entryMap.get(code);
-                if (entryPrice > 0 && cur.price > 0) {
-                  const pnlPct = ((cur.price - entryPrice) / entryPrice) * 100;
-                  if (pnlPct <= -2) reasons.push("진입가대비 " + pnlPct.toFixed(2) + "%");
-                }
-
-                if (reasons.length) data.watchlistExitSignals.push({ code, reasons });
-              }
-            }
-          } catch (e) {
-            data.watchlistExitSignals = []; // 계산 실패해도 화면 전체는 정상 표시
-          }
-        }
-
-        return Response.json(data);
-      }
-
-      if (url.pathname === "/api/buy" && request.method === "POST") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
-        }
-        try {
-          const { code } = await request.json();
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          const result = await kiwoomBuyOrder(env, code);
-          return Response.json(result);
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/sell" && request.method === "POST") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
-        }
-        try {
-          const { code } = await request.json();
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          const result = await kiwoomSellOrder(env, code);
-          return Response.json(result);
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/admin/sync-dart-codes") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        try {
-          const count = await syncDartCorpCodes(env);
-          return Response.json({ ok: true, synced: count });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/disclosures") {
-        try {
-          const code = url.searchParams.get("code");
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          const corp = await getDartCorpCode(env, code);
-          if (!corp) {
-            return Response.json({ ok: false, error: "DART corp_code 매핑이 없습니다. /api/admin/sync-dart-codes를 먼저 실행하세요." });
-          }
-          const items = await fetchDartDisclosures(env, corp.corp_code);
-          return Response.json({ ok: true, corpName: corp.corp_name, items });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/news") {
-        try {
-          const q = url.searchParams.get("q");
-          if (!q) return Response.json({ ok: false, error: "q 누락" }, { status: 400 });
-          const items = await naverNewsSearch(env, q);
-          await classifyNewsSentiment(env, items);
-          return Response.json({ ok: true, items });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/quote") {
-        try {
-          const code = url.searchParams.get("code");
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-
-          // 장 마감 후에는 실시간 재조회 대신 15:35 최종 재조회로 D1에 박아둔 정확한 마감 데이터를 씀
-          // (마감 후 키움 실전 조회는 기준이 달라져 리스트와 등락률이 어긋나는 문제 있었음)
-          if (!isMarketHoursKST(new Date())) {
-            const row = await env.DB.prepare(
-              `SELECT price, change_rate AS rate, volume FROM snapshots WHERE code = ? ORDER BY captured_at DESC LIMIT 1`
-            )
-              .bind(code)
-              .first();
-            if (row) {
-              return Response.json({
-                ok: true,
-                price: row.price,
-                rate: row.rate,
-                open: row.price,
-                high: row.price,
-                low: row.price,
-                volume: row.volume,
-              });
-            }
-            // D1에 해당 종목 기록이 없으면 아래로 폴백해서 실시간 조회 시도
-          }
-
-          // relay가 이미 웹소켓으로 들고 있는 실시간가를 우선 씀 (즉시 응답, 키움 TR 호출 없음).
-          // relay 미보유(구독 안 된 종목 등)일 때만 키움 직접조회로 폴백.
-          try {
-            const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
-            const relayData = await relayRes.json();
-            const q = relayData.stocks && relayData.stocks[code];
-            if (q && q.price) {
-              return Response.json({ ok: true, price: q.price, rate: q.rate, open: q.price, high: q.price, low: q.price, volume: q.volume || 0 });
-            }
-          } catch (e) {
-            // relay 실패시 아래 폴백으로 계속
-          }
-
-          const token = await kiwoomIssueToken(env);
-          const raw = await kiwoomQuote(env, token, code);
-          return Response.json({ ok: true, ...parseKiwoomQuote(raw) });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/ai-analysis" && request.method === "POST") {
-        try {
-          const body = await request.json();
-          const { code, name } = body;
-          if (!code || !name) {
-            return Response.json({ ok: false, error: "code, name 필요" }, { status: 400 });
-          }
-
-          const token = await kiwoomIssueToken(env);
-          const [quoteRaw, newsItems, corp] = await Promise.all([
-            kiwoomQuote(env, token, code).catch(() => null),
-            naverNewsSearch(env, name).catch(() => []),
-            getDartCorpCode(env, code).catch(() => null),
-          ]);
-          const quote = quoteRaw ? parseKiwoomQuote(quoteRaw) : null;
-          let disclosures = [];
-          if (corp) {
-            disclosures = await fetchDartDisclosures(env, corp.corp_code).catch(() => []);
-          }
-
-          const lines = [`종목: ${name} (${code})`];
-          if (quote) {
-            lines.push(`현재가: ${quote.price}원, 등락률: ${quote.rate}%`);
-            lines.push(`오늘 시가: ${quote.open}, 고가: ${quote.high}, 저가: ${quote.low}, 거래량: ${quote.volume}`);
-            if (quote.high) {
-              const gapFromHigh = (((quote.price - quote.high) / quote.high) * 100).toFixed(2);
-              lines.push(`오늘 고점 대비: ${gapFromHigh}% (${gapFromHigh < -3 ? "고점에서 꽤 밀림" : gapFromHigh < 0 ? "고점 대비 소폭 하락" : "고점 유지 중"})`);
-            }
-          }
-          if (body.cntrStr) {
-            lines.push(`체결강도: ${body.cntrStr} (${body.cntrStr >= 105 ? "매수세 우위" : body.cntrStr < 95 ? "매도세 우위" : "중립"})`);
-          }
-          if (body.buyReq && body.selReq) {
-            lines.push(`매수잔량: ${body.buyReq}, 매도잔량: ${body.selReq} (${body.buyReq > body.selReq ? "매수 우위" : "매도 우위"})`);
-          }
-          if (body.signalChecks && body.signalChecks.length) {
-            lines.push(`충족된 기술적 조건: ${body.signalChecks.join(", ")}`);
-          }
-          if (newsItems.length) {
-            lines.push("최근 뉴스:");
-            newsItems.forEach((n) => lines.push(`- ${n.title}: ${n.description}`));
-          } else {
-            lines.push("최근 뉴스: 검색된 것 없음");
-          }
-          if (disclosures.length) {
-            lines.push("최근 30일 공시:");
-            disclosures.forEach((d) => lines.push(`- ${d.date} ${d.title}`));
-          } else {
-            lines.push("최근 30일 공시: 없음");
-          }
-          lines.push(
-            "위 항목을 단순 나열하지 말고 서로 연결지어 해석하세요. 예: 뉴스/공시 내용이 오늘 등락률과 " +
-            "시점상 관련 있어 보이는지, 체결강도와 호가잔량이 같은 방향을 가리키는지 엇갈리는지, " +
-            "고점 대비 낙폭이 신호들과 앞뒤가 맞는지. 실제로 확인되는 연결점이 없으면 " +
-            "'특별한 연관성 확인 안 됨'이라고 명시하세요."
-          );
-
-          const analysis = await askStockExpert(env, lines.join("\n"));
-          return Response.json({ ok: true, analysis });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/risk-levels") {
-        try {
-          const code = url.searchParams.get("code");
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          const token = await kiwoomIssueToken(env);
-          const ohlc = await getCachedDailyOHLC(env, token, code);
-          const quoteRaw = await kiwoomQuote(env, token, code);
-          const atr = computeATR(ohlc, 14);
-          const goldenCross = computeGoldenCross(ohlc);
-          const quote = parseKiwoomQuote(quoteRaw);
-          if (!atr) {
-            return Response.json({ ok: false, error: "ATR 계산에 필요한 일봉 데이터가 부족합니다" });
-          }
-          return Response.json({
-            ok: true,
-            atr,
-            currentPrice: quote.price,
-            stopLoss: Math.round(quote.price - atr * 1.5),
-            takeProfit: Math.round(quote.price + atr * 2),
-            goldenCross,
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/mini-candles") {
-        try {
-          const code = url.searchParams.get("code");
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-
-          // relay(Oracle VM)가 관심종목 미니차트를 백그라운드로 미리 갱신해서 캐시해둠 - 그걸
-          // 우선 씀 (즉시 응답, 종목당 1.1초 순차대기 없음). 단, relay는 장중(09:01~15:46)에만
-          // 갱신하므로 장마감 후 캐시미스는 "곧 채워짐"이 아니라 "영원히 안 채워짐"임 - 이땐 바로
-          // 직접조회 폴백으로 넘어가야 함 (장중에만 폴백을 미루는 pending 응답을 씀).
-          try {
-            const relayRes = await kiwoomRelayFetch(env, `/realtime/mini-candles?code=${code}`, { method: "GET" });
-            const relayData = await relayRes.json();
-            if (relayData.ok) {
-              return Response.json({ ok: true, candles: relayData.candles, tradingDate: relayData.tradingDate });
-            }
-            if (isMarketHoursKST(new Date())) {
-              // 장중 캐시미스만 "곧 채워짐" 취급 - 동시다발적 직접조회로 인한 초당1건 제한 충돌 방지
-              return Response.json({ ok: false, error: "relay 캐시 준비중", pending: true });
-            }
-            // 장마감 후엔 아래로 계속 진행해서 직접조회 폴백
-          } catch (e) {
-            // relay 요청 자체가 실패(다운/타임아웃)했을 때도 아래 직접조회 폴백으로 진행
-          }
-
-          const token = await kiwoomIssueToken(env);
-          const raw = await kiwoomChart(env, token, code, "1");
-          const parsed = parseKiwoomChartOHLC(raw);
-          // 휴일 등으로 오늘자 데이터가 없으면, 이미 받아온 응답 안에서 가장 최근 거래일로 자동 폴백
-          // (추가 조회 없음 - kiwoomChart가 원래 여러 날짜분을 한 번에 내려줌)
-          const todayStr = todayYYYYMMDD();
-          const hasToday = parsed.some((c) => c.time.slice(0, 8) === todayStr);
-          const targetDate = hasToday
-            ? todayStr
-            : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
-          const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
-          return Response.json({ ok: true, candles, tradingDate: targetDate || null });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/chart") {
-        try {
-          const code = url.searchParams.get("code");
-          const period = url.searchParams.get("period") || "5";
-          if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
-          const token = await kiwoomIssueToken(env);
-          const raw = await kiwoomChart(env, token, code, period);
-          const parsed = parseKiwoomChart(raw);
-          return Response.json({
-            ok: true,
-            prices: parsed.map((p) => p.price),
-            times: parsed.map((p) => p.time),
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/debug") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
-        }
-        const result = await debugFetch(env);
-        return Response.json(result);
-      }
-
-      if (url.pathname === "/api/debug-quote") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
-        }
-        try {
-          const code = url.searchParams.get("code") || "005930";
-          const token = await kiwoomIssueToken(env);
-          const raw = await kiwoomQuote(env, token, code);
-          return Response.json({ ok: true, rawKeys: Object.keys(raw), raw });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/debug-chart") {
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
-        }
-        try {
-          const code = url.searchParams.get("code") || "005930";
-          const period = url.searchParams.get("period") || "5";
-          const token = await kiwoomIssueToken(env);
-          const raw = await kiwoomChart(env, token, code, period);
-          let rows = [];
-          for (const k of Object.keys(raw)) {
-            if (Array.isArray(raw[k])) { rows = raw[k]; break; }
-          }
-          const times = rows.map((r) => r.cntr_tm).filter(Boolean);
-          const dates = [...new Set(times.map((t) => t.slice(0, 8)))].sort();
-          return Response.json({
-            ok: true,
-            rawKeys: Object.keys(raw),
-            totalRows: rows.length,
-            uniqueDates: dates,
-            earliestTm: times[times.length - 1],
-            latestTm: times[0],
-            rawSample: JSON.stringify(raw).slice(0, 800),
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/pattern-scan") {
-        try {
-          const timesRes = await env.DB.prepare(
-            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT 1`
-          ).all();
-          const times = timesRes.results.map((r) => r.captured_at);
-          if (times.length === 0) {
-            return Response.json({ ok: false, error: "오늘 수집된 데이터가 없습니다" });
-          }
-
-          // 같은 스냅샷 시각(2분 틱)에 대해 이미 스캔한 적 있으면 15종목×1.1초 재스캔 없이 캐시 반환
-          const cached = await env.DB.prepare(
-            `SELECT result_json FROM pattern_scan_cache WHERE captured_at = ?`
-          )
-            .bind(times[0])
-            .first();
-          if (cached) {
-            return Response.json({ ok: true, cached: true, ...JSON.parse(cached.result_json) });
-          }
-
-          const candRes = await env.DB.prepare(
-            `SELECT code, name, volume FROM snapshots WHERE captured_at = ? ORDER BY volume DESC LIMIT 15`
-          )
-            .bind(times[0])
-            .all();
-          const candidates = candRes.results;
-          const { results, debugInfo } = await scanPatternMatches(env, candidates);
-          const payload = { scanned: candidates.length, latestSnapshotAt: times[0], results, debugInfo };
-
-          await env.DB.prepare(
-            `INSERT OR REPLACE INTO pattern_scan_cache (captured_at, result_json, created_at) VALUES (?, ?, ?)`
-          )
-            .bind(times[0], JSON.stringify(payload), new Date().toISOString())
-            .run();
-
-          return Response.json({ ok: true, cached: false, ...payload });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/market-index") {
-        // relay가 웹소켓으로 상시 물고 있는 실시간 지수를 그대로 읽어옴.
-        // 키움 TR 호출 0건이라 초당1건 제한과 무관하고, D1 캐싱도 필요 없음(항상 최신).
-        try {
-          const res = await kiwoomRelayFetch(env, "/realtime/index", { method: "GET" });
-          const data = await res.json();
-          if (!data.ok || !data.kospi || !data.kosdaq) {
-            // 웹소켓이 아직 연결 전이거나 장 시작 전이라 데이터가 없는 경우
-            return Response.json({
-              ok: false,
-              error: "실시간 지수 데이터 대기 중",
-              wsConnected: data.wsConnected,
-              wsLoggedIn: data.wsLoggedIn,
-            });
-          }
-          return Response.json({
-            ok: true,
-            realtime: true,
-            kospi: { price: data.kospi.price, rate: data.kospi.rate },
-            kosdaq: { price: data.kosdaq.price, rate: data.kosdaq.rate },
-            updatedAt: data.kospi.updatedAt,
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/admin/performance-report") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        // 실제로 담았던 관심종목들의 결과를 보드별/신호별로 집계.
-        // 백테스트(가상)와 달리 이건 "실제로 내가 담은 것"들의 성적표라 가중치 조정의 가장 강한 근거임.
-        try {
-          const horizon = parseInt(url.searchParams.get("horizon") || "30", 10) || 30;
-          // 이상치 기준: 급등주 스크리너는 5~15% 밴드 종목만 담으므로 30분 후 손익률이 이 범위를 크게
-          // 벗어나는 건 진입가 오류(조회 실패 시 엉뚱한 값 저장, 액면분할/거래정지로 가격체계 변경 등)일
-          // 가능성이 높음. 실제로 +227% 한 건이 전체 순손익을 -25만원 -> +202만원으로 뒤집어버린 사례가 있었음.
-          // outlierPct 파라미터로 조정 가능하고, includeOutliers=1이면 예전처럼 전부 포함해서 볼 수 있음.
-          const outlierPct = Math.abs(parseFloat(url.searchParams.get("outlierPct") || "40")) || 40;
-          const includeOutliers = url.searchParams.get("includeOutliers") === "1";
-          const res = await env.DB.prepare(
-            `SELECT code, name, added_at, entry_price, later_price, source_board, added_state, pnl_pct
-             FROM watchlist_performance WHERE horizon_min = ?`
-          )
-            .bind(horizon)
-            .all();
-          const allRows = res.results;
-          if (!allRows.length) {
-            return Response.json({ ok: true, horizon, sampleSize: 0, note: "아직 기록된 성과 데이터가 없습니다. 관심종목을 담고 30분 이상 지나야 쌓입니다." });
-          }
-          const outliers = allRows.filter((r) => Math.abs(r.pnl_pct) > outlierPct);
-          const rows = includeOutliers ? allRows : allRows.filter((r) => Math.abs(r.pnl_pct) <= outlierPct);
-          if (!rows.length) {
-            return Response.json({ ok: true, horizon, sampleSize: 0, excludedOutliers: outliers, note: "이상치를 제외하고 나니 남은 표본이 없습니다." });
-          }
-
-          // 관심종목 화면(computeRealisticPnl)과 동일한 공식으로 실질 손익을 미리 계산해둠.
-          // 예전엔 순수 가격변동률(pnl_pct)만으로 금액을 냈는데, 그러면 수수료·세금(왕복 약 0.23%)이
-          // 통째로 빠져서 리포트가 실제보다 항상 좋게 나왔음(하루 표본 270여건 기준 약 60만원 차이).
-          const BUY_AMOUNT = 1000000;
-          const netRows = rows
-            .map((r) => {
-              if (!r.entry_price || r.entry_price <= 0 || !r.later_price || r.later_price <= 0) return null;
-              const net = computeRealisticPnlServer(r.entry_price, r.later_price, BUY_AMOUNT);
-              if (!net) return null;
-              return { ...r, netPnlPct: net.netPnlPct, netPnlAmount: net.netPnlAmount };
-            })
-            .filter(Boolean);
-          if (!netRows.length) {
-            return Response.json({ ok: true, horizon, sampleSize: 0, note: "실질손익 계산 가능한 표본이 없습니다(진입가/현재가 누락)." });
-          }
-
-          const moneyAgg = (keyFn) => {
-            const map = new Map();
-            netRows.forEach((r) => {
-              for (const k of keyFn(r)) {
-                if (!k) continue;
-                if (!map.has(k)) map.set(k, { profitSum: 0, lossSum: 0, profitCount: 0, lossCount: 0 });
-                const s = map.get(k);
-                if (r.netPnlAmount > 0) { s.profitSum += r.netPnlAmount; s.profitCount++; }
-                else if (r.netPnlAmount < 0) { s.lossSum += r.netPnlAmount; s.lossCount++; }
-              }
-            });
-            const out = {};
-            for (const [k, s] of map) {
-              out[k] = {
-                profitWon: Math.round(s.profitSum),
-                lossWon: Math.round(s.lossSum),
-                netWon: Math.round(s.profitSum + s.lossSum),
-                profitCount: s.profitCount,
-                lossCount: s.lossCount,
-              };
-            }
-            return out;
-          };
-
-          const agg = (keyFn) => {
-            const map = new Map();
-            netRows.forEach((r) => {
-              for (const k of keyFn(r)) {
-                if (!k) continue;
-                if (!map.has(k)) map.set(k, { count: 0, sum: 0, wins: 0 });
-                const s = map.get(k);
-                s.count++;
-                s.sum += r.netPnlPct;
-                if (r.netPnlAmount > 0) s.wins++;
-              }
-            });
-            const out = {};
-            for (const [k, s] of map) {
-              out[k] = {
-                sampleSize: s.count,
-                avgPnlPct: +(s.sum / s.count).toFixed(3),
-                winRatePct: +((s.wins / s.count) * 100).toFixed(1),
-              };
-            }
-            return out;
-          };
-
-          const overallAvg = +(netRows.reduce((s, r) => s + r.netPnlPct, 0) / netRows.length).toFixed(3);
-          const overallWinRate = +((netRows.filter((r) => r.netPnlAmount > 0).length / netRows.length) * 100).toFixed(1);
-          const overallProfitWon = Math.round(netRows.reduce((s, r) => s + Math.max(0, r.netPnlAmount), 0));
-          const overallLossWon = Math.round(netRows.reduce((s, r) => s + Math.min(0, r.netPnlAmount), 0));
-
-          return Response.json({
-            ok: true,
-            horizon,
-            sampleSize: netRows.length,
-            buyAmountAssumedWon: BUY_AMOUNT,
-            feesIncluded: true,
-            outlierThresholdPct: outlierPct,
-            outliersExcluded: includeOutliers ? 0 : outliers.length,
-            // 제외된 레코드를 그대로 보여줘서 원인(진입가 오류인지, 실제 급등인지)을 바로 확인할 수 있게 함
-            outlierRecords: outliers.map((r) => ({
-              code: r.code, name: r.name, addedAt: r.added_at,
-              entryPrice: r.entry_price, laterPrice: r.later_price, pnlPct: r.pnl_pct,
-              sourceBoard: r.source_board, addedState: r.added_state,
-            })),
-            overall: {
-              avgPnlPct: overallAvg,
-              winRatePct: overallWinRate,
-              profitWon: overallProfitWon,
-              lossWon: overallLossWon,
-              netWon: overallProfitWon + overallLossWon,
-            },
-            byBoard: agg((r) => [r.source_board]),
-            byBoardMoney: moneyAgg((r) => [r.source_board]),
-            bySignal: agg((r) => (r.added_state || "").split(",").filter(Boolean)),
-            bySignalMoney: moneyAgg((r) => (r.added_state || "").split(",").filter(Boolean)),
-            interpretation:
-              "byBoard/bySignal의 avgPnlPct가 overall보다 높으면 그 보드/신호가 실제로 효과 있었다는 뜻. " +
-              "sampleSize가 작으면(대략 20 미만) 아직 우연일 수 있으니 데이터가 더 쌓인 뒤 판단할 것. " +
-              "profitWon/lossWon/netWon은 종목당 100만원 매수 가정, 매수/매도 수수료(0.015%씩)와 매도 거래세(0.20%)를 " +
-              "실제 관심종목 화면과 동일하게 반영한 실질 손익 금액. avgPnlPct/winRatePct도 동일 기준. " +
-              "손익률 절댓값이 " + outlierPct + "%를 넘는 건은 진입가 오류일 가능성이 높아 집계에서 제외했고 " +
-              "outlierRecords에 따로 담았음(전부 포함해서 보려면 &includeOutliers=1).",
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // 익절/손절 임계값 시뮬레이터 - "그때 임계값이 달랐다면 실제로 얼마 벌었을까"를 실측 데이터로 계산.
-      // 실제로 담았던 관심종목(watchlist_performance에 기록된 added_at/entry_price)의 진입 이후 가격 경로를
-      // snapshots(2분 간격) + watchlist_fine_snapshots(30초 간격)에서 시간순으로 재구성한 뒤, 임계값 조합마다
-      // "먼저 닿는 쪽"으로 청산했다고 가정해 손익을 집계함.
-      // - 30분 시점 가격만 보는 performance-report와 달리, 중간에 익절선/손절선을 스쳤는지까지 반영됨
-      // - 장중에 어느 쪽도 안 닿으면 마지막 관측가로 청산(장마감 정리에 해당)
-      // - 수수료/세금은 관심종목 화면과 동일 기준(매수·매도 각 0.015%, 매도 거래세 0.20%)으로 반영
-      if (url.pathname === "/api/admin/simulate-exits") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        try {
-          const days = Math.min(parseInt(url.searchParams.get("days") || "7", 10) || 7, 30);
-          const maxHoldMin = Math.min(parseInt(url.searchParams.get("holdMin") || "390", 10) || 390, 390);
-          const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-
-          // 실제로 담았던 이력 - horizon_min=30 행 하나당 "한 번의 진입"으로 취급(중복 방지)
-          const entriesRes = await env.DB.prepare(
-            `SELECT DISTINCT code, name, added_at, entry_price, source_board
-             FROM watchlist_performance
-             WHERE horizon_min = 30 AND entry_price > 0 AND added_at >= ?
-             ORDER BY added_at ASC`
-          )
-            .bind(cutoff)
-            .all();
-          const entries = entriesRes.results || [];
-          if (!entries.length) {
-            return Response.json({ ok: true, sampleSize: 0, note: "해당 기간에 기록된 진입 이력이 없습니다." });
-          }
-
-          // 진입 종목들의 가격 경로를 한 번에 가져옴(종목별 개별 쿼리 대신 IN절 - D1 왕복 최소화).
-          // 변수 개수 제한 때문에 종목코드는 60개씩 끊어서 조회.
-          const codes = [...new Set(entries.map((e) => e.code))];
-          const priceRows = [];
-          for (let i = 0; i < codes.length; i += 60) {
-            const chunk = codes.slice(i, i + 60);
-            const ph = chunk.map(() => "?").join(",");
-            const [snapRes, fineRes] = await Promise.all([
-              env.DB.prepare(
-                `SELECT code, price, captured_at FROM snapshots WHERE code IN (${ph}) AND captured_at >= ?`
-              ).bind(...chunk, cutoff).all().catch(() => ({ results: [] })),
-              env.DB.prepare(
-                `SELECT code, price, captured_at FROM watchlist_fine_snapshots WHERE code IN (${ph}) AND captured_at >= ?`
-              ).bind(...chunk, cutoff).all().catch(() => ({ results: [] })),
-            ]);
-            priceRows.push(...(snapRes.results || []), ...(fineRes.results || []));
-          }
-
-          // 종목별 시간순 가격 경로 구성 (snapshots와 fine을 합쳐서 정렬 - 같은 시각 중복은 무해)
-          const pathByCode = new Map();
-          for (const r of priceRows) {
-            if (!r.price || r.price <= 0) continue;
-            if (!pathByCode.has(r.code)) pathByCode.set(r.code, []);
-            pathByCode.get(r.code).push({ t: new Date(r.captured_at).getTime(), price: r.price });
-          }
-          for (const arr of pathByCode.values()) arr.sort((a, b) => a.t - b.t);
-
-          const FEE = 0.00015, TAX = 0.0020, BUDGET = 1000000;
-          // 비율 손익을 수수료·세금 반영한 실질 손익률로 환산 (관심종목 화면의 computeRealisticPnl과 동일 기준)
-          const netPct = (entryPrice, exitPrice) => {
-            const qty = Math.floor(BUDGET / entryPrice);
-            if (qty <= 0) return null;
-            const invested = qty * entryPrice;
-            const cost = invested + invested * FEE;
-            const proceeds = qty * exitPrice - qty * exitPrice * FEE - qty * exitPrice * TAX;
-            return { pct: ((proceeds - cost) / cost) * 100, won: Math.round(proceeds - cost) };
-          };
-
-          const simulate = (tpPct, slPct) => {
-            let wins = 0, losses = 0, profitWon = 0, lossWon = 0, tpHit = 0, slHit = 0, timeout = 0, used = 0;
-            for (const e of entries) {
-              const path = pathByCode.get(e.code);
-              if (!path || !path.length) continue;
-              const startMs = new Date(e.added_at).getTime();
-              const endMs = startMs + maxHoldMin * 60000;
-              const after = path.filter((p) => p.t >= startMs && p.t <= endMs);
-              if (!after.length) continue;
-              used++;
-              const tpPrice = e.entry_price * (1 + tpPct / 100);
-              const slPrice = e.entry_price * (1 + slPct / 100);
-              let exitPrice = after[after.length - 1].price, hit = "timeout";
-              for (const p of after) {
-                // 같은 관측 시점에 둘 다 걸릴 수 있는데(2분/30초 간격이라 그 사이 움직임은 알 수 없음),
-                // 실제 운용에서 손실이 먼저 확정되는 보수적 가정을 따름 - 손절을 우선 판정.
-                if (p.price <= slPrice) { exitPrice = slPrice; hit = "sl"; break; }
-                if (p.price >= tpPrice) { exitPrice = tpPrice; hit = "tp"; break; }
-              }
-              if (hit === "tp") tpHit++; else if (hit === "sl") slHit++; else timeout++;
-              const n = netPct(e.entry_price, exitPrice);
-              if (!n) continue;
-              if (n.won > 0) { wins++; profitWon += n.won; } else { losses++; lossWon += n.won; }
-            }
-            const total = wins + losses;
-            return {
-              takeProfitPct: tpPct, stopLossPct: slPct,
-              sampleSize: used,
-              winRatePct: total ? +((wins / total) * 100).toFixed(1) : null,
-              netWon: profitWon + lossWon,
-              profitWon, lossWon,
-              tpHitCount: tpHit, slHitCount: slHit, timeoutCount: timeout,
-            };
-          };
-
-          const tpCandidates = [2, 2.5, 3, 3.5, 4, 5];
-          const slCandidates = [-1, -1.5, -2, -2.5];
-          const results = [];
-          for (const tp of tpCandidates) for (const sl of slCandidates) results.push(simulate(tp, sl));
-          results.sort((a, b) => b.netWon - a.netWon);
-
-          return Response.json({
-            ok: true,
-            days, maxHoldMin,
-            entriesFound: entries.length,
-            best: results[0],
-            current: results.find((r) => r.takeProfitPct === 3.5 && r.stopLossPct === -1.5),
-            previous: results.find((r) => r.takeProfitPct === 2.5 && r.stopLossPct === -1.5),
-            allResults: results,
-            caveats:
-              "가격 경로가 snapshots(2분)+fine(30초) 관측점 기준이라 그 사이의 순간 고저는 안 잡힘 - 실제보다 익절/손절 도달이 과소집계될 수 있음. " +
-              "한 관측점에서 익절선·손절선이 동시에 걸리면 보수적으로 손절을 우선 적용함. " +
-              "5~15% 밴드를 벗어난 구간은 snapshots에 안 남으므로 관심종목이 아니었던 시간대는 경로가 끊길 수 있음. " +
-              "표본이 작으면(대략 30 미만) 순위가 우연일 수 있으니 days를 늘려서 재확인할 것.",
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // 잘못 들어간 성과 레코드 삭제 (테스트 데이터 정리용) - code와 added_at을 둘 다 정확히
-      // 지정해야만 지워지므로 실수로 다른 데이터를 날릴 위험이 낮음. 삭제 전 대상을 먼저 보여주고,
-      // confirm=1이 있을 때만 실제로 지움.
-      if (url.pathname === "/api/admin/delete-performance") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        try {
-          const code = url.searchParams.get("code");
-          const addedAt = url.searchParams.get("addedAt");
-          if (!code || !addedAt) {
-            return Response.json({ ok: false, error: "code, addedAt 파라미터 둘 다 필요" }, { status: 400 });
-          }
-          const targetRes = await env.DB.prepare(
-            `SELECT code, name, added_at, horizon_min, entry_price, later_price, pnl_pct, source_board, added_state
-             FROM watchlist_performance WHERE code = ? AND added_at = ?`
-          )
-            .bind(code, addedAt)
-            .all();
-          const targets = targetRes.results || [];
-          if (!targets.length) {
-            return Response.json({ ok: true, deleted: 0, note: "해당 조건에 맞는 레코드가 없습니다. addedAt이 DB에 저장된 형식과 정확히 같아야 합니다." });
-          }
-          if (url.searchParams.get("confirm") !== "1") {
-            return Response.json({
-              ok: true, deleted: 0, wouldDelete: targets.length, targets,
-              note: "확인용 미리보기입니다. 실제로 지우려면 URL 끝에 &confirm=1 을 붙이세요.",
-            });
-          }
-          const del = await env.DB.prepare(
-            `DELETE FROM watchlist_performance WHERE code = ? AND added_at = ?`
-          )
-            .bind(code, addedAt)
-            .run();
-          await logSystemEvent(env, "perf_record_deleted", `${code} ${addedAt} 성과레코드 ${targets.length}건 수동삭제`);
-          return Response.json({ ok: true, deleted: del.meta?.changes ?? targets.length, targets });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/admin/backtest-history") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        try {
-          const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10) || 14, 60);
-          const res = await env.DB.prepare(
-            `SELECT date, result_json FROM signal_backtest_history ORDER BY date DESC LIMIT ?`
-          )
-            .bind(days)
-            .all();
-          return Response.json({
-            ok: true,
-            days: res.results.map((r) => ({ date: r.date, ...JSON.parse(r.result_json) })),
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/admin/backtest-signals") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        // computeRecommendations가 쓰는 신호들(가속중/매수전환/체결강도개선/매수잔량급증/눌림목/거래량급증/당일신고가)
-        // 각각이 "신호가 있었던 시점 다음 틱에 실제로 더 올랐는지"를 실측. 지금 가중치는 전부 직관으로 붙인 거라
-        // 이 결과를 보고 효과 없는 건 빼고, 효과 큰 건 가중치를 올리는 식으로 재조정해야 함.
-        try {
-          const tickLimit = Math.min(parseInt(url.searchParams.get("ticks") || "300", 10) || 300, 1000);
-          const result = await computeSignalBacktest(env, tickLimit);
-          if (!result.ok) return Response.json(result);
-          return Response.json({
-            ...result,
-            interpretation:
-              "edgeVsBaseline이 뚜렷한 양수면 그 신호가 실제로 다음 틱 상승폭을 키우는 효과가 있다는 뜻(가중치 유지/상향 근거). " +
-              "0에 가깝거나 음수면 그 신호는 추천점수에서 가중치를 낮추거나 빼는 걸 검토. " +
-              "sampleSize가 너무 작으면(대략 30 미만) 우연일 수 있으니 ticks 파라미터를 늘려서 다시 확인.",
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/admin/backtest-momentum") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        // "직전 틱 대비 상승 중인 종목이 그 다음 틱에도 계속 오르는가?" 검증
-        // (momentumScore/risingTop5가 근거로 쓰는 가정 자체가 맞는지 실제 데이터로 확인)
-        try {
-          const tickLimit = Math.min(parseInt(url.searchParams.get("ticks") || "300", 10) || 300, 1000);
-          const timesRes = await env.DB.prepare(
-            `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
-          )
-            .bind(tickLimit)
-            .all();
-          const times = timesRes.results.map((r) => r.captured_at).reverse(); // 과거 -> 최신
-          if (times.length < 3) {
-            return Response.json({ ok: false, error: "분석할 틱이 부족합니다 (최소 3틱 필요)" });
-          }
-
-          const rowsRes = await env.DB.prepare(
-            `SELECT code, change_rate, captured_at FROM snapshots WHERE captured_at >= ? AND captured_at <= ?`
-          )
-            .bind(times[0], times[times.length - 1])
-            .all();
-
-          // code별로 시간순 change_rate 배열 구성
-          const byCode = new Map();
-          for (const r of rowsRes.results) {
-            if (!byCode.has(r.code)) byCode.set(r.code, new Map());
-            byCode.get(r.code).set(r.captured_at, r.change_rate);
-          }
-
-          let posCount = 0, posForwardSum = 0;
-          let negCount = 0, negForwardSum = 0;
-          for (const rateByTime of byCode.values()) {
-            for (let i = 1; i < times.length - 1; i++) {
-              const prev = rateByTime.get(times[i - 1]);
-              const cur = rateByTime.get(times[i]);
-              const next = rateByTime.get(times[i + 1]);
-              if (prev === undefined || cur === undefined || next === undefined) continue; // 그 구간에 리스트 밖이었던 종목
-              const momentumDelta = cur - prev; // 지금 이 틱까지의 momentum
-              const forwardDelta = next - cur; // 그 다음 틱에서 실제로 어떻게 됐는지
-              if (momentumDelta > 0) {
-                posCount++;
-                posForwardSum += forwardDelta;
-              } else if (momentumDelta < 0) {
-                negCount++;
-                negForwardSum += forwardDelta;
-              }
-            }
-          }
-
-          return Response.json({
-            ok: true,
-            ticksAnalyzed: times.length,
-            momentumPositive: {
-              sampleSize: posCount,
-              avgForwardDeltaPct: posCount ? +(posForwardSum / posCount).toFixed(4) : null,
-            },
-            momentumNegative: {
-              sampleSize: negCount,
-              avgForwardDeltaPct: negCount ? +(negForwardSum / negCount).toFixed(4) : null,
-            },
-            interpretation:
-              "momentumPositive.avgForwardDeltaPct가 momentumNegative보다 뚜렷하게 크면(양수 우세) " +
-              "momentumScore/risingTop5 가정(상승 중이면 계속 상승)이 어느 정도 근거 있는 것. " +
-              "차이가 거의 없거나 반대면 가중치 재검토 필요.",
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/realtime-condition") {
-        // relay가 조건검색 웹소켓으로 실시간 감시 중인 결과를 그대로 반환.
-        // 2분 cron 폴링과 달리, 조건에 편입되는 순간 즉시 목록에 나타남.
-        try {
-          const res = await kiwoomRelayFetch(env, "/realtime/condition", { method: "GET" });
-          const data = await res.json();
-          return Response.json({
-            ok: true,
-            wsConnected: data.wsConnected,
-            seq: data.seq,
-            name: data.name,
-            codes: data.codes || [],
-            count: data.count || 0,
-            lastEventAt: data.lastEventAt,
-            history: data.history || [],
-            events: data.events || [],
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // SSE 실시간 스트리밍 - relay가 웹소켓으로 값을 받는 즉시(최대 200ms 지연) push하는 걸
-      // 그대로 브라우저까지 릴레이함. 기존 2초 폴링(/api/realtime-all)을 대체하는 진짜 실시간 경로.
-      // Worker는 relay 응답 스트림을 그대로 전달만 하므로 CPU 소모 거의 없음(네트워크 대기는 CPU시간에
-      // 안 잡힘) - Free 플랜에서도 무리 없음.
-      // SSE 연결은 목록이 고정되므로, 구독 목록만 별도로 갱신하는 경량 라우트 (5초마다 클라이언트가 호출).
-      // subscribe 결과 자체를 기다리지 않고 바로 응답 - 이 라우트는 순수히 목록 갱신 트리거용.
-      if (url.pathname === "/api/realtime-resubscribe") {
-        try {
-          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-          const codes = wlRes.results.map((r) => r.code);
-          const listParam = url.searchParams.get("list") || "";
-          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
-          kiwoomRelayFetch(env, "/realtime/subscribe", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ codes, listCodes }),
-          }).catch(() => {});
-          return Response.json({ ok: true });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/realtime-stream") {
-        if (!env.RELAY_URL || !env.RELAY_SECRET) {
-          return Response.json({ ok: false, error: "RELAY_URL / RELAY_SECRET 시크릿 미설정" }, { status: 500 });
-        }
-        try {
-          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-          const codes = wlRes.results.map((r) => r.code);
-          const listParam = url.searchParams.get("list") || "";
-          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
-          kiwoomRelayFetch(env, "/realtime/subscribe", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ codes, listCodes }),
-          }).catch(() => {});
-
-          const relayRes = await fetch(`${env.RELAY_URL}/realtime/stream`, {
-            headers: { "X-Relay-Secret": env.RELAY_SECRET },
-          });
-          if (!relayRes.ok || !relayRes.body) {
-            return Response.json({ ok: false, error: "relay 스트림 연결 실패" }, { status: 502 });
-          }
-          return new Response(relayRes.body, {
+          const res = await fetch(prod.affiliateUrl, {
+            method: "GET",
+            redirect: "follow",
             headers: {
-              "content-type": "text/event-stream",
-              "cache-control": "no-cache",
-              "connection": "keep-alive",
-            },
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+              "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, deflate, br",
+              "Sec-Fetch-Dest": "document",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "none",
+              "Sec-Fetch-User": "?1",
+              "Upgrade-Insecure-Requests": "1",
+              "Referer": "https://www.coupang.com/"
+            }
           });
+          statusCode = res.status;
         } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+          statusCode = 0; // 네트워크 오류도 이상 신호로 취급
         }
-      }
-
-      if (url.pathname === "/api/global-index") {
-        // 해외지수 전용 - /api/realtime-all과 달리 relay subscribe를 건드리지 않음(빈 list로
-        // 이 API를 불러도 화면 리스트 실시간 구독이 끊기지 않게 하기 위한 분리).
-        // 국내지수는 SSE 스트림엔 안 실려오므로(relay가 체결값만 보냄), 여기서 D1 폴백값을
-        // 같이 실어보내 SSE 전용 사용자도 지수바를 볼 수 있게 함.
-        const globalIndices = await fetchGlobalIndices(env).catch(() => ({ ok: false }));
-        let krIndex = null;
-        try {
-          const lastRow = await env.DB.prepare(
-            `SELECT * FROM kr_index_last_cache ORDER BY captured_at DESC LIMIT 1`
-          ).first();
-          if (lastRow) {
-            krIndex = {
-              kospi: { price: lastRow.kospi_price, rate: lastRow.kospi_rate },
-              kosdaq: { price: lastRow.kosdaq_price, rate: lastRow.kosdaq_rate },
-              stale: true,
-            };
-          }
-        } catch (e) { /* 테이블 없으면 그냥 null */ }
-        return Response.json({ ...globalIndices, krIndex });
-      }
-
-      if (url.pathname === "/api/realtime-all") {
-        // 관심종목시세 + 리스트시세 + 지수 + 실시간포착을 한 번에 반환.
-        // 전부 relay 메모리에서 읽는 거라 나눌 이유가 없어서 통합 - 클라이언트 폴링이 3개 API -> 1개로 줄어듦.
-        try {
-          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-          const codes = wlRes.results.map((r) => r.code);
-          const listParam = url.searchParams.get("list") || "";
-          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
-
-          // 2초마다 반복되는 메인 폴링 경로라 여기 지연이 체감에 가장 큰 영향을 줌.
-          // subscribe 결과는 안 쓰므로 기다리지 않고 던지기만 함 -> relay 왕복 1회로 단축.
-          kiwoomRelayFetch(env, "/realtime/subscribe", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ codes, listCodes }),
-          }).catch(() => {});
-
-          const res = await kiwoomRelayFetch(env, "/realtime/all", { method: "GET" });
-          const data = await res.json();
-          const globalIndices = await fetchGlobalIndices(env).catch(() => ({ ok: false }));
-
-          // 지수는 relay 웹소켓이 살아있을 때만 값이 옴 - 장마감/휴장 등으로 못 받으면
-          // D1에 저장해둔 마지막 값으로 폴백함(화면에서 지수바 자체가 계속 숨겨지는 것 방지).
-          let dbDebug = null;
+        checked++;
+        if (statusCode >= 400 || statusCode === 0) {
           try {
             await env.DB.prepare(
-              `CREATE TABLE IF NOT EXISTS kr_index_last_cache (
-                captured_at TEXT PRIMARY KEY,
-                kospi_price REAL, kospi_rate REAL, kosdaq_price REAL, kosdaq_rate REAL
-              )`
-            ).run();
-          } catch (e) {
-            dbDebug = "CREATE 실패: " + (e.message || e);
-          }
-          if (!dbDebug) {
-            try {
-              const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM kr_index_last_cache`).first();
-              if (countRow && countRow.c === 0) {
-                await env.DB.prepare(
-                  `INSERT INTO kr_index_last_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
-                )
-                  .bind("2026-08-07T06:30:00.000Z", 6258.77, -0.60, 798.81, -0.36)
-                  .run();
-                dbDebug = "시드 삽입함(count=0이었음)";
-              } else {
-                dbDebug = "count=" + (countRow ? countRow.c : "null응답");
-              }
-            } catch (e) {
-              dbDebug = "COUNT/INSERT 실패: " + (e.message || e);
-            }
-          }
-          let indexOut = data.index || { kospi: null, kosdaq: null };
-          if (indexOut.kospi && indexOut.kosdaq) {
-            ctx.waitUntil(
-              env.DB.prepare(
-                `INSERT INTO kr_index_last_cache (captured_at, kospi_price, kospi_rate, kosdaq_price, kosdaq_rate) VALUES (?, ?, ?, ?, ?)`
-              )
-                .bind(new Date().toISOString(), indexOut.kospi.price, indexOut.kospi.rate, indexOut.kosdaq.price, indexOut.kosdaq.rate)
-                .run()
-                .then(() =>
-                  // 새 값이 성공적으로 들어간 뒤에만 6시간 넘은 옛 행 정리 - 이러면 정리 직후에도
-                  // 항상 최소 1개(방금 넣은 값)는 남아있어서 폴백이 끊기는 일이 없음.
-                  env.DB.prepare(`DELETE FROM kr_index_last_cache WHERE captured_at < ?`)
-                    .bind(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString())
-                    .run()
-                )
-                .catch(() => {})
-            );
-          } else {
-            const lastRow = await env.DB.prepare(
-              `SELECT * FROM kr_index_last_cache ORDER BY captured_at DESC LIMIT 1`
-            )
-              .first()
-              .catch(() => null);
-            if (lastRow) {
-              indexOut = {
-                kospi: { price: lastRow.kospi_price, rate: lastRow.kospi_rate },
-                kosdaq: { price: lastRow.kosdaq_price, rate: lastRow.kosdaq_rate },
-                stale: true,
-              };
-            }
-          }
-
-          // 관심종목만 30초 촘촘 기록 (응답을 막지 않도록 기다리지 않고 백그라운드로 실행)
-          if (codes.length && data.stocks) {
-            ctx.waitUntil(maybeWriteFineWatchlistSnapshot(env, codes, data.stocks));
-          }
-
-          return Response.json({
-            ok: true,
-            wsConnected: data.wsConnected,
-            wsLoggedIn: data.wsLoggedIn,
-            index: indexOut,
-            globalIndex: globalIndices,
-            dbDebug,
-            stocks: data.stocks || {},
-            condition: data.condition || { seq: null, name: null, codes: [], count: 0, history: [] },
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/realtime-watchlist") {
-        // 관심종목 + 화면 리스트 종목을 relay 웹소켓으로 구독시키고, 실시간 체결값을 반환.
-        // 키움 TR 호출 0건. 리스트 종목은 클라이언트가 지금 보고 있는 종목만 보내줌(그룹당 200 제한).
-        try {
-          const wlRes = await env.DB.prepare(`SELECT code FROM watchlist`).all();
-          const codes = wlRes.results.map((r) => r.code);
-
-          // 클라이언트가 ?list=코드,코드,... 로 화면에 뜬 종목을 알려줌
-          const listParam = url.searchParams.get("list") || "";
-          const listCodes = listParam.split(",").filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, 180);
-
-          // subscribe는 결과를 안 쓰므로 기다리지 않고 던지기만 함(fire-and-forget) - 이전엔 매번
-          // 두 번의 relay 왕복(subscribe 완료 대기 + stocks 조회)이라 응답이 느렸는데, stocks 조회
-          // 하나만 기다리면 지연이 절반으로 줄어듦. 최초 로드 시 체감속도 개선의 핵심.
-          kiwoomRelayFetch(env, "/realtime/subscribe", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ codes, listCodes }),
-          }).catch(() => {});
-
-          const res = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
-          const data = await res.json();
-          return Response.json({
-            ok: true,
-            wsConnected: data.wsConnected,
-            wsLoggedIn: data.wsLoggedIn,
-            stocks: data.stocks || {},
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/system-status-summary") {
-        // 화면 상단 배너용 - 세부 메시지는 안 주고 "확인할 게 있는지"만 알려줌 (관리자키 불필요, 안전)
-        try {
-          const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-          const res = await env.DB.prepare(
-            `SELECT kind, COUNT(*) as cnt, MAX(created_at) as latest FROM system_events
-             WHERE created_at >= ? AND kind IN
-               ('relay_unhealthy', 'cron_failure', 'final_quote_partial_failure', 'relay_memory_high')
-             GROUP BY kind`
-          )
-            .bind(cutoff)
-            .all()
-            .catch(() => ({ results: [] }));
-          const issues = res.results || [];
-          const totalCount = issues.reduce((s, r) => s + r.cnt, 0);
-          return Response.json({
-            ok: true,
-            hasIssues: totalCount > 0,
-            totalCount,
-            kinds: issues.map((r) => ({ kind: r.kind, count: r.cnt, latest: r.latest })),
-          });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // 오늘 관심종목 추가/자동삭제 건수 - 관심종목 패널 헤더에 표시용
-      // 오늘(또는 지정 날짜) 익절/손절된 종목 상세 목록 - 화면 상단 "익절 X / 손절 Y" 버튼을
-      // 눌렀을 때 뜨는 팝업용. daily-stats의 요약 숫자와 같은 데이터 소스(watchlist_performance)를
-      // 쓰고, 실제 손익 부호로 기록된 라벨(익절삭제/손절삭제 - 예전 라벨링 버그 수정본)로 구분함.
-      if (url.pathname === "/api/watchlist-exit-list") {
-        try {
-          const dateParam = url.searchParams.get("date"); // YYYY-MM-DD(KST 기준), 없으면 오늘
-          let startKst;
-          if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
-            const [y, m, d] = dateParam.split("-").map(Number);
-            startKst = new Date(Date.UTC(y, m - 1, d));
-          } else {
-            const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
-            startKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
-          }
-          const dateKey = startKst.toISOString().slice(0, 10);
-
-          // 짧은 캐시(20초) - 팝업을 여러 번 열어도 그 사이엔 D1을 다시 안 탐. 오늘 날짜는 계속
-          // 갱신되니 짧게, 지난 날짜는 어차피 안 바뀌니 길게 캐싱함.
-          const isToday = dateKey === new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
-          const CACHE_KEY = "exit-list-v1-" + dateKey;
-          if (env.CACHE_KV) {
-            const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
-            if (cached) return Response.json(cached);
-          }
-
-          const startUtc = new Date(startKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
-          const endUtc = new Date(startKst.getTime() - 9 * 60 * 60 * 1000 + 24 * 60 * 60 * 1000).toISOString();
-
-          // recorded_at 범위조회에 쓸 인덱스 - 없으면 매번 watchlist_performance 전체를 스캔하게 돼서
-          // (예전에 snapshots 테이블에서 LIKE 프리픽스매칭 때문에 D1 read가 폭증했던 것과 같은 유형의
-          // 문제) 팝업이 느려지는 주된 원인이었을 가능성이 큼. IF NOT EXISTS라 최초 1회 이후는
-          // 사실상 무비용 - 매 요청마다 실행해도 안전함.
-          await env.DB.prepare(
-            `CREATE INDEX IF NOT EXISTS idx_wp_recorded ON watchlist_performance (horizon_min, recorded_at)`
-          ).run().catch(() => {});
-
-          const res = await env.DB.prepare(
-            `SELECT code, name, entry_price, later_price, pnl_pct, added_state, source_board, recorded_at
-             FROM watchlist_performance
-             WHERE horizon_min = 30 AND recorded_at >= ? AND recorded_at < ?
-             ORDER BY recorded_at DESC`
-          )
-            .bind(startUtc, endUtc)
-            .all();
-
-          const profitList = [], lossList = [];
-          for (const r of res.results || []) {
-            if (Math.abs(r.pnl_pct) > 40) continue; // 진입가 오류 의심 이상치 제외 (다른 리포트와 동일 기준)
-            const state = r.added_state || "";
-            const item = {
-              code: r.code, name: r.name,
-              entryPrice: r.entry_price, exitPrice: r.later_price,
-              pnlPct: r.pnl_pct, sourceBoard: r.source_board, recordedAt: r.recorded_at,
-            };
-            if (state.includes("익절삭제")) profitList.push(item);
-            else if (state.includes("손절삭제")) lossList.push(item);
-            // 둘 다 아니면(자연 30분 관찰 종료 등) 팝업 목적과 무관하므로 제외
-          }
-
-          const payload = {
-            ok: true,
-            date: dateKey,
-            profitCount: profitList.length,
-            lossCount: lossList.length,
-            profitList,
-            lossList,
-          };
-          if (env.CACHE_KV) {
-            ctx.waitUntil(
-              env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: isToday ? 20 : 3600 }).catch(() => {})
-            );
-          }
-          return Response.json(payload);
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/watchlist-daily-stats") {
-        try {
-          async function computeStatsFor(startUtc, endUtc) {
-            const res = await env.DB.prepare(
-              `SELECT kind, message FROM system_events
-               WHERE kind IN ('watchlist_added', 'watchlist_auto_removed') AND created_at >= ? AND created_at < ?`
-            )
-              .bind(startUtc, endUtc)
-              .all();
-            let added = 0, removedProfit = 0, removedLoss = 0;
-            for (const r of res.results || []) {
-              if (r.kind === "watchlist_added") { added++; continue; }
-              if (r.message && r.message.includes("[익절]")) removedProfit++;
-              else removedLoss++;
-            }
-            const BUY_AMOUNT = 1000000;
-            const perfRes = await env.DB.prepare(
-              `SELECT entry_price, later_price, pnl_pct FROM watchlist_performance WHERE horizon_min = 30 AND recorded_at >= ? AND recorded_at < ?`
-            )
-              .bind(startUtc, endUtc)
-              .all();
-            let profitWon = 0, lossWon = 0, outlierCount = 0;
-            for (const r of perfRes.results || []) {
-              // 급등주 스크리너는 5~15% 밴드 종목만 담으므로 30분 손익률이 ±40%를 넘는 건 진입가 오류
-              // (조회 실패로 엉뚱한 값 저장, 액면분할 등)일 가능성이 높음. 실제로 +227% 한 건이 화면
-              // 실현손익을 -25만원에서 +225만원으로 뒤집어 보여준 사례가 있어서 집계에서 제외함.
-              if (Math.abs(r.pnl_pct) > 40) { outlierCount++; continue; }
-              // 화면(computeRealisticPnl)과 동일하게 수수료·세금 반영한 실질 손익으로 계산 -
-              // 예전엔 순수 가격변동률만 써서 실제보다 하루 수십만원씩 좋게 보이던 문제를 고침.
-              if (!r.entry_price || r.entry_price <= 0 || !r.later_price || r.later_price <= 0) continue;
-              const net = computeRealisticPnlServer(r.entry_price, r.later_price, BUY_AMOUNT);
-              if (!net) continue;
-              if (net.netPnlAmount > 0) profitWon += net.netPnlAmount;
-              else lossWon += net.netPnlAmount;
-            }
-            return {
-              added, removed: removedProfit + removedLoss, removedProfit, removedLoss,
-              profitWon: Math.round(profitWon), lossWon: Math.round(lossWon), netWon: Math.round(profitWon + lossWon),
-              outlierCount,
-            };
-          }
-
-          const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
-          const todayStartKst = new Date(Date.UTC(kstNow.getUTCFullYear(), kstNow.getUTCMonth(), kstNow.getUTCDate()));
-          const todayStartUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
-          const farFutureUtc = new Date(todayStartKst.getTime() - 9 * 60 * 60 * 1000 + 2 * 24 * 60 * 60 * 1000).toISOString();
-
-          let stats = await computeStatsFor(todayStartUtc, farFutureUtc);
-          let usedDate = "today";
-
-          // 오늘 데이터가 전부 0(주말/휴장 등으로 아직 아무 변화도 없음)이면 가장 최근에
-          // 데이터가 있었던 날을 찾아서 그 날짜 통계를 대신 보여줌 - 화면이 통째로 0으로
-          // 비어보이는 것보다 마지막 알려진 상태를 보여주는 게 사용자에게 더 유용함.
-          const allZero = stats.added === 0 && stats.removed === 0 && stats.netWon === 0;
-          if (allZero) {
-            const lastEventRes = await env.DB.prepare(
-              `SELECT created_at FROM system_events
-               WHERE kind IN ('watchlist_added', 'watchlist_auto_removed')
-               ORDER BY created_at DESC LIMIT 1`
-            ).all();
-            const lastRow = (lastEventRes.results || [])[0];
-            if (lastRow && lastRow.created_at) {
-              const lastKst = new Date(new Date(lastRow.created_at).getTime() + 9 * 60 * 60 * 1000);
-              const lastDayStartKst = new Date(Date.UTC(lastKst.getUTCFullYear(), lastKst.getUTCMonth(), lastKst.getUTCDate()));
-              const lastDayStartUtc = new Date(lastDayStartKst.getTime() - 9 * 60 * 60 * 1000).toISOString();
-              const lastDayEndUtc = new Date(lastDayStartKst.getTime() - 9 * 60 * 60 * 1000 + 24 * 60 * 60 * 1000).toISOString();
-              const fallbackStats = await computeStatsFor(lastDayStartUtc, lastDayEndUtc);
-              if (fallbackStats.added > 0 || fallbackStats.removed > 0 || fallbackStats.netWon !== 0) {
-                stats = fallbackStats;
-                usedDate = lastDayStartKst.toISOString().slice(0, 10);
-              }
-            }
-          }
-
-          return Response.json({ ok: true, ...stats, statsDate: usedDate });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      // 날짜별 실현손익 히스토리 - 당일 표시는 자정에 초기화되지만 원본 기록(watchlist_performance)은
-      // 계속 D1에 남아있으므로, 날짜별로 묶어서 과거 추이를 차트로 보여줌.
-      if (url.pathname === "/api/watchlist-pnl-history") {
-        try {
-          const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10) || 14, 90);
-          const BUY_AMOUNT = 1000000;
-          const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-          // recorded_at은 UTC 저장이므로 KST(+9h) 보정 후 날짜만 뽑아서 그룹핑.
-          // horizon_min=30만 써서 60분치와 중복집계 방지 (daily-stats와 동일 기준).
-          const res = await env.DB.prepare(
-            `SELECT DATE(datetime(recorded_at, '+9 hours')) as d, entry_price, later_price, pnl_pct
-             FROM watchlist_performance
-             WHERE horizon_min = 30 AND recorded_at >= ?
-             ORDER BY recorded_at ASC`
-          )
-            .bind(cutoff)
-            .all();
-
-          const byDate = {};
-          for (const r of res.results || []) {
-            // daily-stats와 동일 기준으로 진입가 오류 의심 건(±40% 초과) 제외 - 이런 값 하나가 들어가면
-            // 막대그래프 스케일이 통째로 망가져서 나머지 날짜가 전부 납작하게 보이는 문제도 같이 해결됨
-            if (Math.abs(r.pnl_pct) > 40) continue;
-            if (!r.entry_price || r.entry_price <= 0 || !r.later_price || r.later_price <= 0) continue;
-            // 화면과 동일하게 수수료·세금 반영한 실질 손익으로 계산
-            const net = computeRealisticPnlServer(r.entry_price, r.later_price, BUY_AMOUNT);
-            if (!net) continue;
-            if (!byDate[r.d]) byDate[r.d] = { profitWon: 0, lossWon: 0, count: 0 };
-            if (net.netPnlAmount > 0) byDate[r.d].profitWon += net.netPnlAmount;
-            else byDate[r.d].lossWon += net.netPnlAmount;
-            byDate[r.d].count += 1;
-          }
-
-          const dates = Object.keys(byDate).sort();
-          const history = dates.map((d) => ({
-            date: d,
-            profitWon: Math.round(byDate[d].profitWon),
-            lossWon: Math.round(byDate[d].lossWon),
-            netWon: Math.round(byDate[d].profitWon + byDate[d].lossWon),
-            count: byDate[d].count,
-          }));
-
-          return Response.json({ ok: true, history });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/relay-health") {
-        // relay VM이 살아있는지 + 웹소켓이 실제로 연결/로그인 상태인지 한 번에 확인
-        // (relay 프로세스는 살아있는데 웹소켓만 조용히 끊긴 경우를 잡기 위함)
-        const startedAt = Date.now();
-        try {
-          if (!env.RELAY_URL || !env.RELAY_SECRET) {
-            return Response.json({ ok: false, error: "RELAY_URL / RELAY_SECRET 시크릿 미설정" }, { status: 500 });
-          }
-          const res = await kiwoomRelayFetch(env, "/realtime/status", { method: "GET" });
-          const elapsedMs = Date.now() - startedAt;
-          let wsStatus = null;
+              "INSERT INTO broken_links (slug, product_index, product_name, url, status_code, checked_at, fail_count) VALUES (?, ?, ?, ?, ?, ?, 1) ON CONFLICT(slug, product_index) DO UPDATE SET status_code=excluded.status_code, checked_at=excluded.checked_at, fail_count = broken_links.fail_count + 1"
+            ).bind(slug, pi, prod.name || "", prod.affiliateUrl, statusCode, Date.now()).run();
+          } catch (e) {}
+        } else {
           try {
-            wsStatus = await res.json();
-          } catch (e) {
-            // 구버전 relay(웹소켓 없는 버전)면 이 엔드포인트가 없어서 JSON이 아닐 수 있음
-          }
-          return Response.json({
-            ok: true,
-            relayReachable: true,
-            httpStatus: res.status,
-            elapsedMs,
-            wsConnected: wsStatus ? wsStatus.wsConnected : null,
-            wsLoggedIn: wsStatus ? wsStatus.wsLoggedIn : null,
-            wsLastMessageAt: wsStatus ? wsStatus.lastMessageAt : null,
-          });
-        } catch (e) {
-          return Response.json(
-            { ok: true, relayReachable: false, error: String(e.message || e), elapsedMs: Date.now() - startedAt },
-            { status: 200 } // relay 다운은 이 API 자체의 실패가 아니라 정상적인 진단 결과이므로 200
-          );
+            await env.DB.prepare("DELETE FROM broken_links WHERE slug = ? AND product_index = ?").bind(slug, pi).run();
+          } catch (e) {}
         }
       }
-
-      if (url.pathname === "/api/admin/system-events") {
-        if (!checkAdminKey(request, url, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (ADMIN_KEY)" }, { status: 401 });
-        }
-        try {
-          const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
-          const res = await env.DB.prepare(
-            `SELECT kind, message, created_at FROM system_events ORDER BY created_at DESC LIMIT ?`
-          )
-            .bind(limit)
-            .all();
-          return Response.json({ ok: true, events: res.results });
-        } catch (e) {
-          return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
-        }
-      }
-
-      if (url.pathname === "/api/run-now") {
-        // 수동 테스트용 (배포 직후 cron 기다리지 않고 바로 확인) - 실제 키움 조회+D1 저장을
-        // 트리거하는 작업이라 외부에서 무단 반복 호출되지 않도록 관리자 인증 필요.
-        if (!checkAdminKeyHeaderOnly(request, env)) {
-          return Response.json({ ok: false, error: "인증 필요 (X-Admin-Key 헤더)" }, { status: 401 });
-        }
-        const result = await collectAndStore(env);
-        return Response.json(result);
-      }
-
-      return new Response(renderDashboard(), {
-        headers: { "content-type": "text/html; charset=UTF-8" },
-      });
     } catch (e) {
-      // 내부 stack/구조는 외부에 노출하지 않고 서버 로그에만 남김
-      console.error("처리 안 된 예외:", e.message || e, e.stack || "");
-      return Response.json(
-        { ok: false, error: "Internal Server Error" },
-        { status: 500 }
-      );
+      console.log(`[링크체크] "${slug}" 확인 실패: ${e.message}`);
     }
-  },
+  }
+  const nextCursor = idx.length ? (cursor + batchSize) % idx.length : 0;
+  try {
+    await env.DB.prepare(
+      "INSERT INTO meta_state (key, value) VALUES ('linkcheck-cursor', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    ).bind(String(nextCursor)).run();
+  } catch (e) {}
+  return { checked };
+}
+__name(checkBrokenLinksBatch, "checkBrokenLinksBatch");
+async function syncKvFallbackToKV(env, batchLimit = 50) {
+  // KV 한도 초과로 D1(kv_fallback)에 대신 저장됐던 항목을, KV가 정상화되면 다시 KV로 옮기고 D1에서는 삭제
+  if (!env.DB) return { migrated: 0, remaining: 0 };
+  let rows;
+  try {
+    const res = await env.DB.prepare("SELECT key, value, expires_at FROM kv_fallback ORDER BY updated_at ASC LIMIT ?").bind(batchLimit).all();
+    rows = res.results || [];
+  } catch (e) {
+    return { migrated: 0, remaining: 0 }; // 테이블이 아직 없으면(폴백 이력 없음) 조용히 종료
+  }
+  let migrated = 0;
+  for (const row of rows) {
+    if (row.expires_at && row.expires_at < Date.now()) {
+      // 이미 만료된 항목은 KV로 옮길 필요 없이 D1에서만 정리
+      try { await env.DB.prepare("DELETE FROM kv_fallback WHERE key = ?").bind(row.key).run(); } catch (e) {}
+      continue;
+    }
+    const ttlSeconds = row.expires_at ? Math.max(60, Math.ceil((row.expires_at - Date.now()) / 1000)) : undefined;
+    try {
+      await env.POSTS.put(row.key, row.value, ttlSeconds ? { expirationTtl: ttlSeconds } : undefined);
+      await env.DB.prepare("DELETE FROM kv_fallback WHERE key = ?").bind(row.key).run();
+      migrated++;
+    } catch (e) {
+      // 아직 KV 한도가 안 풀린 상태 — 더 시도해봐야 다 실패할 테니 여기서 중단
+      console.log(`[KV 폴백 동기화] "${row.key}" 아직 실패, 중단: ${e.message}`);
+      break;
+    }
+  }
+  let remaining = 0;
+  try {
+    const cnt = await env.DB.prepare("SELECT COUNT(*) as c FROM kv_fallback").first();
+    remaining = cnt?.c || 0;
+  } catch (e) {}
+  if (migrated) console.log(`[KV 폴백 동기화] ${migrated}건 KV로 복구 완료, 남은 대기 ${remaining}건`);
+  return { migrated, remaining };
+}
+__name(syncKvFallbackToKV, "syncKvFallbackToKV");
+async function handleExternalVideoPoll(request, env) {
+  // cron-job.org 외부 스케줄러용 — 5분마다 영상 작업 폴링 (구 Cloudflare Cron 대체)
+  if (!checkCronKey(request, env)) return new Response("Unauthorized", { status: 401 });
+  try {
+    await pollPendingVideoJobs(env);
+    const syncResult = await syncKvFallbackToKV(env);
+    const linkCheckResult = await checkBrokenLinksBatch(env).catch(() => ({ checked: 0 }));
+    console.log(`[외부크론] /cron/poll-video 호출됨 — 완료 (KV폴백 복구 ${syncResult.migrated}건, 대기 ${syncResult.remaining}건, 링크체크 ${linkCheckResult.checked}건)`);
+    return new Response("ok", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  } catch (e) {
+    console.log(`[외부크론] /cron/poll-video 예외: ${e.message}\n${e.stack}`);
+    return new Response("Error: " + e.message, { status: 500 });
+  }
+}
+__name(handleExternalVideoPoll, "handleExternalVideoPoll");
 
-  async scheduled(event, env, ctx) {
-    const now = new Date();
-    if (!isMarketHoursKST(now)) return;
-    // 15:36 종가 재조회(collectFinalAccurateQuotes)와 재시도틱(retryFinalQuotePending)은
-    // relay(Oracle VM)의 자체 15:36 KST 트리거 -> POST /api/ingest/final-quotes 로 완전히 이전됨.
-    // relay는 Worker 서브리퀘스트 한도가 없어 전종목을 한 번에 순차조회 가능 -> 여러 틱에 나눠
-    // 재시도할 필요 자체가 없어짐(retryFinalQuotePending 관련 로직 전부 제거).
-    ctx.waitUntil(
-      (async () => {
-        await purgeOldRows(env).catch((e) => {
-          console.error("오래된 행 정리 실패:", e.message || e);
-        });
-        await checkWatchlistRiskLevels(env).catch((e) => {
-          console.error("관심종목 리스크체크 실패:", e.message || e);
-        });
-        await enforceWatchlistCap(env).catch((e) => {
-          console.error("관심종목 상한 정리 실패:", e.message || e);
-        });
-        await trackWatchlistPerformance(env).catch((e) => {
-          console.error("관심종목 성과추적 실패:", e.message || e);
-        });
-        await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
-        // 미니차트 KV 프리웜은 제거함 - 2분마다 무조건 KV write가 발생해서(장중 하루 약 200회)
-        // Workers KV 무료 티어 쓰기 한도를 크게 잡아먹던 주된 원인이었음. 클라이언트가 실제로 페이지를
-        // 보고 있을 때만(load() 주기 15초) 호출하는 /api/mini-candles-all의 온디맨드 캐시 채움만으로도
-        // 충분해서, 아무도 안 보고 있을 때까지 미리 채워두는 낭비를 없앰.
-      })().catch((e) => {
-        console.error("scheduled 정리작업 실패:", e.message || e);
-        return logSystemEvent(env, "cron_failure", `정리작업 실패: ${e.message || e}`);
-      })
+async function getDanawaDailyProducts(env) {
+  const stored = await env.POSTS.get('danawa-daily-products');
+  if (stored) {
+    return JSON.parse(stored);
+  }
+  // 캐시가 없다고 여기서 무거운 실시간 스캔을 돌리면(타임아웃 없는 다중 요청) generate-post 크론 전체가
+  // 30초 넘게 걸려 죽을 수 있음 — 그냥 건너뛰고 다음 폴백(트렌딩/키워드풀)으로 넘어가게 함.
+  // 캐시 채우는 건 전용 크론(/cron/scan-danawa)이 하루 1번 담당.
+  console.log("다나와 일일 캐시 없음 — 실시간 스캔 생략, 다음 폴백으로 진행");
+  return [];
+}
+__name(getDanawaDailyProducts, "getDanawaDailyProducts");
+
+async function isProductUsedRecently(productName, env, days = 4) {
+  const key = `product-used:${productName}`;
+  const used = await env.POSTS.get(key);
+  return !!used;
+}
+__name(isProductUsedRecently, "isProductUsedRecently");
+
+async function markProductAsUsed(productName, env, days = 4) {
+  const key = `product-used:${productName}`;
+  await safeKVPut(env, key, Date.now().toString(), { expirationTtl: days * 24 * 60 * 60 });
+}
+__name(markProductAsUsed, "markProductAsUsed");
+function keywordCoreTokens(keyword) {
+  const raw = (keyword || "").toLowerCase().split(/[\s,/()\-]+/).filter((t) => t.length >= 2);
+  const core = raw.filter((t) => t.length >= 3);
+  return core.length ? core : raw;
+}
+__name(keywordCoreTokens, "keywordCoreTokens");
+async function isKeywordUsedRecently(keyword, env) {
+  if (await env.POSTS.get(`usedKeyword:${keyword}`)) return true;
+  // 완전히 다른 문자열이라도 핵심 토큰이 겹치면(예: "무선청소기" vs "핸디청소기"의 "청소기") 사실상 같은 상품군일 수 있으므로 최근목록과 비교
+  try {
+    const listRaw = await env.POSTS.get("recent-keywords-list");
+    if (!listRaw) return false;
+    const list = JSON.parse(listRaw);
+    const cutoff = Date.now() - KEYWORD_USED_TTL_SECONDS * 1000;
+    const candidateTokens = keywordCoreTokens(keyword);
+    for (const entry of list) {
+      if (!entry.at || entry.at < cutoff) continue;
+      if (entry.keyword === keyword) continue; // 완전동일은 위에서 이미 체크됨
+      const overlap = entry.tokens.filter((t) => candidateTokens.includes(t));
+      if (overlap.length > 0) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+__name(isKeywordUsedRecently, "isKeywordUsedRecently");
+async function markKeywordUsed(keyword, env) {
+  await safeKVPut(env, `usedKeyword:${keyword}`, "1", { expirationTtl: KEYWORD_USED_TTL_SECONDS });
+  try {
+    const listRaw = await env.POSTS.get("recent-keywords-list");
+    const list = listRaw ? JSON.parse(listRaw) : [];
+    const cutoff = Date.now() - KEYWORD_USED_TTL_SECONDS * 1000;
+    const trimmed = list.filter((e) => e.at && e.at >= cutoff).slice(0, 200);
+    trimmed.unshift({ keyword, tokens: keywordCoreTokens(keyword), at: Date.now() });
+    await safeKVPut(env, "recent-keywords-list", JSON.stringify(trimmed));
+  } catch (e) {}
+}
+__name(markKeywordUsed, "markKeywordUsed");
+var worker_default = {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const response = await handleRequest(request, env, ctx, url, path);
+    return applySecurityHeaders(response, path);
+  }
+};
+function applySecurityHeaders(response, path) {
+  // /out은 외부(쿠팡)로 리다이렉트하는 용도라 과한 CSP를 걸면 정상 동작에 지장 없지만, 일관성 위해 기본 헤더는 동일 적용
+  const headers = new Headers(response.headers);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  if (!headers.has("X-Frame-Options")) headers.set("X-Frame-Options", "SAMEORIGIN");
+  const ct = headers.get("Content-Type") || "";
+  if (ct.includes("text/html")) {
+    headers.set(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' https: data:; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' https://www.google-analytics.com https://region1.google-analytics.com https://analytics.google.com; frame-ancestors 'self'; base-uri 'self'"
     );
-  },
+  }
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+__name(applySecurityHeaders, "applySecurityHeaders");
+async function handleRequest(request, env, ctx, url, path) {
+    try {
+      if (path.startsWith("/admin")) {
+        const authFail = checkAdminPassword(request, env);
+        if (authFail) return authFail;
+      }
+      if (path === "/") return await renderHomePage(env, request);
+      if (path === "/0") return await renderStatsPage(env);
+      if (path === "/api/posts") return await handleApiMorePosts(request, env);
+      if (path === "/privacy") return renderPrivacyPage();
+      if (path === "/robots.txt") return renderRobotsTxt();
+      if (path === "/llms.txt") return await renderLlmsTxt(env);
+      if (path === "/sitemap.xml") return await renderSitemap(env);
+      if (path === "/feed.xml" || path === "/rss.xml") return await renderRssFeed(env);
+      if (path.startsWith("/category/")) return await renderCategoryPage(env, decodeURIComponent(path.slice("/category/".length)), request, ctx);
+      if (path === "/favicon.ico" || path === "/favicon.svg") {
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 26 26"><rect x="2" y="2" width="22" height="22" rx="6" fill="#3A2E2A" stroke="#FF4B3E" stroke-width="1.5"/><path d="M13 6.5V15" stroke="#FF4B3E" stroke-width="1.6" stroke-linecap="round"/><path d="M9.5 9L13 6.5L16.5 9" stroke="#FF4B3E" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="9.5" cy="17.5" r="1.6" fill="#FFC629"/><circle cx="16.5" cy="17.5" r="1.6" fill="#FFC629"/><path d="M13 15V17.5H9.5M13 17.5H16.5" stroke="#FFC629" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+        return new Response(svg, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=2592000" } });
+      }
+      if (path === "/img") return await proxyImage(url.searchParams.get("u"), { removeBg: url.searchParams.get("nobg") === "1" });
+      if (path === "/manifest.json") {
+        const manifest = {
+          name: "usb.kr - 전자기기 비교 가이드",
+          short_name: "usb.kr",
+          start_url: "/",
+          display: "standalone",
+          background_color: "#FFF9F6",
+          theme_color: "#FF4B3E",
+          icons: [{ src: "/favicon.svg", sizes: "any", type: "image/svg+xml", purpose: "any maskable" }]
+        };
+        return new Response(JSON.stringify(manifest), { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "public, max-age=86400" } });
+      }
+      if (path.startsWith("/img/")) return await proxyImage(decodeImgToken(path.slice("/img/".length)), { removeBg: url.searchParams.get("nobg") === "1" });
+      if (path.startsWith("/video/")) return await serveVideo(request, env, ctx, decodeURIComponent(path.slice("/video/".length)));
+      if (path === "/admin/generate-video" && request.method === "POST") return await handleGenerateVideo(request, env);
+      if (path.startsWith("/post/")) return await renderPostPage(env, decodeURIComponent(path.slice(6)), request, ctx);
+      if (path === "/admin") {
+        const adminRes = await renderAdminPage(env, url);
+        const newHeaders = new Headers(adminRes.headers);
+        newHeaders.append("Set-Cookie", "owner=1; Max-Age=31536000; Path=/; SameSite=Lax");
+        return new Response(adminRes.body, { status: adminRes.status, headers: newHeaders });
+      }
+      if (path === "/admin/generate" && request.method === "POST") return await handleManualGenerate(request, env);
+      if (path === "/admin/priority-keyword/add" && request.method === "POST") return await handleAddPriorityKeyword(request, env);
+      if (path === "/admin/priority-keyword/remove" && request.method === "POST") return await handleRemovePriorityKeyword(request, env);
+      if (path === "/admin/priority-keyword/promote" && request.method === "POST") return await handlePromotePriorityKeyword(request, env);
+      if (path === "/admin/priority-url/add" && request.method === "POST") return await handleAddPriorityUrl(request, env);
+      if (path === "/admin/priority-url/remove" && request.method === "POST") return await handleRemovePriorityUrl(request, env);
+      if (path === "/admin/priority-url/promote" && request.method === "POST") return await handlePromotePriorityUrl(request, env);
+      if (path === "/admin/generate-from-url" && request.method === "POST") return await handleGenerateFromUrl(request, env);
+      if (path === "/go" && request.method === "GET") return await handleCoupangSearchRedirect(request, env, ctx);
+      if (path === "/out" && request.method === "GET") return await handleOutboundClick(request, env, ctx);
+      if (path === "/admin/generate-from-extension" && request.method === "POST") return await handleGenerateFromExtension(request, env);
+      if (path === "/cron/scan-danawa") return await handleExternalDanawaScan(request, env);
+      if (path === "/cron/generate-post") return await handleExternalGeneratePost(request, env);
+      if (path === "/cron/poll-video") return await handleExternalVideoPoll(request, env);
+      if (path === "/admin/generate-trending" && request.method === "POST") return await handleTrendingGenerate(env);
+      if (path === "/admin/delete" && request.method === "POST") return await handleDelete(request, env);
+
+      const rootSlugMatch = path.match(/^\/([^\/]+)$/);
+      if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]), request, ctx);
+      if (!isLikelyBotUA(request.headers.get("User-Agent"))) ctx.waitUntil(bumpDailyCounter(env, "notfound", "paths", path));
+      return new Response(null, { status: 302, headers: { Location: "/" } });
+    } catch (e) {
+      if (!isLikelyBotUA(request.headers.get("User-Agent"))) ctx.waitUntil(bumpDailyCounter(env, "notfound", "serverErrors", path));
+      return new Response("Server error: " + e.message, { status: 500 });
+    }
+}
+__name(handleRequest, "handleRequest");
+var ALLOWED_IMAGE_HOST_SUFFIXES = [".coupangcdn.com", ".coupang.com"];
+var ALLOWED_IMAGE_HOSTS_EXACT = ["coupangcdn.com", "coupang.com"];
+var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+function isAllowedImageHost(hostname) {
+  return ALLOWED_IMAGE_HOSTS_EXACT.includes(hostname) || ALLOWED_IMAGE_HOST_SUFFIXES.some((suf) => hostname.endsWith(suf));
+}
+__name(isAllowedImageHost, "isAllowedImageHost");
+async function serveVideo(request, env, ctx, key) {
+  if (!env.VIDEOS) return new Response("Video storage not configured", { status: 500 });
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+  const object = await env.VIDEOS.get(key);
+  if (!object) return new Response("Not Found", { status: 404 });
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("Cache-Control", "public, max-age=604800");
+  const response = new Response(object.body, { headers });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+__name(serveVideo, "serveVideo");
+async function proxyImage(imageUrl, opts = {}) {
+  if (!imageUrl) return new Response("Invalid image URL", { status: 400 });
+  let parsed;
+  try {
+    parsed = new URL(imageUrl);
+  } catch (e) {
+    return new Response("Invalid image URL", { status: 400 });
+  }
+  if (parsed.protocol !== "https:" || !isAllowedImageHost(parsed.hostname)) {
+    return new Response("Invalid image URL", { status: 400 });
+  }
+  try {
+    const imageOptions = { width: 440, quality: 75, format: "webp" };
+    if (opts.removeBg) imageOptions.segment = "foreground"; // 흰 배경 등을 투명 처리(Cloudflare Images 배경제거)
+    const res = await fetch(parsed.toString(), {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; usbkrBot/1.0)" },
+      cf: {
+        cacheTtl: 604800,
+        cacheEverything: true,
+        image: imageOptions
+      }
+    });
+    if (!res.ok) return new Response("Image fetch failed", { status: 502 });
+    const contentType = res.headers.get("Content-Type") || "";
+    if (contentType && !contentType.startsWith("image/")) {
+      return new Response("Not an image", { status: 400 });
+    }
+    const contentLength = Number(res.headers.get("Content-Length") || 0);
+    if (contentLength && contentLength > MAX_IMAGE_BYTES) {
+      return new Response("Image too large", { status: 413 });
+    }
+    return new Response(res.body, {
+      headers: { "Content-Type": contentType || "image/webp", "Cache-Control": "public, max-age=604800" }
+    });
+  } catch (e) {
+    return new Response("Image proxy error: " + e.message, { status: 502 });
+  }
+}
+__name(proxyImage, "proxyImage");
+function imgProxy(u, opts = {}) {
+  const b64 = btoa(u).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const suffix = opts.removeBg ? "?nobg=1" : "";
+  return "/img/" + b64 + suffix;
+}
+__name(imgProxy, "imgProxy");
+function decodeImgToken(token) {
+  let b64 = token.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4) b64 += "=";
+  return atob(b64);
+}
+__name(decodeImgToken, "decodeImgToken");
+async function coupangSignedHeaders(method, pathWithQuery, env) {
+  const datetime = (/* @__PURE__ */ new Date()).toISOString().substr(2, 17).replace(/[-:]/g, "") + "Z";
+  const [path, query = ""] = pathWithQuery.split("?");
+  const message = datetime + method + path + query;
+  const keyData = new TextEncoder().encode(env.COUPANG_SECRET_KEY);
+  const msgData = new TextEncoder().encode(message);
+  const cryptoKey = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  const signature = [...new Uint8Array(sigBuffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return {
+    "Authorization": `CEA algorithm=HmacSHA256, access-key=${env.COUPANG_ACCESS_KEY}, signed-date=${datetime}, signature=${signature}`,
+    "Content-Type": "application/json"
+  };
+}
+__name(coupangSignedHeaders, "coupangSignedHeaders");
+var BEST_CATEGORY_IDS = [
+  { id: 1016, name: "가전디지털" },
+  // 전자기기 전반 — 가장 확실한 소스
+  { id: 1017, name: "스포츠레저" },
+  // 액션캠, 웨어러블 등 일부 테크 겹침
+  { id: 1018, name: "자동차용품" },
+  // 블랙박스, 차량용 카플레이 등
+  { id: 1020, name: "완구/취미" },
+  // 드론, RC, 3D프린터 등
+  { id: 1021, name: "문구오피스" }
+  // 프린터, 사무용 전자기기
+];
+async function coupangBestCategoryProducts(categoryId, env, limit = 20) {
+  const path = `/v2/providers/affiliate_open_api/apis/openapi/products/bestcategories/${categoryId}?limit=${limit}`;
+  const headers = await coupangSignedHeaders("GET", path, env);
+  let res;
+  const controller1 = new AbortController();
+  const timer1 = setTimeout(() => controller1.abort(), 8000);
+  try {
+    res = await fetch("https://api-gateway.coupang.com" + path, { headers, signal: controller1.signal });
+  } catch (e) {
+    return { products: [], error: "네트워크 오류: " + e.message };
+  } finally {
+    clearTimeout(timer1);
+  }
+  if (!res.ok) {
+    const bodyText = await res.text();
+    console.log("쿠팡 베스트카테고리 실패: " + res.status + " " + bodyText.slice(0, 200));
+    return { products: [], error: `HTTP ${res.status}: ${bodyText.slice(0, 200)}` };
+  }
+  const data = await res.json();
+  const productData = data?.data;
+  if (!Array.isArray(productData) || !productData.length) {
+    return {
+      products: [],
+      error: `응답은 성공(200)했지만 상품 없음 — rCode:${data?.rCode ?? "N/A"} rMessage:${data?.rMessage ?? "N/A"} raw:${JSON.stringify(data).slice(0, 300)}`
+    };
+  }
+  return { products: productData, error: null };
+}
+__name(coupangBestCategoryProducts, "coupangBestCategoryProducts");
+var VEO_MODEL = "veo-3.1-fast-generate-preview";
+var VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
+var VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1e3;
+var VIDEO_POLL_CRON = "*/5 * * * *";
+var DANAWA_SCAN_CRON = "0 5 * * *";
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 32768;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+__name(arrayBufferToBase64, "arrayBufferToBase64");
+async function startVeoOperation({ prompt, imageBase64, imageMimeType }, env) {
+  const instance = { prompt };
+  if (imageBase64) {
+    instance.image = { bytesBase64Encoded: imageBase64, mimeType: imageMimeType || "image/jpeg" };
+  }
+  let res;
+  try {
+    res = await fetch(`${VEO_BASE_URL}/models/${VEO_MODEL}:predictLongRunning`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify({ instances: [instance] })
+    });
+  } catch (e) {
+    return { ok: false, error: `Veo 시작 네트워크 오류: ${e.message}` };
+  }
+  if (!res.ok) {
+    const bodyText = await res.text();
+    return { ok: false, error: `Veo 시작 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}` };
+  }
+  const data = await res.json();
+  const operationName = data?.name;
+  if (!operationName) {
+    return { ok: false, error: `operation name 없음 — raw: ${JSON.stringify(data).slice(0, 300)}` };
+  }
+  return { ok: true, operationName };
+}
+__name(startVeoOperation, "startVeoOperation");
+async function fetchVeoVideoBytes({ videoUri, videoBase64 }, env) {
+  if (videoBase64) {
+    const binary = atob(videoBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+  const res = await fetch(videoUri, { headers: { "x-goog-api-key": env.GEMINI_API_KEY } });
+  if (!res.ok) throw new Error(`영상 다운로드 실패: HTTP ${res.status}`);
+  return await res.arrayBuffer();
+}
+__name(fetchVeoVideoBytes, "fetchVeoVideoBytes");
+function buildVideoPrompt(productName, hasImage = true) {
+  if (hasImage) {
+    return `주어진 이미지에 있는 바로 그 제품(${productName})만을 그대로 사용해서 짧은 홍보 영상을 만들어라. 매우 중요한 규칙: 1) 이미지 속 제품의 모양, 색상, 로고, 디자인, 비율을 절대 바꾸지 않는다 2) 다른 제품이나 유사 제품으로 바꾸지 않는다 3) 제품을 새로 그리거나 재해석하지 않고, 원본 이미지를 기준으로 카메라 앵글/움직임과 조명만 살짝 더한다 4) 배경은 깔끔하고 단순하게, 제품 외에 다른 물체를 추가하지 않는다 5) 텍스트나 로고를 새로 생성하지 않는다. 카메라가 제품 주위를 천천히 돌거나 살짝 클로즈업하는 정도의 절제된 움직임만 사용한다.`;
+  }
+  return `"${productName}" 제품을 소개하는 짧고 절제된 홍보 영상을 만들어라. 깔끔하고 단순한 배경, 부드러운 조명, 제품이 자연스럽게 돋보이는 카메라 워크만 사용한다. 실존하지 않는 브랜드 로고나 텍스트를 화면에 새로 만들어 넣지 않는다.`;
+}
+__name(buildVideoPrompt, "buildVideoPrompt");
+async function startVideoJob({ prompt, imageUrl, r2Key, slug, field }, env) {
+  if (!env.GEMINI_API_KEY) return { ok: false, error: "GEMINI_API_KEY 환경변수가 설정 안 됨" };
+  if (!env.VIDEOS) return { ok: false, error: "VIDEOS(R2) 바인딩이 없음" };
+  let imageBase64 = null;
+  let imageMimeType = null;
+  if (imageUrl) {
+    try {
+      const imgRes = await fetch(imageUrl, { cf: { image: { width: 720, quality: 80 } } });
+      if (imgRes.ok) {
+        imageMimeType = imgRes.headers.get("Content-Type") || "image/jpeg";
+        imageBase64 = arrayBufferToBase64(await imgRes.arrayBuffer());
+      }
+    } catch (e) {
+      console.log("영상용 이미지 준비 실패, 이미지 없이 진행: " + e.message);
+    }
+  }
+  const start = await startVeoOperation({ prompt, imageBase64, imageMimeType }, env);
+  if (!start.ok) return start;
+  const saved = await safeKVPut(env,
+    `videoJob:${slug}:${field}`,
+    JSON.stringify({ operationName: start.operationName, slug, r2Key, field, startedAt: Date.now() })
+  );
+  if (!saved) return { ok: false, reason: "영상 작업 정보 저장 실패(KV 한도 초과 가능성)" };
+  console.log(`영상 작업 등록됨: ${slug}:${field} (operation: ${start.operationName})`);
+  return { ok: true };
+}
+__name(startVideoJob, "startVideoJob");
+async function pollPendingVideoJobs(env) {
+  const list = await env.POSTS.list({ prefix: "videoJob:" });
+  if (!list.keys.length) {
+    console.log("대기 중인 영상 작업 없음.");
+    return;
+  }
+  console.log(`대기 중인 영상 작업 ${list.keys.length}건 확인 시작.`);
+  for (const keyInfo of list.keys) {
+    const raw = await env.POSTS.get(keyInfo.name);
+    if (!raw) continue;
+    const job = JSON.parse(raw);
+    let res;
+    try {
+      res = await fetch(`${VEO_BASE_URL}/${job.operationName}`, { headers: { "x-goog-api-key": env.GEMINI_API_KEY } });
+    } catch (e) {
+      console.log(`[${keyInfo.name}] 상태 조회 네트워크 오류: ${e.message}`);
+      continue;
+    }
+    if (!res.ok) {
+      const bodyText = await res.text();
+      console.log(`[${keyInfo.name}] 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
+      continue;
+    }
+    const data = await res.json();
+    if (!data.done) {
+      if (Date.now() - job.startedAt > VIDEO_JOB_TIMEOUT_MS) {
+        console.log(`[${keyInfo.name}] 타임아웃(${VIDEO_JOB_TIMEOUT_MS / 6e4}분 초과)으로 작업 포기.`);
+        await env.POSTS.delete(keyInfo.name);
+      } else {
+        console.log(`[${keyInfo.name}] 아직 진행 중.`);
+      }
+      continue;
+    }
+    if (data.error) {
+      console.log(`[${keyInfo.name}] Veo 생성 오류: ${JSON.stringify(data.error).slice(0, 300)}`);
+      await env.POSTS.delete(keyInfo.name);
+      continue;
+    }
+    const videoUri = data?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || data?.response?.generatedVideos?.[0]?.video?.uri || data?.response?.videos?.[0]?.uri || null;
+    const videoBase64 = data?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.bytesBase64Encoded || data?.response?.generatedVideos?.[0]?.video?.videoBytes || null;
+    if (!videoUri && !videoBase64) {
+      console.log(`[${keyInfo.name}] 완료됐지만 영상 위치를 못 찾음 — raw: ${JSON.stringify(data).slice(0, 400)}`);
+      await env.POSTS.delete(keyInfo.name);
+      continue;
+    }
+    let videoBuffer;
+    try {
+      videoBuffer = await fetchVeoVideoBytes({ videoUri, videoBase64 }, env);
+    } catch (e) {
+      console.log(`[${keyInfo.name}] 영상 다운로드 실패: ${e.message}`);
+      continue;
+    }
+    await env.VIDEOS.put(job.r2Key, videoBuffer, { httpMetadata: { contentType: "video/mp4" } });
+    const postRaw = await safeKVGet(env, `post:${job.slug}`);
+    if (postRaw) {
+      const post = JSON.parse(postRaw);
+      post[job.field] = job.r2Key;
+      const saved = await safeKVPut(env, `post:${job.slug}`, JSON.stringify(post));
+      if (!saved) { console.log(`[${keyInfo.name}] 영상 필드 저장 실패(KV 한도), 다음 폴링에서 재시도`); continue; }
+    }
+    await env.POSTS.delete(keyInfo.name).catch(() => {});
+    console.log(`[${keyInfo.name}] 완료 및 저장: ${job.r2Key}`);
+  }
+}
+__name(pollPendingVideoJobs, "pollPendingVideoJobs");
+async function coupangSearchProducts(keyword, env, limit = 8) {
+  const safeKeyword = (keyword || "").slice(0, 50);
+  const path = `/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword=${encodeURIComponent(safeKeyword)}&limit=${limit}`;
+  const headers = await coupangSignedHeaders("GET", path, env);
+  let res;
+  const controller2 = new AbortController();
+  const timer2 = setTimeout(() => controller2.abort(), 8000);
+  try {
+    res = await fetch("https://api-gateway.coupang.com" + path, { headers, signal: controller2.signal });
+  } catch (e) {
+    return { products: [], error: "네트워크 오류: " + e.message };
+  } finally {
+    clearTimeout(timer2);
+  }
+  if (!res.ok) {
+    const bodyText = await res.text();
+    console.log("쿠팡 검색 실패: " + res.status + " " + bodyText.slice(0, 200));
+    return { products: [], error: `HTTP ${res.status}: ${bodyText.slice(0, 200)}` };
+  }
+  const data = await res.json();
+  const productData = data?.data?.productData;
+  if (!productData || !productData.length) {
+    return {
+      products: [],
+      error: `응답은 성공(200)했지만 상품 없음 — rCode:${data?.rCode ?? "N/A"} rMessage:${data?.rMessage ?? "N/A"} raw:${JSON.stringify(data).slice(0, 300)}`
+    };
+  }
+  return { products: productData, error: null };
+}
+__name(coupangSearchProducts, "coupangSearchProducts");
+async function coupangDeeplinks(urls, env) {
+  const path = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink";
+  const headers = await coupangSignedHeaders("POST", path, env);
+  const controller3 = new AbortController();
+  const timer3 = setTimeout(() => controller3.abort(), 8000);
+  let res;
+  try {
+    res = await fetch("https://api-gateway.coupang.com" + path, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ coupangUrls: urls }),
+      signal: controller3.signal
+    });
+  } catch (e) {
+    console.log("쿠팡 딥링크 네트워크 오류: " + e.message);
+    return urls.map((u) => ({ originalUrl: u, shortenUrl: u }));
+  } finally {
+    clearTimeout(timer3);
+  }
+  if (!res.ok) {
+    console.log("쿠팡 딥링크 실패: " + res.status + " " + (await res.text()).slice(0, 200));
+    return urls.map((u) => ({ originalUrl: u, shortenUrl: u }));
+  }
+  const data = await res.json();
+  return data?.data || urls.map((u) => ({ originalUrl: u, shortenUrl: u }));
+}
+__name(coupangDeeplinks, "coupangDeeplinks");
+async function handleCoupangSearchRedirect(request, env, ctx) {
+  const url = new URL(request.url);
+  const q = (url.searchParams.get("q") || "").trim();
+  if (!q) return Response.redirect(new URL("/", url).toString(), 302);
+  if (ctx && ctx.waitUntil) {
+    ctx.waitUntil(recordSearchQuery(env, q));
+  } else {
+    recordSearchQuery(env, q).catch(() => {});
+  }
+  const targetUrl = `https://www.coupang.com/np/search?component=&q=${encodeURIComponent(q)}&channel=user`;
+  try {
+    const links = await coupangDeeplinks([targetUrl], env);
+    const affiliateUrl = links[0]?.shortenUrl || targetUrl;
+    return Response.redirect(affiliateUrl, 302);
+  } catch (e) {
+    console.log("검색 딥링크 변환 실패: " + e.message);
+    return Response.redirect(targetUrl, 302);
+  }
+}
+__name(handleCoupangSearchRedirect, "handleCoupangSearchRedirect");
+var GROQ_MODEL_CHAIN = ["llama-3.1-8b-instant", "openai/gpt-oss-120b"];
+async function callGroqChain(systemPrompt, userPrompt, env) {
+  const attemptErrors = [];
+  const tryCerebras = /* @__PURE__ */ __name(async () => {
+    if (!env.CEREBRAS_API_KEY) {
+      attemptErrors.push("[cerebras] CEREBRAS_API_KEY 미설정");
+      return null;
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      let res;
+      try {
+        res = await fetch(`https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/cerebras/v1/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.CEREBRAS_API_KEY}` },
+          body: JSON.stringify({
+            model: "gpt-oss-120b",
+            messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+            temperature: 0.6,
+            max_tokens: 4200
+          }),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.ok) {
+        const data = await res.json();
+        let raw = data?.choices?.[0]?.message?.content;
+        if (raw) {
+          raw = raw.trim().replace(/^```json\s*|\s*```$/gm, "").trim();
+          try {
+            return { article: JSON.parse(raw), error: null, modelUsed: "cerebras:gpt-oss-120b" };
+          } catch (e) {
+            console.log("Cerebras JSON 파싱 실패: " + raw.slice(0, 300));
+            attemptErrors.push(`[cerebras] JSON 파싱 실패: ${e.message}`);
+          }
+        } else {
+          attemptErrors.push("[cerebras] 응답에 content 없음");
+        }
+      } else {
+        const bodyText = await res.text();
+        console.log("Cerebras 호출 실패: " + res.status + " " + bodyText.slice(0, 200));
+        attemptErrors.push(`[cerebras] HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
+      }
+    } catch (e) {
+      attemptErrors.push(`[cerebras] 네트워크 오류: ${e.message}`);
+    }
+    return null;
+  }, "tryCerebras");
+  const tryGroq = /* @__PURE__ */ __name(async () => {
+    if (!env.GROQ_API_KEY) {
+      attemptErrors.push("[groq] GROQ_API_KEY 환경변수가 설정 안 됨");
+      return null;
+    }
+    const modelsToTry = env.GROQ_MODEL ? [env.GROQ_MODEL, ...GROQ_MODEL_CHAIN] : GROQ_MODEL_CHAIN;
+    for (const model of modelsToTry) {
+      let res;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      try {
+        res = await fetch(`https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/groq/openai/v1/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.GROQ_API_KEY}` },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+            temperature: 0.6,
+            max_tokens: 4200
+          }),
+          signal: controller.signal
+        });
+      } catch (e) {
+        attemptErrors.push(`[${model}] 네트워크 오류: ${e.message}`);
+        continue;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) {
+        const bodyText = await res.text();
+        console.log(`Groq(${model}) 호출 실패: ${res.status} ${bodyText.slice(0, 200)}`);
+        attemptErrors.push(`[${model}] HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
+        continue;
+      }
+      const data = await res.json();
+      let raw = data?.choices?.[0]?.message?.content;
+      if (!raw) {
+        attemptErrors.push(`[${model}] 응답에 content 없음`);
+        continue;
+      }
+      raw = raw.trim().replace(/^```json\s*|\s*```$/gm, "").trim();
+      try {
+        return { article: JSON.parse(raw), error: null, modelUsed: model };
+      } catch (e) {
+        console.log(`Groq(${model}) JSON 파싱 실패: ` + raw.slice(0, 300));
+        attemptErrors.push(`[${model}] JSON 파싱 실패: ${e.message}`);
+        continue;
+      }
+    }
+    return null;
+  }, "tryGroq");
+  // 특정 모델(Cerebras)만 계속 쓰지 않도록, 매 호출마다 1순위를 랜덤으로 섞는다.
+  const providers = Math.random() < 0.5 ? [tryCerebras, tryGroq] : [tryGroq, tryCerebras];
+  for (const attempt of providers) {
+    const result = await attempt();
+    if (result) return result;
+  }
+  if (env.AI) {
+    try {
+      const aiTimeout1 = new Promise((_, reject) => setTimeout(() => reject(new Error("Workers AI 타임아웃(8초)")), 8000));
+      const response = await Promise.race([
+        env.AI.run("@cf/zai-org/glm-4.7-flash", {
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+          max_tokens: 3200
+        }, { gateway: { id: CF_AI_GATEWAY } }),
+        aiTimeout1
+      ]);
+      let raw = response?.response;
+      if (raw) {
+        raw = raw.trim().replace(/^```json\s*|\s*```$/gm, "").trim();
+        try {
+          return { article: JSON.parse(raw), error: null, modelUsed: "workers-ai:@cf/zai-org/glm-4.7-flash" };
+        } catch (e) {
+          attemptErrors.push(`[workers-ai] JSON 파싱 실패: ${e.message}`);
+        }
+      } else {
+        attemptErrors.push("[workers-ai] 응답에 content 없음");
+      }
+    } catch (e) {
+      attemptErrors.push(`[workers-ai] 오류: ${e.message}`);
+    }
+  } else {
+    attemptErrors.push("[workers-ai] AI 바인딩 없음");
+  }
+  return { article: null, error: `모든 모델 시도 실패 — ${attemptErrors.join(" / ")}` };
+}
+__name(callGroqChain, "callGroqChain");
+function cleanProductQuery(productName) {
+  // 다나와 원본명은 괄호/옵션이 지저분하게 붙어있어서 검색이 잘 안 맞음 — 핵심 브랜드+모델명만 추림
+  let q = (productName || "")
+    .replace(/\([^)]*\)/g, " ")       // 괄호 안 내용(병행수입, 색상옵션 등) 제거
+    .replace(/\[[^\]]*\]/g, " ")      // 대괄호도 제거
+    .replace(/정품|국내|병행수입|리퍼|공식|무료배송|당일발송/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tokens = q.split(" ").filter(Boolean);
+  return tokens.slice(0, 6).join(" "); // 브랜드+모델 핵심 토큰 위주로 앞부분만
+}
+__name(cleanProductQuery, "cleanProductQuery");
+async function naverWebResearch(productName, env) {
+  // 무료 조사 — 이미 등록된 네이버 오픈API 키(쇼핑발굴용과 동일) 재사용, 추가 비용 없음
+  if (!env.NAVER_CLIENT_ID || !env.NAVER_CLIENT_SECRET) {
+    console.log(`[조사] "${productName}" 스킵 — NAVER_CLIENT_ID/SECRET 미등록`);
+    return { info: null, error: "NAVER_CLIENT_ID/SECRET 미등록" };
+  }
+  const query = cleanProductQuery(productName);
+  try {
+    const headers = await naverAuthHeaders(env);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let webRes, encycRes, blogRes, cafeRes;
+    try {
+      [webRes, encycRes, blogRes, cafeRes] = await Promise.all([
+        fetch(`https://openapi.naver.com/v1/search/webkr.json?query=${encodeURIComponent(query)}&display=8`, { headers, signal: controller.signal }),
+        fetch(`https://openapi.naver.com/v1/search/encyc.json?query=${encodeURIComponent(query)}&display=3`, { headers, signal: controller.signal }),
+        fetch(`https://openapi.naver.com/v1/search/blog.json?query=${encodeURIComponent(query)}&display=8&sort=sim`, { headers, signal: controller.signal }),
+        fetch(`https://openapi.naver.com/v1/search/cafearticle.json?query=${encodeURIComponent(query)}&display=6&sort=sim`, { headers, signal: controller.signal })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const snippets = [];
+    for (const [label, res] of [["웹문서", webRes], ["지식백과", encycRes], ["블로그", blogRes], ["카페글", cafeRes]]) {
+      if (!res.ok) {
+        console.log(`[조사] "${query}" ${label} 실패 — HTTP ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      for (const item of data.items || []) {
+        const text = stripNaverHtml(item.description);
+        if (text) snippets.push(text);
+      }
+    }
+    const combined = snippets.join(" / ").slice(0, 2500);
+    if (!combined) {
+      console.log(`[조사] "${query}" 검색결과 없음 (원본명: "${productName}")`);
+      return { info: null, error: "검색결과 없음" };
+    }
+    console.log(`[조사] "${query}" 성공 — 스니펫 ${snippets.length}개, ${combined.length}자`);
+    return { info: combined, error: null };
+  } catch (e) {
+    console.log(`[조사] "${query}" 예외 — ${e.message}`);
+    return { info: null, error: e.message };
+  }
+}
+__name(naverWebResearch, "naverWebResearch");
+async function researchProduct(productName, env) {
+  return await naverWebResearch(productName, env);
+}
+__name(researchProduct, "researchProduct");
+async function generateArticleWithGroq(keyword, products, env) {
+  const researchResults = await Promise.all(products.map((p) => researchProduct(p.productName, env)));
+  const productSummary = products.map((p, i) => {
+    const research = researchResults[i]?.info;
+    return `${i + 1}. ${p.productName} - ${p.productPrice}원${research ? `\n   [조사된 실제 스펙 정보]: ${research}` : ""}`;
+  }).join("\n");
+  const hasAnyResearch = researchResults.some((r) => r.info);
+  const systemPrompt = '너는 이 분야를 정말 잘 아는 전자기기 전문가인데, 어렵게 잘난 척하며 설명하지 않고 친한 친구한테 말하듯 편하고 친근하게 설명하는 필자다. 능글맞은 카피라이터처럼 영업하는 톤이 아니라, 실사용 관점에서 딱 필요한 판단을 자신 있게 짚어주면서도 부담 없이 술술 읽히게 쓴다. 주어진 실제 상품 목록을 바탕으로 밋밋한 스펙 나열이 아니라 술술 읽히는 비교/추천 글을 쓴다. 분량 규칙(중요): 이 블로그는 짧은 요약글이 아니라 읽는 재미가 있는 장문 콘텐츠가 강점이다. sections는 최소 5개 이상 만들고, 각 section의 body_html은 <p> 태그 2~4개로 구성해 충분히 깊이 있게 써라(한 줄짜리 밋밋한 문단 금지). 상품마다 최소 1개 섹션 이상 할애해서 구체적으로 다뤄라. 짧고 리듬감 있는 문장, 전문가다운 확신 있는 판단과 실용적인 팁을 적극 활용해라(예: "이 가격대에서 이 스펙이면 꽤 잘 뽑힌 편이에요", "실사용 기준으로 보면 이 부분이 은근 중요해요"). 독자가 일상에서 겪을 법한 구체적 상황(출퇴근길, 자취방, 야근 등)을 곁들여 몰입감 있게 써라. 각 상품을 최소 1번씩 본문에서 자연스럽게 언급해야 한다. 소제목도 "특징"/"장단점" 같은 딱딱한 말 대신 핵심을 짚어주는 실용적인 카피로 뽑아라(예: "이런 분들에게 딱 맞아요", "가성비로 보면 여기가 포인트", "솔직히 아쉬운 점"). 이모지는 넣어도 소제목/포인트당 1개 이내로 절제한다. 사람이 쓴 글처럼 느껴지게 하는 규칙(매우 중요): 1) 문장 길이를 일부러 들쭉날쭉하게 써라 — 짧은 단문과 긴 만연체를 섞어 쓰고, 매 문단을 비슷한 길이로 맞추지 마라 2) AI가 남발하는 상투어를 절대 쓰지 마라: "다양한", "완벽한 선택", "매력적인", "궁극적으로", "결론적으로", "요약하자면", "이는 ~때문입니다", "~라고 할 수 있습니다", "필수적인", "다시 말해", "무엇보다도" — 이런 표현 대신 훨씬 구체적이고 캐주얼한 한국어 화법을 써라 3) 모든 섹션마다 기계적으로 균형(장점 하나·단점 하나)을 맞추지 마라 4) 가끔 독자에게 직접 말 거는 문장이나 반문을 섞어라(순수하게 궁금해하는 톤으로, 예: "이거 어떨 것 같아요?") 5) 대시(—)나 콜론(:)을 남발하지 말고, 자연스러운 한국어 종결어미(다/네요/죠/거든요/더라고요 등)를 다양하게 섞어 써라 6) 매 섹션을 동일한 문형으로 시작하지 말고 도입 방식을 섹션마다 다르게 하라. 단, 다음 규칙은 톤이 발랄하고 분량이 길어도 반드시 지킨다: 1) 상품 목록에 "[조사된 실제 스펙 정보]"가 붙어있으면 그건 실제로 조사된 사실이니 적극 활용해서 구체적으로 써도 된다. 그게 없는 상품은 상품명/가격에 없는 스펙이나 성능 수치를 절대 지어내지 않는다 — 과장된 표현은 되지만 없는 사실을 만들어내면 안 된다. 분량을 채우려고 없는 스펙을 지어내는 것도 금지, 대신 비유·상황묘사·감상으로 분량을 채워라 2) 연도 규칙: "2024년", "2025년" 같은 특정 과거 연도를 단정적으로 언급하지 않는다. 확인 안 된 출시연도나 트렌드 시기를 지어내지 말고, 필요하면 "최근", "요즘" 같은 표현을 쓴다 3) 어투 규칙(매우 중요): 너는 이 상품을 직접 사거나 써본 적이 없다. "사봤는데", "써보니", "직접 사용해보니", "구매해서 써본 결과" 같은 1인칭 실사용 체험담 어투를 절대 쓰지 않는다. 대신 전문가답게 확신 있는 제3자 관점의 어투를 쓴다 4) 본문 문장은 반드시 순수 한글로만 작성한다 — 한자, 영어 단어(브랜드/제품 고유명사 제외), 일본어 등 외국어 표기를 절대 섞지 말고, 외래어도 가능하면 이미 널리 쓰이는 한글 표기로 자연스럽게 풀어 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력 (다른 텍스트 절대 포함 금지):\n{"title": "블로그 제목(한국어, 후킹력 있게)", "tldr": "이 글의 핵심 결론을 1~2문장으로, 검색결과나 AI 답변에 그대로 인용될 수 있게 명확하고 단정적인 요약 문장으로 작성(과장 없이 사실 기반)", "intro_html": "<p>도입부 2~3문단, 상황묘사로 몰입감 있게</p>", "sections": [{"heading":"소제목","body_html":"<p>본문 문단1</p><p>본문 문단2</p>"}], "outro_html":"<p>마무리 2~3문단, 구매 시 체크포인트</p>", "faq": [{"q":"이 상품들과 관련해 독자가 실제로 검색할 법한 질문(한국어)","a":"1~2문장의 명확한 답변"}, {"q":"질문2","a":"답변2"}]}';
+  const userPrompt = `주제 키워드: ${keyword}
+
+실제 상품 목록:
+${productSummary}${hasAnyResearch ? "" : "\n\n(주의: 조사된 스펙 정보가 없는 상품은 상품명/가격 외 정보를 알 수 없으니 추정 톤을 유지해라.)"}`;
+  return callGroqChain(systemPrompt, userPrompt, env);
+}
+__name(generateArticleWithGroq, "generateArticleWithGroq");
+async function generateProductReviewArticle(product, env) {
+  const research = await researchProduct(product.productName, env);
+  const systemPrompt = '너는 이 분야를 정말 잘 아는 전자기기 전문가인데, 어렵게 잘난 척하며 설명하지 않고 친한 친구한테 말하듯 편하고 친근하게 설명하는 필자다. 주어진 실제 상품 하나에 대해 밋밋한 스펙 나열이 아니라 술술 읽히는 단일 상품 리뷰를 쓴다. 분량 규칙(중요): 이 블로그는 짧은 요약글이 아니라 읽는 재미가 있는 장문 콘텐츠가 강점이다. sections는 최소 4개 이상 만들고, 각 section의 body_html은 <p> 태그 2~4개로 구성해 충분히 깊이 있게 써라(한 줄짜리 밋밋한 문단 금지). 독자가 일상에서 겪을 법한 구체적 상황(출퇴근길, 자취방, 야근 등)을 곁들여 몰입감 있게 써라. 분량을 채우려고 없는 스펙을 지어내는 건 절대 금지, 대신 비유·상황묘사·구매 고민 포인트로 자연스럽게 채워라. 아주 중요한 규칙: "[조사된 실제 스펙 정보]"가 제공되면 그건 실제로 조사된 사실이니 적극 활용해서 구체적으로 써도 된다. 그게 없으면 너에게 주어지는 정보는 상품명과 가격뿐이다. 그 경우: 1) 상품명에 명시적으로 적힌 정보(용량, 색상, 브랜드, 모델명 등)만 사실로 다룬다 2) 상품명에 없는 구체적인 스펙(배터리 시간, 방수등급, 성능 수치, 소재 등)을 절대 단정적으로 지어내지 않는다 3) 확인되지 않은 내용을 언급할 때 "일반적으로", "이 가격대에서는 보통", "제품명 기준으로 추정하면" 같은 헤지 표현을 반드시 쓰되, 밋밋하지 않게 위트있게 풀어써라(헤지 표현이라고 재미없을 필요는 없다) 4) 실사용 후기처럼 들리는 단정적 표현("배터리가 오래 간다", "소음이 적다" 등 실측 없이는 알 수 없는 주장)은 조사된 정보에 명시된 게 아니면 금지한다 5) "장점"/"단점" 섹션도 조사된 정보가 있으면 그 기반으로, 없으면 상품명·가격대에서 합리적으로 유추 가능한 특징 위주로 추정 톤을 유지하되 표현은 발랄하게. 연도 규칙(중요): "2024년", "2025년" 같은 특정 과거 연도를 단정적으로 언급하지 않는다. 확인 안 된 출시연도나 트렌드 시기를 지어내지 말고, 필요하면 "최근", "요즘" 같은 표현을 쓴다. 어투 규칙(매우 중요): 너는 이 상품을 직접 사거나 써본 적이 없다. "사봤는데", "써보니", "직접 사용해보니", "구매해서 써본 결과", "몇 주 써본 소감" 같은 1인칭 실사용 체험담 어투를 절대 쓰지 않는다. 대신 전문가답게 확신 있는 제3자 관점의 어투를 쓴다(예: "~로 되어있습니다", "~하는 분들에게 딱입니다", "~라는 점이 눈에 띕니다"). 짧고 리듬감 있는 문장과 전문가다운 확신 있는 판단을 적극 활용하되, 없는 사실을 지어내진 않는다. 상품명을 본문에서 자연스럽게 여러 번 언급한다. 소제목은 "주요 특징", "이런 분께 어울림", "구매 전 확인할 점" 같은 딱딱한 형식 대신 톡톡 튀는 카피로 뽑아도 된다. 이모지는 넣어도 소제목/포인트당 1개 이내로 절제한다. 사람이 쓴 글처럼 느껴지게 하는 규칙(매우 중요): 1) 문장 길이를 일부러 들쭉날쭉하게 써라 — 짧은 단문과 긴 만연체를 섞어 쓰고, 매 문단을 비슷한 길이로 맞추지 마라 2) AI가 남발하는 상투어를 절대 쓰지 마라: "다양한", "완벽한 선택", "매력적인", "궁극적으로", "결론적으로", "요약하자면", "이는 ~때문입니다", "~라고 할 수 있습니다", "필수적인", "다시 말해", "무엇보다도" — 이런 표현 대신 훨씬 구체적이고 캐주얼한 한국어 화법을 써라 3) 모든 섹션마다 기계적으로 균형을 맞추지 마라 4) 가끔 독자에게 직접 말 거는 문장이나 반문을 섞어라 5) 대시(—)나 콜론(:)을 남발하지 말고, 자연스러운 한국어 종결어미(다/네요/죠/거든요/더라고요 등)를 다양하게 섞어 써라 6) 매 섹션을 동일한 문형으로 시작하지 말고 도입 방식을 섹션마다 다르게 하라. 본문 문장은 반드시 순수 한글로만 작성한다 — 한자, 영어 단어(브랜드/제품 고유명사 제외), 일본어 등 외국어 표기를 절대 섞지 말고, 외래어도 가능하면 이미 널리 쓰이는 한글 표기로 자연스럽게 풀어 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력 (다른 텍스트 절대 포함 금지):\n{"title": "블로그 제목(한국어, 후킹력 있게)", "tldr": "이 글의 핵심 결론을 1~2문장으로, 검색결과나 AI 답변에 그대로 인용될 수 있게 명확한 요약 문장으로(단, 확인 안 된 스펙은 단정하지 말고 추정 톤 유지)", "intro_html": "<p>도입부 2~3문단, 상황묘사로 몰입감 있게</p>", "sections": [{"heading":"소제목","body_html":"<p>본문 문단1</p><p>본문 문단2</p>"}], "outro_html":"<p>마무리 2~3문단, 구매 시 체크포인트(가급적 판매 페이지에서 실제 스펙을 직접 확인하라는 안내 포함)</p>", "faq": [{"q":"이 상품과 관련해 독자가 실제로 검색할 법한 질문(한국어)","a":"1~2문장의 명확한 답변(추정 톤 유지)"}, {"q":"질문2","a":"답변2"}]}';
+  const userPrompt = `리뷰할 상품: ${product.productName}
+가격: ${product.productPrice}원
+${research.info ? `\n[조사된 실제 스펙 정보]: ${research.info}\n` : "\n(주의: 위 두 정보 외의 스펙/성능은 네가 알 수 없다. 상품명에 없는 사실은 지어내지 말고 추정 톤으로만 써라.)"}`;
+  return callGroqChain(systemPrompt, userPrompt, env);
+}
+__name(generateProductReviewArticle, "generateProductReviewArticle");
+var USED_PRODUCT_TTL_SECONDS = 5 * 24 * 60 * 60;
+function normalizeProductName(name) {
+  let s = (name || "").toLowerCase();
+  s = s.replace(/[\[\(（【][^\]\)）】]*[\]\)）】]/g, " ");
+  const colors = ["블랙", "화이트", "그레이", "실버", "골드", "레드", "블루", "핑크", "그린", "네이비", "베이지", "퍼플", "옐로우", "브라운", "민트", "로즈골드", "스페이스그레이", "아이보리", "그래파이트"];
+  colors.forEach((c) => {
+    s = s.split(c).join(" ");
+  });
+  s = s.replace(/\d+(\.\d+)?\s?(gb|tb|mah|w|kg|g|ml|l|인치|cm|mm|리터|개입|개)/gi, " ");
+  s = s.replace(/\d+/g, " ");
+  s = s.replace(/[^\p{L}\s]/gu, " ");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+__name(normalizeProductName, "normalizeProductName");
+function filterRelevantProductsByTokens(keyword, products) {
+  const rawTokens = keyword.toLowerCase().split(/[\s,/()\-]+/).filter((t) => t.length >= 2);
+  const normalizedKeyword = keyword.toLowerCase().replace(/\s+/g, "");
+  if (!rawTokens.length && !normalizedKeyword) return products;
+  // 2글자짜리 짧은 토큰(브랜드 이니셜/조사 등)은 신뢰도가 낮으므로, 3글자 이상 핵심 토큰이 있으면 그것만 사용
+  const coreTokens = rawTokens.filter((t) => t.length >= 3);
+  const meaningfulTokens = coreTokens.length ? coreTokens : rawTokens;
+  const matchCountOf = (p) => {
+    const name = (p.productName || "").toLowerCase();
+    const normalizedName = name.replace(/\s+/g, "");
+    if (normalizedKeyword && normalizedName.includes(normalizedKeyword)) return meaningfulTokens.length || 1;
+    return meaningfulTokens.filter((t) => name.includes(t) || normalizedName.includes(t.replace(/\s+/g, ""))).length;
+  };
+  // 1차: 토큰이 2개 이상이면 과반(60%) 이상 일치를 요구하는 엄격 기준
+  const strictRequired = meaningfulTokens.length >= 2 ? Math.max(2, Math.ceil(meaningfulTokens.length * 0.6)) : 1;
+  const strict = products.filter((p) => matchCountOf(p) >= strictRequired);
+  if (strict.length) return strict;
+  // 2차(완화): 이미 쿠팡 자체 검색엔진이 이 키워드로 찾아온 결과이므로, 토큰 1개만 겹쳐도 완전 무관하진 않음.
+  // 밤 시간대 등 검색결과 품질이 애매할 때 엄격 기준 때문에 전멸하는 걸 막기 위한 안전망.
+  const relaxed = products.filter((p) => matchCountOf(p) >= 1);
+  return relaxed;
+}
+__name(filterRelevantProductsByTokens, "filterRelevantProductsByTokens");
+async function filterRelevantProducts(keyword, products, env) {
+  return filterRelevantProductsByTokens(keyword, products);
+}
+__name(filterRelevantProducts, "filterRelevantProducts");
+function getProductKey(p) {
+  if (p.productId) return `id:${p.productId}`;
+  try {
+    const u = new URL(p.productUrl);
+    return `url:${u.origin}${u.pathname}`;
+  } catch (e) {
+    return `raw:${p.productUrl || p.productName}`;
+  }
+}
+__name(getProductKey, "getProductKey");
+function dedupeSimilarProducts(products) {
+  const seenIds = /* @__PURE__ */ new Set();
+  const seenNames = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const p of products) {
+    const id = getProductKey(p);
+    if (seenIds.has(id)) continue;
+    const sig = normalizeProductName(p.productName);
+    if (seenNames.has(sig)) continue;
+    seenIds.add(id);
+    seenNames.add(sig);
+    result.push(p);
+  }
+  return result;
+}
+__name(dedupeSimilarProducts, "dedupeSimilarProducts");
+async function filterUnusedProducts(rawProducts, env, needed) {
+  let usedSet = new Set();
+  try {
+    const raw = await env.POSTS.get("recent-used-products");
+    if (raw) {
+      const cutoff = Date.now() - USED_PRODUCT_TTL_SECONDS * 1000;
+      const list = JSON.parse(raw);
+      usedSet = new Set(list.filter((e) => e.at >= cutoff).map((e) => e.id));
+    }
+  } catch (e) {}
+  const unused = [];
+  for (const p of rawProducts) {
+    const id = getProductKey(p);
+    if (!usedSet.has(id)) unused.push(p);
+    if (unused.length >= needed) break;
+  }
+  return unused;
+}
+__name(filterUnusedProducts, "filterUnusedProducts");
+async function markProductsUsed(products, env) {
+  // 상품마다 따로 KV write 하지 않고, 하나의 목록 키로 묶어서 한 번의 read+write로 처리 (read/write 둘 다 절감)
+  try {
+    const raw = await env.POSTS.get("recent-used-products");
+    const cutoff = Date.now() - USED_PRODUCT_TTL_SECONDS * 1000;
+    const list = raw ? JSON.parse(raw).filter((e) => e.at >= cutoff) : [];
+    const now = Date.now();
+    for (const p of products) {
+      const id = getProductKey(p);
+      const existing = list.find((e) => e.id === id);
+      if (existing) existing.at = now;
+      else list.push({ id, at: now });
+    }
+    await safeKVPut(env, "recent-used-products", JSON.stringify(list.slice(-2000)));
+  } catch (e) {}
+}
+__name(markProductsUsed, "markProductsUsed");
+var MIN_PRODUCTS = 4;
+var MAX_PRODUCTS = 8;
+async function checkDuplicateViaVectorize(products, env) {
+  const vectorMap = /* @__PURE__ */ new Map();
+  if (!env?.AI || !env?.VECTORIZE || !products.length) return { kept: products, vectorMap };
+  const SIMILARITY_THRESHOLD = 0.92;
+  const SIMILAR_PRODUCT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 비슷한 제품은 30일 안에는 재게재 금지, 이후엔 허용
+  const kept = [];
+  try {
+    const names = products.map((p) => p.productName || "");
+    const embedTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("임베딩 타임아웃(8초)")), 8000));
+    const response = await Promise.race([
+      env.AI.run("@cf/baai/bge-m3", { text: names }, { gateway: { id: CF_AI_GATEWAY } }),
+      embedTimeout
+    ]);
+    const vectors = response?.data;
+    if (!Array.isArray(vectors) || vectors.length !== products.length) return { kept: products, vectorMap };
+    for (let i = 0; i < products.length; i++) {
+      vectorMap.set(getProductKey(products[i]), vectors[i]); // 나중에 최종 인덱싱시 재사용 (중복계산 방지)
+      const queryTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Vectorize 조회 타임아웃(5초)")), 5000));
+      let match;
+      try {
+        match = await Promise.race([env.VECTORIZE.query(vectors[i], { topK: 1, returnMetadata: true }), queryTimeout]);
+      } catch (e) {
+        console.log(`Vectorize 조회 실패/타임아웃(건너뜀): ${e.message}`);
+        kept.push(products[i]);
+        continue;
+      }
+      const topMatch = match?.matches?.[0];
+      const topScore = topMatch?.score || 0;
+      const indexedAt = topMatch?.metadata?.indexedAt;
+      const withinWindow = !indexedAt || (Date.now() - Number(indexedAt)) < SIMILAR_PRODUCT_WINDOW_MS;
+      if (topScore >= SIMILARITY_THRESHOLD && withinWindow) {
+        console.log(`Vectorize 중복 발견(제외): "${products[i].productName}" (유사도 ${topScore.toFixed(3)}, 30일 이내)`);
+        continue;
+      }
+      kept.push(products[i]);
+    }
+  } catch (e) {
+    console.log("Vectorize 중복판단 실패, 그대로 진행: " + e.message);
+    return { kept: products, vectorMap };
+  }
+  return { kept, vectorMap };
+}
+__name(checkDuplicateViaVectorize, "checkDuplicateViaVectorize");
+async function indexProductsInVectorize(products, env, precomputedVectorMap) {
+  if (!env?.AI || !env?.VECTORIZE || !products.length) return;
+  try {
+    const missing = precomputedVectorMap ? products.filter((p) => !precomputedVectorMap.has(getProductKey(p))) : products;
+    let freshVectors = [];
+    if (missing.length) {
+      const names = missing.map((p) => p.productName || "");
+      const embedTimeout2 = new Promise((_, reject) => setTimeout(() => reject(new Error("임베딩 타임아웃(8초)")), 8000));
+      let response;
+      try {
+        response = await Promise.race([
+          env.AI.run("@cf/baai/bge-m3", { text: names }, { gateway: { id: CF_AI_GATEWAY } }),
+          embedTimeout2
+        ]);
+      } catch (e) {
+        console.log("인덱싱용 임베딩 실패/타임아웃: " + e.message);
+        response = null;
+      }
+      freshVectors = response?.data;
+      if (!Array.isArray(freshVectors) || freshVectors.length !== missing.length) freshVectors = [];
+    }
+    let freshIdx = 0;
+    const vectorObjects = [];
+    for (const p of products) {
+      const cached = precomputedVectorMap?.get(getProductKey(p));
+      const vec = cached || freshVectors[freshIdx++];
+      if (!vec) continue;
+      vectorObjects.push({
+        id: getProductKey(p).replace(/[^a-zA-Z0-9_:-]/g, "_").slice(0, 60),
+        values: vec,
+        metadata: { name: (p.productName || "").slice(0, 100), indexedAt: Date.now() }
+      });
+    }
+    if (!vectorObjects.length) return;
+    await env.VECTORIZE.upsert(vectorObjects);
+    const reused = products.length - missing.length;
+    console.log(`Vectorize에 ${vectorObjects.length}개 상품 인덱싱 완료 (임베딩 재사용 ${reused}개, 신규계산 ${missing.length}개)`);
+  } catch (e) {
+    console.log("Vectorize 인덱싱 실패(발행은 계속 진행): " + e.message);
+  }
+}
+__name(indexProductsInVectorize, "indexProductsInVectorize");
+async function tryFillProducts(keyword, env) {
+  const searchResult = await coupangSearchProducts(keyword, env, 10);
+  if (!searchResult.products.length) {
+    return { ok: false, reason: `쿠팡 상품 검색 결과 없음 — ${searchResult.error || "응답에 상품 없음"}` };
+  }
+  const relevant = await filterRelevantProducts(keyword, searchResult.products, env);
+  if (!relevant.length) {
+    return { ok: false, reason: `검색 결과가 키워드와 관련성이 낮아 전부 필터링됨 (쿠팡 검색 결과 ${searchResult.products.length}건 중 0건 통과)` };
+  }
+  const currentModels = relevant.filter((p) => !isOutdatedProduct(p.productName));
+  const relevantFiltered = currentModels.length ? currentModels : relevant;
+  let candidates = dedupeSimilarProducts(relevantFiltered);
+  candidates = await filterUnusedProducts(candidates, env, MAX_PRODUCTS);
+  candidates = dedupeSimilarProducts(candidates);
+  const { kept: dedupedCandidates, vectorMap } = await checkDuplicateViaVectorize(candidates, env);
+  candidates = dedupedCandidates;
+  if (candidates.length < MIN_PRODUCTS) {
+    if (candidates.length >= 1) {
+      return { ok: false, reason: `상품 ${candidates.length}개밖에 안 모임 (최소 ${MIN_PRODUCTS}개 필요)`, fallbackProduct: candidates[0], vectorMap };
+    }
+    return { ok: false, reason: `상품 ${candidates.length}개밖에 안 모임 (최소 ${MIN_PRODUCTS}개 필요)` };
+  }
+  let selected = candidates.slice(0, MAX_PRODUCTS);
+  if (selected.length % 2 !== 0) selected.pop();
+  return { ok: true, products: selected, vectorMap };
+}
+__name(tryFillProducts, "tryFillProducts");
+function articleNeedsReview(article) {
+  const FIRST_PERSON_PATTERNS = ["사봤는데", "써보니", "직접 사용해보니", "구매해서 써본", "써본 소감", "몇 주 써본", "써본 결과", "사용해본 결과"];
+  const texts = [article.title, article.tldr, article.intro_html, article.outro_html, ...(article.sections || []).flatMap((s) => [s.heading, s.body_html]), ...(article.faq || []).flatMap((f) => [f.q, f.a])].filter(Boolean);
+  const combined = texts.join(" ");
+  if (FIRST_PERSON_PATTERNS.some((p) => combined.includes(p))) return true;
+  if (/[\u4e00-\u9fff]/.test(combined)) return true; // 한자
+  if (/[\u3040-\u30ff]/.test(combined)) return true; // 히라가나/가타카나
+  return false;
+}
+__name(articleNeedsReview, "articleNeedsReview");
+async function recordModelStat(env, modelUsed, needsReview, title) {
+  // 모델별 "1차 품질" 추적 — 검수(articleNeedsReview) 트리거율이 낮을수록 그 모델의 1차생성 퀄리티가 좋다는 뜻
+  try {
+    const raw = await env.POSTS.get("model-stats");
+    const stats = raw ? JSON.parse(raw) : {};
+    if (!stats[modelUsed]) stats[modelUsed] = { count: 0, needsReviewCount: 0 };
+    stats[modelUsed].count += 1;
+    if (needsReview) stats[modelUsed].needsReviewCount += 1;
+    stats[modelUsed].lastUsedAt = Date.now();
+    stats[modelUsed].lastTitle = title || "";
+    await safeKVPut(env, "model-stats", JSON.stringify(stats));
+  } catch (e) {}
+}
+__name(recordModelStat, "recordModelStat");
+const AI_CLICHE_REPLACEMENTS = [
+  [/다양한\s*/g, ""],
+  [/완벽한\s*선택(입니다|이에요|이죠|이다)/g, "괜찮은 선택$1"],
+  [/매력적인\s*/g, ""],
+  [/궁극적으로,?\s*/g, ""],
+  [/결론적으로,?\s*/g, ""],
+  [/요약하자면,?\s*/g, ""],
+  [/필수적인\s*/g, "꼭 필요한 "],
+  [/다시\s*말해,?\s*/g, ""],
+  [/무엇보다도,?\s*/g, ""],
+  [/라고\s*할\s*수\s*있습니다/g, "습니다"],
+  [/라고\s*할\s*수\s*있어요/g, "어요"]
+];
+function humanizeText(text) {
+  if (!text) return text;
+  let result = text;
+  for (const [pattern, replacement] of AI_CLICHE_REPLACEMENTS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+__name(humanizeText, "humanizeText");
+function humanizeArticle(article) {
+  if (!article) return article;
+  if (article.title) article.title = humanizeText(article.title);
+  if (article.tldr) article.tldr = humanizeText(article.tldr);
+  if (article.intro_html) article.intro_html = humanizeText(article.intro_html);
+  if (article.outro_html) article.outro_html = humanizeText(article.outro_html);
+  if (Array.isArray(article.sections)) {
+    article.sections = article.sections.map((s) => ({
+      ...s,
+      heading: humanizeText(s.heading),
+      body_html: humanizeText(s.body_html)
+    }));
+  }
+  if (Array.isArray(article.faq)) {
+    article.faq = article.faq.map((f) => ({ q: humanizeText(f.q), a: humanizeText(f.a) }));
+  }
+  return article;
+}
+__name(humanizeArticle, "humanizeArticle");
+async function reviewArticleWithWorkersAI(article, env) {
+  if (!env.AI) {
+    console.log("Workers AI 바인딩 없음. 검수 패스 건너뜀.");
+    return article;
+  }
+  const systemPrompt = '너는 한국어 전자기기 블로그의 editor다. 아래 JSON은 AI가 초안으로 쓴 글이다. 이 블로그는 전문성 있으면서도 친근하고 편안한 톤이 컨셉이니 그 느낌은 그대로 살리면서, 다음 기준으로만 다듬어라: 1) 어색한 문장, 반복 표현 개선(순수한 톤 자체는 유지, 밋밋하게 만들지 말 것) 2) 한자/영어/일본어가 섞여 있으면 순수 한글로 순화(브랜드명·모델명 제외) 3) 실측 없이 단정하는 사실주장(예: "배터리가 정말 오래갑니다", "소음이 거의 없어요" 같은 검증 안 된 단정)이 있으면 추정 톤으로 완화하되, 문장의 리듬감은 살린다 4) 상품명, 가격, 스펙 등 사실 정보는 절대 바꾸지 않는다 5) "사봤는데", "써보니", "직접 사용해보니" 같은 1인칭 실사용 체험담 어투가 있으면 전문가답게 확신 있는 제3자 소개 어투로 고친다 6) JSON 구조와 필드명(title, tldr, intro_html, sections, outro_html, faq, heading, body_html, q, a)은 그대로 유지한다 — tldr과 faq 필드가 있으면 삭제하지 말고 같은 방식(1인칭 어투 금지, 사실 정보 유지, 한글 순화)으로 다듬어라. 결과는 반드시 입력과 동일한 JSON 형식으로만 출력하고, 다른 설명은 절대 붙이지 않는다.';
+  const userPrompt = JSON.stringify(article);
+  try {
+    const aiTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Workers AI 검수 타임아웃(8초)")), 8000));
+    const response = await Promise.race([
+      env.AI.run("@cf/zai-org/glm-4.7-flash", {
+        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+        max_tokens: 3e3
+      }, { gateway: { id: CF_AI_GATEWAY } }),
+      aiTimeout
+    ]);
+    let raw = response?.response;
+    if (!raw) {
+      console.log("Workers AI 검수 응답 없음. 원본 유지.");
+      return article;
+    }
+    raw = raw.trim().replace(/^```json\s*|\s*```$/gm, "").trim();
+    const revised = JSON.parse(raw);
+    if (!revised.title || !revised.intro_html || !Array.isArray(revised.sections)) {
+      console.log("Workers AI 검수 결과 구조 이상. 원본 유지.");
+      return article;
+    }
+    console.log("Workers AI 검수 완료.");
+    return revised;
+  } catch (e) {
+    console.log("Workers AI 검수 실패(원본 유지): " + e.message);
+    return article;
+  }
+}
+__name(reviewArticleWithWorkersAI, "reviewArticleWithWorkersAI");
+async function saveProductReviewPost(env, target, displayKeyword, markKeyword, precomputedAffiliateUrl, precomputedVectorMap) {
+  const { article: draftArticle, error: groqError, modelUsed } = await generateProductReviewArticle(target, env);
+  if (!draftArticle) {
+    console.log("상품 리뷰 생성 실패. 종료.");
+    return { ok: false, reason: `Groq 리뷰 생성 실패 — ${groqError || "알 수 없는 오류"}` };
+  }
+  console.log(`상품 리뷰 생성 성공 (모델: ${modelUsed})`);
+  const needsReview1 = articleNeedsReview(draftArticle);
+  await recordModelStat(env, modelUsed, needsReview1, draftArticle.title);
+  const article = humanizeArticle(needsReview1 ? await reviewArticleWithWorkersAI(draftArticle, env) : draftArticle);
+  if (article === draftArticle) console.log("검수 스킵 — 규칙위반 없음 (토큰 절약)");
+  let finalAffiliateUrl = precomputedAffiliateUrl;
+  if (!finalAffiliateUrl) {
+    const links = await coupangDeeplinks([target.productUrl], env);
+    finalAffiliateUrl = links[0]?.shortenUrl || target.productUrl;
+  }
+  const products = [{
+    name: target.productName,
+    price: target.productPrice,
+    image: target.productImage,
+    affiliateUrl: finalAffiliateUrl
+  }];
+  const metaDescription = makeExcerpt(article.tldr || article.intro_html, 150) || `${displayKeyword} 리뷰`;
+  const slug = String(Date.now());
+  const post = {
+    slug,
+    title: article.title,
+    keyword: displayKeyword,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    tldr: article.tldr || "",
+    intro: article.intro_html,
+    sections: article.sections || [],
+    outro: article.outro_html,
+    faq: article.faq || [],
+    products,
+    metaDescription,
+    type: "review"
+  };
+  const savedOk = await safeKVPut(env, `post:${slug}`, JSON.stringify(post));
+  if (!savedOk) return { ok: false, reason: "글 저장 실패(KV 용량/한도 초과 가능성)" };
+  await addToIndex(env, slug);
+  await markProductsUsed([target], env);
+  await indexProductsInVectorize([target], env, precomputedVectorMap);
+  if (markKeyword) await markKeywordUsed(displayKeyword, env);
+  console.log(`상품 리뷰 발행 완료: ${slug}`);
+  return { ok: true, post };
+}
+__name(saveProductReviewPost, "saveProductReviewPost");
+async function generateAndSavePost(env, forcedKeyword) {
+  const genStartTime = Date.now();
+  // cron-job.org 무료플랜 타임아웃이 30초라, 전체를 22초 예산으로 제한 — 넘으면 재시도 그만하고 지금까지 결과로 마무리
+  const TIME_BUDGET_MS = 22000;
+  let keyword, rawProducts, vectorMap;
+  let lastReason = "알 수 없는 오류";
+  if (forcedKeyword) {
+    if (await isKeywordUsedRecently(forcedKeyword, env)) {
+      return { ok: false, reason: `"${forcedKeyword}" 키워드는 최근 5일 이내에 이미 사용됨` };
+    }
+    console.log(`=== 생성 시도: ${forcedKeyword} (수동 지정) ===`);
+    const result = await tryFillProducts(forcedKeyword, env);
+    if (result.ok) {
+      keyword = forcedKeyword;
+      rawProducts = result.products;
+      vectorMap = result.vectorMap;
+    } else if (result.fallbackProduct) {
+      console.log(`${forcedKeyword}: 비교글 부족(상품 부족), 단일 리뷰로 전환`);
+      return await saveProductReviewPost(env, result.fallbackProduct, forcedKeyword, true, undefined, result.vectorMap);
+    } else {
+      return { ok: false, reason: result.reason };
+    }
+  } else {
+    // -2) 예약된 쿠팡 URL이 있으면 최우선 소진 (직접 고른 상품이라 키워드보다도 우선순위 높음)
+    const priorityUrlQueue = await getPriorityUrls(env);
+    if (priorityUrlQueue.length > 0) {
+      const priorityUrl = priorityUrlQueue[0];
+      await savePriorityUrls(env, priorityUrlQueue.slice(1));
+      console.log(`=== 생성 시도(예약 URL): ${priorityUrl} ===`);
+      const urlResult = await generateProductReviewFromUrl(env, priorityUrl);
+      if (urlResult.ok) return urlResult;
+      console.log(`예약 URL "${priorityUrl}" 실패 — ${urlResult.reason}. 일반 로직으로 폴백.`);
+    }
+
+    // -1) 예약된 우선순위 키워드가 있으면 그것부터 소진 (성공/실패 여부와 무관하게 1회 소모, 실패시 아래 일반 로직으로 폴백)
+    const priorityQueue = await getPriorityKeywords(env);
+    if (priorityQueue.length > 0) {
+      const priorityKw = priorityQueue[0];
+      await savePriorityKeywords(env, priorityQueue.slice(1));
+      if (await isKeywordUsedRecently(priorityKw, env)) {
+        console.log(`예약 키워드 "${priorityKw}"는 최근 5일 이내 이미 사용됨 — 건너뛰고 일반 로직으로 폴백`);
+      } else {
+        console.log(`=== 생성 시도(예약 키워드): ${priorityKw} ===`);
+        const priorityResult = await tryFillProducts(priorityKw, env);
+        if (priorityResult.ok) {
+          keyword = priorityKw;
+          rawProducts = priorityResult.products;
+          vectorMap = priorityResult.vectorMap;
+        } else if (priorityResult.fallbackProduct) {
+          console.log(`${priorityKw}: 비교글 부족(상품 부족), 단일 리뷰로 전환`);
+          return await saveProductReviewPost(env, priorityResult.fallbackProduct, priorityKw, true, undefined, priorityResult.vectorMap);
+        } else {
+          console.log(`예약 키워드 "${priorityKw}" 실패 — ${priorityResult.reason}. 일반 로직으로 폴백.`);
+        }
+      }
+    }
+
+    // 0) 인기 플래그십(핫키워드) 우선 시도 — 25% 확률
+    if (!rawProducts && Math.random() < 0.25) {
+      const hotUsedFlags = await Promise.all(HOT_KEYWORDS.map((kw) => isKeywordUsedRecently(kw, env)));
+      const hotPool = HOT_KEYWORDS.filter((_, i) => !hotUsedFlags[i]);
+      if (hotPool.length > 0) {
+        const hotKw = hotPool[Math.floor(Math.random() * hotPool.length)];
+        console.log(`=== 생성 시도(핫키워드): ${hotKw} ===`);
+        const hotResult = await tryFillProducts(hotKw, env);
+        if (hotResult.ok) {
+          keyword = hotKw;
+          rawProducts = hotResult.products;
+          vectorMap = hotResult.vectorMap;
+        } else if (hotResult.fallbackProduct) {
+          console.log(`${hotKw}: 비교글 부족(상품 부족), 단일 리뷰로 전환`);
+          return await saveProductReviewPost(env, hotResult.fallbackProduct, hotKw, true, undefined, hotResult.vectorMap);
+        } else {
+          console.log(`핫키워드 ${hotKw} 실패 — ${hotResult.reason}. 기존 방식으로 폴백.`);
+        }
+      }
+    }
+
+    // Danawa 일일 제품 목록에서 랜덤 선택 (최근 4일 미사용 + 최신 등록 상품 우선)
+    if (!rawProducts) {
+    const danawaProducts = await getDanawaDailyProducts(env);
+    if (danawaProducts.length > 0) {
+      const usedFlags = await Promise.all(danawaProducts.map((p) => isProductUsedRecently(p.name, env)));
+      const availableProducts = danawaProducts.filter((_, i) => !usedFlags[i]);
+
+      if (availableProducts.length > 0) {
+        // 핫키워드(아이폰/갤럭시폴드 등)와 이름이 겹치면 등록월 상관없이 최우선
+        const hotMatches = availableProducts.filter((p) => HOT_KEYWORDS.some((hk) => p.name.replace(/\s/g, "").includes(hk.replace(/\s/g, ""))));
+        // "26.07" 형식 등록년월 기준, 이번달/지난달 등록 상품을 그 다음 우선순위로 사용
+        const now = new Date();
+        const thisYm = `${String(now.getFullYear()).slice(2)}${String(now.getMonth() + 1).padStart(2, "0")}`;
+        const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const lastYm = `${String(lastMonthDate.getFullYear()).slice(2)}${String(lastMonthDate.getMonth() + 1).padStart(2, "0")}`;
+        const recentProducts = availableProducts.filter((p) => p.regYm === thisYm || p.regYm === lastYm);
+        const pickFrom = hotMatches.length > 0 ? hotMatches : recentProducts.length > 0 ? recentProducts : availableProducts;
+        if (hotMatches.length === 0 && recentProducts.length === 0) {
+          console.log("최근 등록 상품 없음 (등록년월 파싱 실패 포함) — 전체 후보 중 랜덤 선택으로 폴백");
+        }
+        const randomProduct = pickFrom[Math.floor(Math.random() * pickFrom.length)];
+        console.log(`Danawa 제품 선택: ${randomProduct.name} (카테고리: ${randomProduct.category}, 등록: ${randomProduct.regYm || "미상"}, 핫키워드매치: ${hotMatches.length > 0})`);
+        await markProductAsUsed(randomProduct.name, env);
+        const result = await generateProductReview(env, randomProduct.name);
+        if (result.ok) return result;
+        console.log(`Danawa 제품 생성 실패: ${result.reason}. 폴백 시도.`);
+      } else {
+        console.log("Danawa 사용가능 제품 없음 (모두 최근 4일내 사용). 폴백시도.");
+      }
+    }
+    }
+    
+    if (!rawProducts && Math.random() < 0.4) {
+      const trendingResult = await generateTrendingReview(env);
+      if (trendingResult.ok) return trendingResult;
+      console.log(`베스트카테고리 리뷰 실패 — ${trendingResult.reason}. 기존 키워드 방식으로 폴백.`);
+    }
+    if (!rawProducts) {
+      const activePool = KEYWORDS.slice();
+      const kwUsedFlags = await Promise.all(activePool.map((kw) => isKeywordUsedRecently(kw, env)));
+      const attemptOrder = activePool.filter((_, i) => !kwUsedFlags[i]);
+      if (!attemptOrder.length) attemptOrder.push(...activePool);
+      const MAX_KEYWORD_ATTEMPTS = 8;
+      for (const kw of attemptOrder.slice(0, MAX_KEYWORD_ATTEMPTS)) {
+        if (Date.now() - genStartTime > TIME_BUDGET_MS) {
+          console.log(`시간예산(22초) 초과 — 키워드 재시도 중단, 지금까지 사유: ${lastReason}`);
+          break;
+        }
+        console.log(`=== 생성 시도: ${kw} ===`);
+        const result = await tryFillProducts(kw, env);
+        if (result.ok) {
+          keyword = kw;
+          rawProducts = result.products;
+          vectorMap = result.vectorMap;
+          break;
+        }
+        if (result.fallbackProduct) {
+          console.log(`${kw}: 비교글 부족(상품 부족), 단일 리뷰로 전환`);
+          return await saveProductReviewPost(env, result.fallbackProduct, kw, true, undefined, result.vectorMap);
+        }
+        lastReason = result.reason;
+        console.log(`${kw} 실패 — ${result.reason}. 다음 키워드로 재시도.`);
+      }
+      if (!rawProducts) {
+        return { ok: false, reason: `모든 키워드 시도했지만 상품을 못 채움 — 마지막 사유: ${lastReason}` };
+      }
+    }
+  }
+  const urls = rawProducts.map((p) => p.productUrl);
+  const links = await coupangDeeplinks(urls, env);
+  const products = rawProducts.map((p, i) => ({
+    name: p.productName,
+    price: p.productPrice,
+    image: p.productImage,
+    affiliateUrl: links[i]?.shortenUrl || p.productUrl
+  }));
+  const { article: draftArticle, error: groqError, modelUsed } = await generateArticleWithGroq(keyword, rawProducts, env);
+  if (!draftArticle) {
+    console.log("글 생성 실패. 종료.");
+    return { ok: false, reason: `Groq 글 생성 실패 — ${groqError || "알 수 없는 오류"}` };
+  }
+  console.log(`Groq 생성 성공 (모델: ${modelUsed})`);
+  const needsReview2 = articleNeedsReview(draftArticle);
+  await recordModelStat(env, modelUsed, needsReview2, draftArticle.title);
+  const article = humanizeArticle(needsReview2 ? await reviewArticleWithWorkersAI(draftArticle, env) : draftArticle);
+  if (article === draftArticle) console.log("검수 스킵 — 규칙위반 없음 (토큰 절약)");
+  const metaDescription = makeExcerpt(article.tldr || article.intro_html, 150) || `${keyword} 비교 가이드`;
+  const slug = String(Date.now());
+  const post = {
+    slug,
+    title: article.title,
+    keyword,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    tldr: article.tldr || "",
+    intro: article.intro_html,
+    sections: article.sections || [],
+    outro: article.outro_html,
+    faq: article.faq || [],
+    products,
+    metaDescription,
+    type: "comparison"
+  };
+  const savedOk2 = await safeKVPut(env, `post:${slug}`, JSON.stringify(post));
+  if (!savedOk2) return { ok: false, reason: "글 저장 실패(KV 용량/한도 초과 가능성)" };
+  await addToIndex(env, slug);
+  await markProductsUsed(rawProducts, env);
+  await indexProductsInVectorize(rawProducts, env, vectorMap);
+  await markKeywordUsed(keyword, env);
+  console.log(`발행 완료: ${slug}`);
+  return { ok: true, post };
+}
+__name(generateAndSavePost, "generateAndSavePost");
+var BRAND_USED_TTL_SECONDS = 2 * 24 * 60 * 60;
+function extractBrand(productName) {
+  const match = (productName || "").trim().match(/^[\p{L}\p{N}]+/u);
+  return match ? match[0] : "";
+}
+__name(extractBrand, "extractBrand");
+async function isBrandUsedRecently(brand, env) {
+  if (!brand) return false;
+  return !!await env.POSTS.get(`usedBrand:${brand}`);
+}
+__name(isBrandUsedRecently, "isBrandUsedRecently");
+async function markBrandUsed(productName, env) {
+  const brand = extractBrand(productName);
+  if (!brand) return;
+  await safeKVPut(env, `usedBrand:${brand}`, "1", { expirationTtl: BRAND_USED_TTL_SECONDS });
+}
+__name(markBrandUsed, "markBrandUsed");
+async function generateTrendingReview(env) {
+  const category = BEST_CATEGORY_IDS[Math.floor(Math.random() * BEST_CATEGORY_IDS.length)];
+  const result = await coupangBestCategoryProducts(category.id, env, 20);
+  if (!result.products.length) {
+    return { ok: false, reason: `베스트카테고리(${category.name}) 상품 없음 — ${result.error || "응답에 상품 없음"}` };
+  }
+  const techOnly = result.products.filter((p) => isTechRelated(p.productName));
+  if (!techOnly.length) {
+    return { ok: false, reason: `베스트카테고리(${category.name})에 테크 관련 상품 없음 (${result.products.length}건 중 0건 통과)` };
+  }
+  const currentModels = techOnly.filter((p) => !isOutdatedProduct(p.productName));
+  const techFiltered = currentModels.length ? currentModels : techOnly;
+  const deduped = dedupeSimilarProducts(techFiltered);
+  const unused = await filterUnusedProducts(deduped, env, 1);
+  if (!unused.length) {
+    return { ok: false, reason: `베스트카테고리(${category.name}) 상품이 전부 최근 5일 이내 이미 사용됨` };
+  }
+  const brandFresh = [];
+  for (const p of unused) {
+    if (!await isBrandUsedRecently(extractBrand(p.productName), env)) brandFresh.push(p);
+  }
+  const candidates = brandFresh.length ? brandFresh : unused;
+  const pickPool = candidates.slice(0, Math.min(5, candidates.length));
+  const target = pickPool[Math.floor(Math.random() * pickPool.length)];
+  const displayKeyword = category.name;
+  const saveResult = await saveProductReviewPost(env, target, displayKeyword, false);
+  if (saveResult.ok) await markBrandUsed(target.productName, env);
+  return saveResult;
+}
+__name(generateTrendingReview, "generateTrendingReview");
+async function generateProductReview(env, productName) {
+  const searchResult = await coupangSearchProducts(productName, env, 12);
+  if (!searchResult.products.length) {
+    return { ok: false, reason: `쿠팡 상품 검색 결과 없음 — ${searchResult.error || "응답에 상품 없음"}` };
+  }
+  const relevant = await filterRelevantProducts(productName, searchResult.products, env);
+  if (!relevant.length) {
+    return { ok: false, reason: `"${productName}"와 관련성 있는 검색 결과 없음 (쿠팡 검색 ${searchResult.products.length}건 중 0건 통과)` };
+  }
+  const deduped = dedupeSimilarProducts(relevant);
+  const unused = await filterUnusedProducts(deduped, env, 1);
+  if (!unused.length) {
+    return { ok: false, reason: `"${productName}"에 해당하는 상품이 최근 5일 이내 이미 리뷰됨` };
+  }
+  const target = unused[0];
+  return await saveProductReviewPost(env, target, productName, false);
+}
+__name(generateProductReview, "generateProductReview");
+async function addToIndex(env, slug) {
+  try {
+    const idxRaw = await env.POSTS.get("index");
+    const idx = idxRaw ? JSON.parse(idxRaw) : [];
+    idx.unshift(slug);
+    await safeKVPut(env, "index", JSON.stringify(idx.slice(0, 500)));
+  } catch (e) {
+    console.log(`[addToIndex 실패] ${slug}: ${e.message}`);
+  }
+}
+__name(addToIndex, "addToIndex");
+function renderPrivacyPage() {
+  const body = `${siteHeader()}
+    <div class="wrap post-body">
+      <h1>개인정보처리방침</h1>
+      <div class="meta">최종 수정일: 2026년 7월 12일</div>
+      <p>usb.kr(이하 "사이트")은 이용자의 개인정보를 소중히 다루며, 다음과 같은 방침에 따라 정보를 처리합니다.</p>
+
+      <h2>1. 수집하는 정보</h2>
+      <p>사이트는 서비스 개선을 위해 아래와 같이 개인을 식별할 수 없는 방문 통계 정보를 수집합니다.</p>
+      <ul style="margin:0 0 16px;padding-left:20px;color:var(--text);line-height:1.7;">
+        <li>방문 시각, 방문 페이지</li>
+        <li>리퍼러(어느 경로로 들어왔는지)</li>
+        <li>접속 국가(IP 주소 자체는 저장하지 않습니다)</li>
+        <li>브라우저/기기 종류(User-Agent), 기기 유형(모바일/PC/태블릿)</li>
+        <li>브라우저 언어 설정</li>
+      </ul>
+      <p>이름, 이메일, 전화번호 등 개인을 직접 식별할 수 있는 정보는 수집하지 않습니다.</p>
+
+      <h2>2. 수집 목적</h2>
+      <p>수집된 정보는 사이트 이용 현황 분석, 콘텐츠 품질 개선, 서비스 안정성 확보 목적으로만 사용됩니다.</p>
+
+      <h2>3. 쿠키 및 로컬 저장소</h2>
+      <p>사이트는 방문자를 추적하는 쿠키를 사용하지 않습니다. 다만 개인정보 수집 고지 배너를 다시 표시하지 않기 위한 확인 여부를, 이용자 브라우저의 로컬 저장소(localStorage)에만 저장합니다. 이 정보는 서버로 전송되지 않으며, 브라우저 데이터를 삭제하면 함께 삭제됩니다.</p>
+
+      <h2>4. 제3자 서비스</h2>
+      <p>사이트는 다음과 같은 제3자 서비스를 이용합니다.</p>
+      <ul style="margin:0 0 16px;padding-left:20px;color:var(--text);line-height:1.7;">
+        <li><strong>쿠팡 파트너스</strong>: 사이트는 쿠팡 파트너스 활동을 통해 일정액의 수수료를 제공받을 수 있습니다.</li>
+        <li><strong>Cloudflare Web Analytics</strong>: 쿠키 없는 방식의 방문 통계 서비스입니다.</li>
+        <li>본문 콘텐츠는 AI(Groq, Google, Cloudflare Workers AI 등)를 통해 자동 생성되며, 이 과정에서 이용자의 개인정보는 사용되지 않습니다.</li>
+      </ul>
+
+      <h2>5. 정보의 보유 및 이용 기간</h2>
+      <p>수집된 방문 통계 정보는 서비스 운영에 필요한 기간 동안 보관되며, 개인을 식별할 수 없는 형태로 관리됩니다.</p>
+
+      <h2>6. 콘텐츠에 대한 안내</h2>
+      <p>사이트에 게재되는 상품 비교/리뷰 콘텐츠는 AI가 자동으로 생성하며, 실제 사용 후기가 아닌 참고용 정보입니다. 스펙, 가격 등 세부 정보가 실제와 다를 수 있으니 구매 전 반드시 판매 페이지에서 정확한 정보를 확인해주시기 바랍니다.</p>
+
+      <h2>7. 문의</h2>
+      <p>개인정보 처리와 관련한 문의사항은 사이트 운영자에게 연락해주시기 바랍니다.</p>
+    </div>
+<footer><div class="wrap">usb.kr — 쿠팡 파트너스 활동을 통해 일정액의 수수료를 제공받을 수 있습니다. · <a href="/privacy" style="text-decoration:underline;">개인정보처리방침</a></div></footer>`;
+  return new Response(page("개인정보처리방침 - usb.kr", body, {
+    description: "usb.kr 개인정보처리방침",
+    canonicalUrl: "https://usb.kr/privacy",
+    noindex: true,
+    showPrivacyNotice: false
+  }), {
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
+}
+__name(renderPrivacyPage, "renderPrivacyPage");
+function renderRobotsTxt() {
+  const body = `User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /admin/
+
+Sitemap: https://usb.kr/sitemap.xml
+`;
+  return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+}
+__name(renderRobotsTxt, "renderRobotsTxt");
+async function renderLlmsTxt(env) {
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const rawRecent = await Promise.all(idx.slice(0, 30).map((slug) => env.POSTS.get(`post:${slug}`)));
+  const lines = rawRecent.filter(Boolean).map((raw) => {
+    const p = JSON.parse(raw);
+    return `- [${p.title}](https://usb.kr/${p.slug}): ${p.tldr || p.metaDescription || ""}`;
+  });
+  const body = `# usb.kr
+
+> 실시간 쿠팡 가격 데이터를 기반으로 전자기기 스펙과 가격을 비교하는 한국어 리뷰/비교 사이트입니다. 오디오, 모바일 액세서리, PC주변기기, 스마트기기 등 전자기기 카테고리를 다룹니다.
+
+이 사이트는 AI가 자동 생성한 참고용 콘텐츠이며, 정확한 스펙은 판매 페이지에서 직접 확인을 권장합니다. 쿠팡 파트너스 활동을 통해 수수료를 제공받을 수 있습니다.
+
+## 최근 게시글
+
+${lines.join("\n")}
+
+## 사이트맵
+https://usb.kr/sitemap.xml
+`;
+  return new Response(body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+}
+__name(renderLlmsTxt, "renderLlmsTxt");
+async function renderSitemap(env) {
+  // 크롤러가 자주 요청하는 페이지라, 15분 캐시로 감싸서 매번 전체 글을 다시 읽지 않도록 함
+  const SITEMAP_CACHE_TTL_MS = 15 * 60 * 1000;
+  try {
+    const cachedRaw = await env.POSTS.get("sitemap:cache");
+    if (cachedRaw) {
+      const cached = JSON.parse(cachedRaw);
+      if (cached && typeof cached.generatedAt === "number" && Date.now() - cached.generatedAt < SITEMAP_CACHE_TTL_MS) {
+        return new Response(cached.xml, { headers: { "Content-Type": "application/xml; charset=utf-8" } });
+      }
+    }
+  } catch (e) {}
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const urls = [`<url><loc>https://usb.kr/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>`];
+  for (const c of CATEGORIES) {
+    urls.push(`<url><loc>https://usb.kr/category/${c.slug}</loc><changefreq>daily</changefreq><priority>0.8</priority></url>`);
+  }
+  // safeKVGet 사용 — KV 한도초과로 D1에만 저장된 글도 사이트맵에서 누락되지 않도록
+  const rawSitemapPosts = await Promise.all(idx.map((slug) => safeKVGet(env, `post:${slug}`)));
+  for (const raw of rawSitemapPosts) {
+    if (!raw) continue;
+    const p = JSON.parse(raw);
+    const lastmod = new Date(p.createdAt).toISOString().slice(0, 10);
+    urls.push(`<url><loc>https://usb.kr/${p.slug}</loc><lastmod>${lastmod}</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>`);
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls.join("\n")}
+</urlset>`;
+  await safeKVPut(env, "sitemap:cache", JSON.stringify({ xml, generatedAt: Date.now() }), { expirationTtl: 3600 });
+  return new Response(xml, { headers: { "Content-Type": "application/xml; charset=utf-8" } });
+}
+__name(renderSitemap, "renderSitemap");
+async function renderRssFeed(env) {
+  const RSS_CACHE_TTL_MS = 15 * 60 * 1000;
+  try {
+    const cachedRaw = await env.POSTS.get("rss:cache");
+    if (cachedRaw) {
+      const cached = JSON.parse(cachedRaw);
+      if (cached && typeof cached.generatedAt === "number" && Date.now() - cached.generatedAt < RSS_CACHE_TTL_MS) {
+        return new Response(cached.xml, { headers: { "Content-Type": "application/rss+xml; charset=utf-8" } });
+      }
+    }
+  } catch (e) {}
+  const idxRaw = await env.POSTS.get("index");
+  const idx = (idxRaw ? JSON.parse(idxRaw) : []).slice(0, 30); // 최신 30건만
+  const rawPosts = await Promise.all(idx.map((slug) => safeKVGet(env, `post:${slug}`)));
+  const items = [];
+  for (const raw of rawPosts) {
+    if (!raw) continue;
+    const p = JSON.parse(raw);
+    const pubDate = new Date(p.createdAt).toUTCString();
+    const desc = escapeHtml((p.metaDescription || p.tldr || "").slice(0, 300));
+    items.push(`<item><title>${escapeHtml(p.title)}</title><link>https://usb.kr/${p.slug}</link><guid>https://usb.kr/${p.slug}</guid><pubDate>${pubDate}</pubDate><description>${desc}</description></item>`);
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>usb.kr - 전자기기 비교 가이드</title>
+<link>https://usb.kr/</link>
+<description>실시간 쿠팡 가격 데이터를 기반으로 전자기기를 비교합니다.</description>
+<language>ko-kr</language>
+${items.join("\n")}
+</channel></rss>`;
+  await safeKVPut(env, "rss:cache", JSON.stringify({ xml, generatedAt: Date.now() }), { expirationTtl: 3600 });
+  return new Response(xml, { headers: { "Content-Type": "application/rss+xml; charset=utf-8" } });
+}
+__name(renderRssFeed, "renderRssFeed");
+async function buildJsonLd(post, env) {
+  const productNodes = await Promise.all((post.products || []).map(async (prod) => ({
+    "@type": "Product",
+    name: prod.name,
+    image: `https://usb.kr${imgProxy(prod.image)}`,
+    offers: {
+      "@type": "Offer",
+      price: String(prod.price || ""),
+      priceCurrency: "KRW",
+      url: prod.affiliateUrl
+    }
+  })));
+  const heroImage = post.products?.[0]?.image ? `https://usb.kr${imgProxy(post.products[0].image)}` : void 0;
+  const graph = [
+    {
+      "@type": "BlogPosting",
+      headline: post.title,
+      datePublished: post.createdAt,
+      dateModified: post.createdAt,
+      author: { "@type": "Organization", name: "usb.kr", url: "https://usb.kr" },
+      publisher: { "@type": "Organization", name: "usb.kr", url: "https://usb.kr" },
+      description: post.metaDescription || "",
+      abstract: post.tldr || void 0,
+      mainEntityOfPage: { "@type": "WebPage", "@id": `https://usb.kr/${post.slug}` },
+      image: heroImage
+    },
+    {
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "usb.kr", item: "https://usb.kr/" },
+        { "@type": "ListItem", position: 2, name: post.title, item: `https://usb.kr/${post.slug}` }
+      ]
+    },
+    ...productNodes
+  ];
+  if (post.faq && post.faq.length) {
+    graph.push({
+      "@type": "FAQPage",
+      mainEntity: post.faq.map((f) => ({
+        "@type": "Question",
+        name: f.q,
+        acceptedAnswer: { "@type": "Answer", text: f.a }
+      }))
+    });
+  }
+  return JSON.stringify({ "@context": "https://schema.org", "@graph": graph });
+}
+__name(buildJsonLd, "buildJsonLd");
+function page(title, body, options = {}) {
+  const { description = "실시간 쿠팡 가격 데이터를 기반으로 전자기기 스펙과 가격을 비교하는 가이드", ogImage = "", canonicalUrl = "", noindex = false, showPrivacyNotice = true, jsonLd = "" } = options;
+  const meta = `<meta name="description" content="${escapeHtml(description)}">
+${canonicalUrl ? `<link rel="canonical" href="${escapeHtml(canonicalUrl)}">` : ""}
+<meta property="og:site_name" content="usb.kr">
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:type" content="${canonicalUrl && canonicalUrl !== "https://usb.kr/" ? "article" : "website"}">
+${canonicalUrl ? `<meta property="og:url" content="${escapeHtml(canonicalUrl)}">` : ""}
+${ogImage ? `<meta property="og:image" content="${escapeHtml(ogImage)}">` : ""}
+<meta name="twitter:card" content="${ogImage ? "summary_large_image" : "summary"}">
+${noindex ? '<meta name="robots" content="noindex, nofollow">' : ""}
+${jsonLd ? `<script type="application/ld+json">${jsonLd}<\/script>` : ""}`;
+  const ga4Script = `<script async src="https://www.googletagmanager.com/gtag/js?id=G-8W82WVZTWF"><\/script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-8W82WVZTWF', { anonymize_ip: true });
+<\/script>`;
+  const privacyBanner = showPrivacyNotice ? `<div class="privacy-banner hidden" id="privacyBanner">
+    <p>usb.kr은 서비스 개선을 위해 방문 통계(리퍼러, 국가, 기기 종류, 언어 등 개인을 식별할 수 없는 정보)를 수집합니다. 또한 쿠팡 파트너스 활동을 통해 일정액의 수수료를 제공받을 수 있습니다. <a href="/privacy" style="text-decoration:underline;color:var(--accent-text);">자세히 보기</a></p>
+    <button id="privacyBannerOk" type="button">확인했습니다</button>
+  </div>
+  <script>
+    (function(){
+      try{
+        if(!localStorage.getItem('usbkr_privacy_ack')){
+          var b=document.getElementById('privacyBanner');
+          if(b) b.classList.remove('hidden');
+        }
+        var okBtn=document.getElementById('privacyBannerOk');
+        if(okBtn) okBtn.addEventListener('click', function(){
+          try{ localStorage.setItem('usbkr_privacy_ack','1'); }catch(e){}
+          var b=document.getElementById('privacyBanner');
+          if(b) b.classList.add('hidden');
+        });
+      }catch(e){}
+    })();
+  <\/script>` : "";
+  const animeScript = `<script src="https://cdn.jsdelivr.net/npm/animejs@3.2.2/lib/anime.min.js" defer><\/script>
+  <script>
+  (function(){
+    function animateIn(root){
+      root = root || document;
+      if (typeof anime === 'undefined') return;
+      var cards = root.querySelectorAll ? root.querySelectorAll('.entry:not([data-anim])') : [];
+      cards.forEach(function(c){ c.setAttribute('data-anim','1'); });
+      if (cards.length) {
+        anime({ targets: cards, translateY:[24,0], opacity:[0,1], duration:520, delay: anime.stagger(60), easing:'easeOutCubic' });
+      }
+      var tags = root.querySelectorAll ? root.querySelectorAll('.price-tag:not([data-anim])') : [];
+      tags.forEach(function(t){ t.setAttribute('data-anim','1'); });
+      if (tags.length) {
+        anime({ targets: tags, scale:[0,1], opacity:[0,1], duration:600, delay: anime.stagger(60,{start:180}), easing:'easeOutElastic(1, .6)' });
+      }
+    }
+    function run(){
+      if (typeof anime === 'undefined') { setTimeout(run, 60); return; }
+      animateIn(document);
+      var banner = document.querySelector('.top-banner-inner');
+      if (banner) anime({ targets: banner, opacity:[0,1], scale:[0.96,1], duration:600, easing:'easeOutCubic' });
+      var heroCards = document.querySelectorAll('.hero-carousel-card');
+      if (heroCards.length) anime({ targets: heroCards, opacity:[0,1], translateY:[16,0], duration:500, delay: anime.stagger(50), easing:'easeOutCubic' });
+      window.__usbkrAnimateIn = animateIn;
+      document.querySelectorAll('.faq-item').forEach(function(item){
+        item.addEventListener('toggle', function(){
+          if (item.open) {
+            var p = item.querySelector('p');
+            if (p && typeof anime !== 'undefined') anime({ targets: p, opacity:[0,1], translateY:[-6,0], duration:320, easing:'easeOutCubic' });
+          }
+        });
+      });
+      // 카드 클릭시 팝 효과 후 이동 (새탭/우클릭/조합키는 그대로 통과)
+      document.addEventListener('click', function(e){
+        var el = e.target.closest('.entry, .top-banner-inner');
+        if (!el) return;
+        var href = el.getAttribute('href');
+        if (!href || el.getAttribute('target') === '_blank') return;
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        e.preventDefault();
+        if (typeof anime === 'undefined') { window.location.href = href; return; }
+        el.style.transformOrigin = 'center';
+        anime({
+          targets: el,
+          scale: [1, 0.94, 1],
+          duration: 260,
+          easing: 'easeOutQuad',
+          complete: function(){ window.location.href = href; }
+        });
+      });
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+    else run();
+  })();
+  <\/script>`;
+  return `<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="manifest" href="/manifest.json"><link rel="alternate" type="application/rss+xml" title="usb.kr RSS" href="/feed.xml"><meta name="theme-color" content="#FF4B3E"><title>${title}</title>${meta}${ga4Script}<style>${STYLE}</style>${FONTS}</head><body>${body}${privacyBanner}${animeScript}</body></html>`;
+}
+__name(page, "page");
+function siteHeader(compact, placeholderWord, visitStats) {
+  const placeholder = placeholderWord ? `'${placeholderWord}' 검색해보기` : "쿠팡에서 상품 검색";
+  const statsHtml = visitStats ? `<div class="visit-stats mono">시간 <b>${visitStats.hour}</b> · 일 <b>${visitStats.day}</b> · 주 <b>${visitStats.week}</b> · 월 <b>${visitStats.month}</b></div>` : "";
+  return `<header class="site"><div class="wrap"><div class="header-left"><a class="logo${compact ? " compact" : ""}" href="/"><span class="logo-icon"><svg width="26" height="26" viewBox="0 0 26 26" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="2" width="22" height="22" rx="6" fill="#3A2E2A" stroke="#FF4B3E" stroke-width="1.5"/><path d="M13 6.5V15" stroke="#FF4B3E" stroke-width="1.6" stroke-linecap="round"/><path d="M9.5 9L13 6.5L16.5 9" stroke="#FF4B3E" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="9.5" cy="17.5" r="1.6" fill="#FFC629"/><circle cx="16.5" cy="17.5" r="1.6" fill="#FFC629"/><path d="M13 15V17.5H9.5M13 17.5H16.5" stroke="#FFC629" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="logo-text">usb<span>.kr</span></span></a>${statsHtml}</div><form action="/go" method="GET" class="site-search" target="_blank" role="search" onsubmit="var i=this.querySelector('input[name=q]');if(!i.value.trim()){var d=i.getAttribute('data-default-q');if(d){i.value=d;}else{return false;}}"><input type="text" name="q" placeholder="${escapeHtml(placeholder)}" data-default-q="${escapeHtml(placeholderWord || "")}" autocomplete="off"><button type="submit" aria-label="검색"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button></form><div class="mono" style="font-size:13px;color:var(--muted)">전자기기 비교 가이드</div></div></header>
+  <style>
+    header.site .wrap{ gap:20px; }
+    .header-left{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+    .visit-stats{ font-size:11px; color:var(--muted); white-space:nowrap; }
+    .visit-stats b{ color:var(--accent-text); font-weight:700; }
+    .site-search{ flex:1; max-width:420px; display:flex; align-items:center; background:var(--surface); border:1px solid var(--border); border-radius:100px; padding:4px 6px 4px 16px; }
+    .site-search input{ flex:1; border:none; background:transparent; outline:none; font-size:14px; color:var(--text); min-width:0; }
+    .site-search input::placeholder{ color:var(--muted); }
+    .site-search button{ display:flex; align-items:center; justify-content:center; width:32px; height:32px; border-radius:50%; border:none; background:var(--accent); color:#fff; cursor:pointer; flex-shrink:0; }
+    @media (max-width:640px){ .site-search{ max-width:none; flex-basis:100%; } header.site .wrap{ flex-wrap:wrap; } header.site .wrap > div.mono{ display:none; } .visit-stats{ font-size:10px; } }
+  </style>`;
+}
+__name(siteHeader, "siteHeader");
+function blankDayStats() {
+  return {
+    count: 0, hourly: new Array(24).fill(0),
+    paths: {}, referrers: {}, countries: {}, devices: {}, searches: {},
+    cities: {}, regions: {}, timezones: {}, isps: {},
+    browsers: {}, oses: {}, languages: {}, utmSources: {}, prevUrls: {},
+    searchKeywords: {}, notFoundPaths: {}, statusCodes: {}, coupangClicks: 0,
+    newVisitors: 0, returningVisitors: 0
+  };
+}
+__name(blankDayStats, "blankDayStats");
+function bumpCounter(dict, key, cap = 500) {
+  const k = key || "unknown";
+  if (dict[k] === undefined) {
+    if (Object.keys(dict).length >= cap) return; // 너무 커지는 것 방지 — 기존 키는 계속 집계, 신규 키만 무시
+    dict[k] = 0;
+  }
+  dict[k] += 1;
+}
+__name(bumpCounter, "bumpCounter");
+function detectDevice(ua) {
+  const s = (ua || "").toLowerCase();
+  if (/bot|crawl|spider|slurp|facebookexternalhit|bingpreview/.test(s)) return "bot";
+  if (/ipad|tablet/.test(s)) return "tablet";
+  if (/mobile|iphone|android/.test(s)) return "mobile";
+  return "desktop";
+}
+__name(detectDevice, "detectDevice");
+async function ensureKvFallbackTable(env) {
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS kv_fallback (key TEXT PRIMARY KEY, value TEXT, expires_at INTEGER, updated_at INTEGER)"
+    ).run();
+  } catch (e) {}
+}
+__name(ensureKvFallbackTable, "ensureKvFallbackTable");
+async function kvFallbackPut(env, key, value, opts) {
+  // KV write 실패시(한도초과 등) D1으로 대신 저장 — D1 무료한도가 KV보다 훨씬 여유로움(하루 10만 write)
+  try {
+    if (!env.DB) return false;
+    const expiresAt = opts?.expirationTtl ? Date.now() + opts.expirationTtl * 1000 : null;
+    await env.DB.prepare(
+      "INSERT INTO kv_fallback (key, value, expires_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at, updated_at=excluded.updated_at"
+    ).bind(key, value, expiresAt, Date.now()).run();
+    return true;
+  } catch (e) {
+    if (String(e.message || "").includes("no such table")) {
+      await ensureKvFallbackTable(env);
+      try {
+        const expiresAt = opts?.expirationTtl ? Date.now() + opts.expirationTtl * 1000 : null;
+        await env.DB.prepare(
+          "INSERT INTO kv_fallback (key, value, expires_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at, updated_at=excluded.updated_at"
+        ).bind(key, value, expiresAt, Date.now()).run();
+        return true;
+      } catch (e2) {
+        console.log(`[D1 폴백 write 실패] key=${key}: ${e2.message}`);
+        return false;
+      }
+    }
+    console.log(`[D1 폴백 write 실패] key=${key}: ${e.message}`);
+    return false;
+  }
+}
+__name(kvFallbackPut, "kvFallbackPut");
+async function kvFallbackGet(env, key) {
+  try {
+    if (!env.DB) return null;
+    const row = await env.DB.prepare("SELECT value, expires_at FROM kv_fallback WHERE key = ?").bind(key).first();
+    if (!row) return null;
+    if (row.expires_at && row.expires_at < Date.now()) return null;
+    return row.value;
+  } catch (e) {
+    return null;
+  }
+}
+__name(kvFallbackGet, "kvFallbackGet");
+async function safeKVPut(env, key, value, opts) {
+  // KV write 한도 초과 등으로 실패해도 요청 전체가 죽지 않도록 방어 — 실패시 D1으로 페일오버, 그것도 실패하면 false
+  try {
+    await env.POSTS.put(key, value, opts);
+    return true;
+  } catch (e) {
+    console.log(`[KV write 실패, D1 폴백 시도] key=${key}: ${e.message}`);
+    return await kvFallbackPut(env, key, value, opts);
+  }
+}
+__name(safeKVPut, "safeKVPut");
+async function safeKVGet(env, key) {
+  // KV에서 못 찾으면(또는 KV 자체가 에러나면) D1 폴백 테이블도 확인 — write가 D1으로 넘어갔을 수 있으므로
+  try {
+    const v = await env.POSTS.get(key);
+    if (v !== null && v !== undefined) return v;
+  } catch (e) {
+    console.log(`[KV read 실패, D1 폴백 확인] key=${key}: ${e.message}`);
+  }
+  return await kvFallbackGet(env, key);
+}
+__name(safeKVGet, "safeKVGet");
+function checkAdminPassword(request, env) {
+  // ADMIN_PASS 시크릿과 대조 — 아이디는 무엇을 입력하든 무시하고 비밀번호만 확인
+  if (!env.ADMIN_PASS) return null; // 시크릿 미설정시(설정 전 과도기) 막지 않음 — 설정 후엔 항상 걸림
+  const authHeader = request.headers.get("Authorization") || "";
+  if (authHeader.startsWith("Basic ")) {
+    try {
+      const decoded = atob(authHeader.slice(6));
+      const pass = decoded.split(":").slice(1).join(":");
+      if (pass === env.ADMIN_PASS) return null;
+    } catch (e) {}
+  }
+  return new Response("인증 필요", {
+    status: 401,
+    headers: { "WWW-Authenticate": 'Basic realm="usb.kr admin"' }
+  });
+}
+__name(checkAdminPassword, "checkAdminPassword");
+function isLikelyBotUA(ua) {
+  const s = ua || "";
+  if (!s) return true; // UA 없는 요청은 대부분 스크립트/스캐너
+  return /bot|crawl|spider|slurp|curl\/|python-requests|Go-http-client|node-fetch|axios\/|okhttp|UptimeRobot|PostmanRuntime|HeadlessChrome|facebookexternalhit|Slackbot|Discordbot|TelegramBot|WhatsApp|AhrefsBot|SemrushBot|MJ12bot|DotBot|PetalBot|Yeti|Daumoa/i.test(s);
+}
+__name(isLikelyBotUA, "isLikelyBotUA");
+function detectBrowser(ua) {
+  const s = ua || "";
+  if (/Edg\//.test(s)) return "Edge";
+  if (/OPR\//.test(s)) return "Opera";
+  if (/(Whale)\//.test(s)) return "Whale";
+  if (/Chrome\//.test(s) && !/Chromium/.test(s)) return "Chrome";
+  if (/CriOS\//.test(s)) return "Chrome(iOS)";
+  if (/FxiOS\//.test(s)) return "Firefox(iOS)";
+  if (/Firefox\//.test(s)) return "Firefox";
+  if (/Safari\//.test(s) && !/Chrome/.test(s)) return "Safari";
+  if (/MSIE|Trident/.test(s)) return "IE";
+  // 알려진 봇/크롤러 식별 — "기타"로 뭉치지 않고 구체적으로 표시
+  const knownBots = [
+    ["Googlebot", /Googlebot/i], ["Bingbot", /bingbot/i], ["Yeti(네이버)", /Yeti/i],
+    ["Daumoa", /Daumoa/i], ["PetalBot", /PetalBot/i], ["AhrefsBot", /AhrefsBot/i],
+    ["SemrushBot", /SemrushBot/i], ["MJ12bot", /MJ12bot/i], ["DotBot", /DotBot/i],
+    ["facebookexternalhit", /facebookexternalhit/i], ["Slackbot", /Slackbot/i],
+    ["Discordbot", /Discordbot/i], ["TelegramBot", /TelegramBot/i], ["WhatsApp", /WhatsApp/i],
+    ["curl", /curl\//i], ["python-requests", /python-requests/i], ["Go-http-client", /Go-http-client/i],
+    ["node-fetch", /node-fetch/i], ["axios", /axios/i], ["okhttp", /okhttp/i],
+    ["UptimeRobot", /UptimeRobot/i], ["Postman", /PostmanRuntime/i], ["헤드리스크롬", /HeadlessChrome/i]
+  ];
+  for (const [label, re] of knownBots) if (re.test(s)) return label;
+  if (!s) return "기타:UA없음";
+  // 그 외엔 UA 첫 토큰(제품명)을 그대로 라벨로 사용해 구체적으로 표시
+  const firstToken = s.split(/[\s(]/)[0].slice(0, 24);
+  return `기타:${firstToken || "확인불가"}`;
+}
+__name(detectBrowser, "detectBrowser");
+function detectOS(ua) {
+  const s = ua || "";
+  if (/Windows/.test(s)) return "Windows";
+  if (/CrOS/.test(s)) return "ChromeOS";
+  if (/Android/.test(s)) return "Android";
+  if (/iPhone|iPad|iPod/.test(s)) return "iOS";
+  if (/Mac OS X/.test(s)) return "macOS";
+  if (/Ubuntu/.test(s)) return "Ubuntu";
+  if (/Linux/.test(s)) return "Linux";
+  const knownBots = [
+    ["Googlebot", /Googlebot/i], ["Bingbot", /bingbot/i], ["Yeti(네이버)", /Yeti/i],
+    ["봇/크롤러", /bot|crawl|spider/i]
+  ];
+  for (const [label, re] of knownBots) if (re.test(s)) return label;
+  if (!s) return "기타:UA없음";
+  const firstToken = s.split(/[\s(]/)[0].slice(0, 24);
+  return `기타:${firstToken || "확인불가"}`;
+}
+__name(detectOS, "detectOS");
+function getPrimaryLanguage(request) {
+  const al = request.headers.get("Accept-Language");
+  if (!al) return "unknown";
+  const first = al.split(",")[0].split(";")[0].trim();
+  return first || "unknown";
+}
+__name(getPrimaryLanguage, "getPrimaryLanguage");
+function getReferrerLabel(request) {
+  const ref = request.headers.get("Referer") || request.headers.get("Referrer");
+  if (!ref) return "direct";
+  try {
+    const h = new URL(ref).hostname.replace(/^www\./, "");
+    return h.includes("usb.kr") ? "internal" : h;
+  } catch (e) {
+    return "unknown";
+  }
+}
+__name(getReferrerLabel, "getReferrerLabel");
+function getPrevUrlNoQuery(request) {
+  // 방문 바로 이전 페이지의 전체 URL — 개인정보 유출 방지를 위해 쿼리스트링/해시는 잘라내고 origin+path까지만
+  const ref = request.headers.get("Referer") || request.headers.get("Referrer");
+  if (!ref) return "direct";
+  try {
+    const u = new URL(ref);
+    return `${u.origin}${u.pathname}`.slice(0, 200);
+  } catch (e) {
+    return "unknown";
+  }
+}
+__name(getPrevUrlNoQuery, "getPrevUrlNoQuery");
+var SEARCH_ENGINE_PARAMS = [
+  { hosts: ["google."], param: "q" },
+  { hosts: ["search.naver.com", "m.search.naver.com"], param: "query" },
+  { hosts: ["search.daum.net"], param: "q" },
+  { hosts: ["bing.com"], param: "q" },
+  { hosts: ["search.yahoo.com"], param: "p" },
+  { hosts: ["duckduckgo.com"], param: "q" }
+];
+function getSearchKeyword(request) {
+  // 검색엔진에서 유입된 경우, 그 검색어를 추출 (검색엔진이 보내주는 공개 쿼리파라미터일 뿐 개인정보 아님)
+  const ref = request.headers.get("Referer") || request.headers.get("Referrer");
+  if (!ref) return null;
+  try {
+    const u = new URL(ref);
+    const match = SEARCH_ENGINE_PARAMS.find((e) => e.hosts.some((h) => u.hostname.includes(h)));
+    if (!match) return null;
+    const kw = u.searchParams.get(match.param);
+    return kw ? kw.slice(0, 60) : null;
+  } catch (e) {
+    return null;
+  }
+}
+__name(getSearchKeyword, "getSearchKeyword");
+async function bumpDailyCounter(env, keyPrefix, dictField, dictKey, ttlSeconds = 400 * 24 * 60 * 60) {
+  // 방문통계 blob과 별도의 가벼운 카운터(404, 클릭수 등) — 메인 통계 쓰기와 경합(레이스컨디션) 안 나게 분리된 KV 키 사용
+  try {
+    const pad = (n) => String(n).padStart(2, "0");
+    const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+    const dayKey = `${keyPrefix}:${kst.getFullYear()}${pad(kst.getMonth() + 1)}${pad(kst.getDate())}`;
+    const raw = await env.POSTS.get(dayKey);
+    const data = raw ? JSON.parse(raw) : {};
+    data.count = (data.count || 0) + 1; // 총계와 세부항목을 같은 읽기/쓰기 사이클에서 함께 처리 (레이스컨디션 방지)
+    if (dictField) {
+      data[dictField] = data[dictField] || {};
+      bumpCounter(data[dictField], dictKey, 300);
+    }
+    await safeKVPut(env, dayKey, JSON.stringify(data), { expirationTtl: ttlSeconds });
+  } catch (e) {}
+}
+__name(bumpDailyCounter, "bumpDailyCounter");
+async function bumpLifetimeCounter(env, key, dictField, dictKey) {
+  // 만료 없이 영구 누적 — 글별 실제 클릭수, 유입경로별 클릭수 등 "누적 총계"가 필요한 지표용
+  try {
+    const raw = await env.POSTS.get(key);
+    const data = raw ? JSON.parse(raw) : {};
+    data.count = (data.count || 0) + 1;
+    if (dictField) {
+      data[dictField] = data[dictField] || {};
+      bumpCounter(data[dictField], dictKey, 3000);
+    }
+    await env.POSTS.put(key, JSON.stringify(data));
+  } catch (e) {}
+}
+__name(bumpLifetimeCounter, "bumpLifetimeCounter");
+async function bumpLifetimeCounterMulti(env, key, updates) {
+  // 여러 필드(예: bySlug, bySrc)를 한 번의 read+write로 함께 갱신 — 클릭 1번당 write 횟수를 줄이기 위함
+  try {
+    const raw = await env.POSTS.get(key);
+    const data = raw ? JSON.parse(raw) : {};
+    data.count = (data.count || 0) + 1;
+    for (const { dictField, dictKey } of updates) {
+      if (!dictField) continue;
+      data[dictField] = data[dictField] || {};
+      bumpCounter(data[dictField], dictKey, 3000);
+    }
+    await safeKVPut(env, key, JSON.stringify(data));
+  } catch (e) {}
+}
+__name(bumpLifetimeCounterMulti, "bumpLifetimeCounterMulti");
+async function getLifetimeClickData(env) {
+  try {
+    const raw = await env.POSTS.get("clicks:lifetime");
+    return raw ? JSON.parse(raw) : { count: 0, bySlug: {}, bySrc: {} };
+  } catch (e) {
+    return { count: 0, bySlug: {}, bySrc: {} };
+  }
+}
+__name(getLifetimeClickData, "getLifetimeClickData");
+function getRefSrcCookie(request) {
+  const cookie = request.headers.get("Cookie") || "";
+  const m = cookie.match(/(?:^|;\s*)refsrc=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : "direct";
+}
+__name(getRefSrcCookie, "getRefSrcCookie");
+async function handleOutboundClick(request, env, ctx) {
+  const url = new URL(request.url);
+  const dest = url.searchParams.get("u");
+  const slug = url.searchParams.get("s") || "unknown";
+  if (!dest) return new Response("Missing url", { status: 400 });
+  let parsed;
+  try {
+    parsed = new URL(dest);
+  } catch (e) {
+    return new Response("Invalid url", { status: 400 });
+  }
+  // 쿠팡 도메인으로만 리다이렉트 허용 (오픈리다이렉트 악용 방지)
+  const allowedSuffixes = [".coupang.com", "coupa.ng"];
+  if (parsed.protocol !== "https:" || !allowedSuffixes.some((suf) => parsed.hostname === suf.replace(/^\./, "") || parsed.hostname.endsWith(suf))) {
+    return new Response("Invalid destination", { status: 400 });
+  }
+  const isBot = isLikelyBotUA(request.headers.get("User-Agent"));
+  const cookie = request.headers.get("Cookie") || "";
+  const dedupeKey = `clk:${slug}`;
+  const alreadyClicked = new RegExp(`(?:^|;\\s*)${dedupeKey}=1(?:;|$)`).test(cookie);
+  const headers = { Location: dest };
+  if (!isBot && !alreadyClicked) {
+    ctx.waitUntil(bumpDailyCounter(env, "clicks", "bySlug", slug));
+    ctx.waitUntil(bumpLifetimeCounterMulti(env, "clicks:lifetime", [
+      { dictField: "bySlug", dictKey: slug },
+      { dictField: "bySrc", dictKey: getRefSrcCookie(request) }
+    ]));
+    headers["Set-Cookie"] = `${dedupeKey}=1; Max-Age=600; Path=/; SameSite=Lax`;
+  }
+  return new Response(null, { status: 302, headers });
+}
+__name(handleOutboundClick, "handleOutboundClick");
+function isOwnerRequest(request) {
+  const cookie = request.headers.get("Cookie") || "";
+  return /(^|;\s*)owner=1(;|$)/.test(cookie);
+}
+__name(isOwnerRequest, "isOwnerRequest");
+const SESSION_DEDUPE_SECONDS = 1800; // 30분 내 같은 브라우저 재방문은 카운트 안 함
+function hasVisitCookie(request) {
+  const cookie = request.headers.get("Cookie") || "";
+  return /(^|;\s*)vseen=1(;|$)/.test(cookie);
+}
+__name(hasVisitCookie, "hasVisitCookie");
+function visitCookiePairs(visitStats) {
+  if (!visitStats || !visitStats.setCookie) return [];
+  const pairs = [["Set-Cookie", `vseen=1; Max-Age=${SESSION_DEDUPE_SECONDS}; Path=/; SameSite=Lax`]];
+  if (visitStats.isNewVisitor) {
+    pairs.push(["Set-Cookie", "vfirst=1; Max-Age=31536000; Path=/; SameSite=Lax"]);
+  }
+  if (visitStats.referrerLabel) {
+    pairs.push(["Set-Cookie", `refsrc=${encodeURIComponent(visitStats.referrerLabel)}; Max-Age=${SESSION_DEDUPE_SECONDS}; Path=/; SameSite=Lax`]);
+  }
+  return pairs;
+}
+__name(visitCookiePairs, "visitCookiePairs");
+async function recordAndGetVisitStats(env, request) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const y = kst.getFullYear();
+  const mo = kst.getMonth();
+  const d = kst.getDate();
+  const hour = kst.getHours();
+  const todayKey = `visits:d:${y}${pad(mo + 1)}${pad(d)}`;
+
+  let today = blankDayStats();
+  try {
+    const raw = await env.POSTS.get(todayKey);
+    if (raw) today = Object.assign(blankDayStats(), JSON.parse(raw));
+  } catch (e) {}
+  today.hourly = today.hourly || new Array(24).fill(0);
+
+  const isOwner = request ? isOwnerRequest(request) : false;
+  const isDup = request ? hasVisitCookie(request) : false;
+  const isBot = request ? isLikelyBotUA(request.headers.get("User-Agent")) : false;
+  const hasVfirst = request ? /(^|;\s*)vfirst=1(;|$)/.test(request.headers.get("Cookie") || "") : false;
+  const isNewVisitor = !hasVfirst;
+  let referrerLabel = null;
+  if (!isOwner && !isDup && !isBot) {
+    today.count = (today.count || 0) + 1;
+    today.hourly[hour] = (today.hourly[hour] || 0) + 1;
+    if (isNewVisitor) today.newVisitors = (today.newVisitors || 0) + 1;
+    else today.returningVisitors = (today.returningVisitors || 0) + 1;
+
+    if (request) {
+      try {
+        const reqUrl = new URL(request.url);
+        const ua = request.headers.get("User-Agent");
+        const cf = request.cf || {};
+        bumpCounter(today.paths, reqUrl.pathname);
+        referrerLabel = getReferrerLabel(request);
+        bumpCounter(today.referrers, referrerLabel);
+        bumpCounter(today.prevUrls, getPrevUrlNoQuery(request));
+        const searchKw = getSearchKeyword(request);
+        if (searchKw) bumpCounter(today.searchKeywords, searchKw);
+        bumpCounter(today.countries, cf.country || "XX");
+        bumpCounter(today.devices, detectDevice(ua));
+        bumpCounter(today.cities, cf.city || (cf.country ? `${cf.country}(도시미상)` : "unknown"));
+        bumpCounter(today.regions, cf.region || cf.regionCode || (cf.country ? `${cf.country}(지역미상)` : "unknown"));
+        bumpCounter(today.timezones, cf.timezone || (cf.country ? `${cf.country}(TZ미상)` : "unknown"));
+        bumpCounter(today.isps, cf.asOrganization || (cf.asn ? `ASN ${cf.asn}` : "unknown"));
+        bumpCounter(today.browsers, detectBrowser(ua));
+        bumpCounter(today.oses, detectOS(ua));
+        bumpCounter(today.languages, getPrimaryLanguage(request));
+        const utmSource = reqUrl.searchParams.get("utm_source");
+        if (utmSource) bumpCounter(today.utmSources, utmSource);
+      } catch (e) {}
+    }
+
+    try {
+      await safeKVPut(env, todayKey, JSON.stringify(today), { expirationTtl: 400 * 24 * 60 * 60 });
+    } catch (e) {}
+  }
+
+  // 주간(최근 7일)/월간(이번달 1일~오늘) 합산 — 방문마다 매번 최대 30여개 키를 읽으면
+  // KV read 한도를 순식간에 소진하므로, 5분 캐시로 감싸서 재계산 빈도를 크게 줄임
+  const AGG_CACHE_TTL_MS = 5 * 60 * 1000;
+  const aggCacheKey = "visits:week-month-cache";
+  let weekTotal = null, monthTotal = null;
+  try {
+    const cachedRaw = await env.POSTS.get(aggCacheKey);
+    if (cachedRaw) {
+      const cached = JSON.parse(cachedRaw);
+      if (cached && typeof cached.computedAt === "number" && Date.now() - cached.computedAt < AGG_CACHE_TTL_MS) {
+        weekTotal = cached.week;
+        monthTotal = cached.month;
+      }
+    }
+  } catch (e) {}
+  if (weekTotal === null || monthTotal === null) {
+    const weekKeys = [];
+    for (let i = 1; i < 7; i++) {
+      const dd = new Date(kst);
+      dd.setDate(dd.getDate() - i);
+      weekKeys.push(`visits:d:${dd.getFullYear()}${pad(dd.getMonth() + 1)}${pad(dd.getDate())}`);
+    }
+    const monthKeys = [];
+    for (let dayNum = 1; dayNum <= d; dayNum++) {
+      monthKeys.push(`visits:d:${y}${pad(mo + 1)}${pad(dayNum)}`);
+    }
+    const [weekRaws, monthRaws] = await Promise.all([
+      Promise.all(weekKeys.map((k) => env.POSTS.get(k).catch(() => null))),
+      Promise.all(monthKeys.map((k) => env.POSTS.get(k).catch(() => null)))
+    ]);
+    weekTotal = today.count;
+    for (const raw of weekRaws) {
+      if (raw) {
+        try {
+          weekTotal += JSON.parse(raw).count || 0;
+        } catch (e) {}
+      }
+    }
+    monthTotal = 0;
+    for (const raw of monthRaws) {
+      if (raw) {
+        try {
+          monthTotal += JSON.parse(raw).count || 0;
+        } catch (e) {}
+      }
+    }
+    try {
+      await safeKVPut(env, aggCacheKey, JSON.stringify({ week: weekTotal, month: monthTotal, computedAt: Date.now() }), { expirationTtl: 3600 });
+    } catch (e) {}
+  }
+
+  return { hour: today.hourly[hour] || 0, day: today.count, week: weekTotal, month: monthTotal, setCookie: !isDup && !isOwner && !!request, isNewVisitor, referrerLabel };
+}
+__name(recordAndGetVisitStats, "recordAndGetVisitStats");
+async function recordSearchQuery(env, query) {
+  if (!query) return;
+  const pad = (n) => String(n).padStart(2, "0");
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const todayKey = `visits:d:${kst.getFullYear()}${pad(kst.getMonth() + 1)}${pad(kst.getDate())}`;
+  let today = blankDayStats();
+  try {
+    const raw = await env.POSTS.get(todayKey);
+    if (raw) today = Object.assign(blankDayStats(), JSON.parse(raw));
+  } catch (e) {}
+  bumpCounter(today.searches, query.slice(0, 60));
+  try {
+    await safeKVPut(env, todayKey, JSON.stringify(today), { expirationTtl: 400 * 24 * 60 * 60 });
+  } catch (e) {}
+}
+__name(recordSearchQuery, "recordSearchQuery");
+async function getVisitStatsOnly(env) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const y = kst.getFullYear();
+  const mo = kst.getMonth();
+  const d = kst.getDate();
+  const hour = kst.getHours();
+  const todayKey = `visits:d:${y}${pad(mo + 1)}${pad(d)}`;
+  let today = blankDayStats();
+  try {
+    const raw = await env.POSTS.get(todayKey);
+    if (raw) today = Object.assign(blankDayStats(), JSON.parse(raw));
+  } catch (e) {}
+  const weekKeys = [];
+  for (let i = 1; i < 7; i++) {
+    const dd = new Date(kst);
+    dd.setDate(dd.getDate() - i);
+    weekKeys.push(`visits:d:${dd.getFullYear()}${pad(dd.getMonth() + 1)}${pad(dd.getDate())}`);
+  }
+  const monthKeys = [];
+  for (let dayNum = 1; dayNum <= d; dayNum++) {
+    monthKeys.push(`visits:d:${y}${pad(mo + 1)}${pad(dayNum)}`);
+  }
+  const [weekRaws, monthRaws] = await Promise.all([
+    Promise.all(weekKeys.map((k) => env.POSTS.get(k).catch(() => null))),
+    Promise.all(monthKeys.map((k) => env.POSTS.get(k).catch(() => null)))
+  ]);
+  let weekTotal = today.count || 0;
+  for (const raw of weekRaws) {
+    if (raw) {
+      try {
+        weekTotal += JSON.parse(raw).count || 0;
+      } catch (e) {}
+    }
+  }
+  let monthTotal = 0;
+  for (const raw of monthRaws) {
+    if (raw) {
+      try {
+        monthTotal += JSON.parse(raw).count || 0;
+      } catch (e) {}
+    }
+  }
+  return { hour: (today.hourly && today.hourly[hour]) || 0, day: today.count || 0, week: weekTotal, month: monthTotal };
+}
+__name(getVisitStatsOnly, "getVisitStatsOnly");
+function topEntries(dict, n = 8) {
+  return Object.entries(dict || {}).sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+__name(topEntries, "topEntries");
+async function renderStatsPage(env) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const y = kst.getFullYear();
+  const mo = kst.getMonth();
+  const d = kst.getDate();
+  const hour = kst.getHours();
+  const todayKey = `visits:d:${y}${pad(mo + 1)}${pad(d)}`;
+
+  let today = blankDayStats();
+  try {
+    const raw = await env.POSTS.get(todayKey);
+    if (raw) today = Object.assign(blankDayStats(), JSON.parse(raw));
+  } catch (e) {}
+
+  const weekKeys = [];
+  for (let i = 1; i < 7; i++) {
+    const dd = new Date(kst);
+    dd.setDate(dd.getDate() - i);
+    weekKeys.push(`visits:d:${dd.getFullYear()}${pad(dd.getMonth() + 1)}${pad(dd.getDate())}`);
+  }
+  const monthKeys = [];
+  for (let dayNum = 1; dayNum <= d; dayNum++) {
+    monthKeys.push(`visits:d:${y}${pad(mo + 1)}${pad(dayNum)}`);
+  }
+  const [weekRaws, monthRaws] = await Promise.all([
+    Promise.all(weekKeys.map((k) => env.POSTS.get(k).catch(() => null))),
+    Promise.all(monthKeys.map((k) => env.POSTS.get(k).catch(() => null)))
+  ]);
+  let weekTotal = today.count || 0;
+  for (const raw of weekRaws) {
+    if (raw) {
+      try {
+        weekTotal += JSON.parse(raw).count || 0;
+      } catch (e) {}
+    }
+  }
+  let monthTotal = 0;
+  for (const raw of monthRaws) {
+    if (raw) {
+      try {
+        monthTotal += JSON.parse(raw).count || 0;
+      } catch (e) {}
+    }
+  }
+
+  const notfoundKey = `notfound:${y}${pad(mo + 1)}${pad(d)}`;
+  const clicksKey = `clicks:${y}${pad(mo + 1)}${pad(d)}`;
+  const [notfoundRaw, clicksRaw, lifetimeClicks] = await Promise.all([
+    env.POSTS.get(notfoundKey).catch(() => null),
+    env.POSTS.get(clicksKey).catch(() => null),
+    getLifetimeClickData(env)
+  ]);
+  const notfoundData = notfoundRaw ? JSON.parse(notfoundRaw) : {};
+  const clicksData = clicksRaw ? JSON.parse(clicksRaw) : {};
+  // slug만 있으면 어떤 글인지 알 수 없으므로, 상위 클릭 slug들의 실제 글 제목을 KV에서 조회해서 붙임
+  const clickTopEntries = topEntries(clicksData.bySlug || {}, 8);
+  const clickTitleDict = {};
+  await Promise.all(clickTopEntries.map(async ([slug, cnt]) => {
+    let label;
+    try {
+      const raw = await env.POSTS.get(`post:${slug}`);
+      const title = raw ? JSON.parse(raw).title : null;
+      const trimmed = title ? (title.length > 28 ? title.slice(0, 28) + "…" : title) : null;
+      label = trimmed ? `${trimmed} #${slug.slice(-6)}` : `(삭제된 글) #${slug.slice(-6)}`;
+    } catch (e) {
+      label = `(조회오류) #${slug.slice(-6)}`;
+    }
+    clickTitleDict[label] = cnt;
+  }));
+  // 유입경로별 실제 클릭수 → bySrc는 클릭 시점의 refsrc 쿠키(방문시 유입경로) 기준 누적
+  const srcCtr = {};
+  for (const [src, clicks] of Object.entries(lifetimeClicks.bySrc || {})) {
+    srcCtr[`${src} (누적클릭 ${clicks}건)`] = clicks;
+  }
+
+  const row = (label, val) => `<div style="display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border);"><span style="color:var(--muted);">${escapeHtml(label)}</span><b>${val}건</b></div>`;
+  const dimBlock = (title, dict) => {
+    const entries = topEntries(dict, 8);
+    if (!entries.length) return "";
+    const rows = entries.map(([k, v]) => row(k, v)).join("");
+    return `<div style="margin:24px 0;"><h3 style="font-size:15px;margin-bottom:4px;">${escapeHtml(title)}</h3>${rows}</div>`;
+  };
+
+  const body = `<div class="wrap" style="max-width:640px;margin:0 auto;padding:32px 20px;">
+    <h1 style="font-size:22px;margin-bottom:20px;">📊 방문자 통계</h1>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px;">
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">이 시간</div><div style="font-size:20px;font-weight:800;">${today.hourly[hour] || 0}</div></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">오늘</div><div style="font-size:20px;font-weight:800;">${today.count || 0}</div></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">이번주</div><div style="font-size:20px;font-weight:800;">${weekTotal}</div></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">이번달</div><div style="font-size:20px;font-weight:800;">${monthTotal}</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:10px;">
+      <div style="background:var(--accent);color:#fff;border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;opacity:0.9;">🛒 오늘 쿠팡 클릭수</div><div style="font-size:20px;font-weight:800;">${clicksData.count || 0}</div></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">⚠️ 오늘 404 발생</div><div style="font-size:20px;font-weight:800;">${notfoundData.count || 0}</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:24px;">
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">🆕 오늘 신규방문</div><div style="font-size:20px;font-weight:800;">${today.newVisitors || 0}</div></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;"><div style="font-size:11px;color:var(--muted);">🔁 오늘 재방문</div><div style="font-size:20px;font-weight:800;">${today.returningVisitors || 0}</div></div>
+    </div>
+    ${dimBlock("🔥 오늘 많이 본 페이지", today.paths)}
+    ${dimBlock("🔗 오늘 유입경로", today.referrers)}
+    ${dimBlock("💰 유입경로별 누적 클릭전환 (어떤 경로가 돈이 되는지)", srcCtr)}
+    ${dimBlock("🔎 오늘 검색유입 키워드", today.searchKeywords)}
+    ${dimBlock("🌏 오늘 국가", today.countries)}
+    ${dimBlock("📱 오늘 기기", today.devices)}
+    ${dimBlock("🔍 오늘 사이트 내 검색어", today.searches)}
+    ${dimBlock("🏙️ 오늘 도시", today.cities)}
+    ${dimBlock("📍 오늘 지역", today.regions)}
+    ${dimBlock("🕒 오늘 타임존", today.timezones)}
+    ${dimBlock("📡 오늘 통신사/ISP", today.isps)}
+    ${dimBlock("🧭 오늘 브라우저", today.browsers)}
+    ${dimBlock("💻 오늘 OS", today.oses)}
+    ${dimBlock("🈺 오늘 언어설정", today.languages)}
+    ${dimBlock("📣 오늘 UTM 유입", today.utmSources)}
+    ${dimBlock("🔗 오늘 직전 방문 URL", today.prevUrls)}
+    ${dimBlock("🛒 오늘 클릭된 상품글", clickTitleDict)}
+    ${dimBlock("⚠️ 오늘 404 페이지", notfoundData.paths || {})}
+  </div>`;
+  return new Response(page("방문자 통계", body, { noindex: true, showPrivacyNotice: false }), { headers: { "Content-Type": "text/html; charset=utf-8", "X-Robots-Tag": "noindex, nofollow" } });
+}
+__name(renderStatsPage, "renderStatsPage");
+async function getRandomItSearchWord(env) {
+  try {
+    const products = await getDanawaDailyProducts(env);
+    if (!products || !products.length) return null;
+    const pick = products[Math.floor(Math.random() * products.length)];
+    return pick.name.length > 22 ? pick.name.slice(0, 22).trim() : pick.name;
+  } catch (e) {
+    return null;
+  }
+}
+__name(getRandomItSearchWord, "getRandomItSearchWord");
+async function renderEntries(posts, env) {
+  const htmlList = await Promise.all(posts.map(async (p, i) => {
+    const firstProduct = p.products?.[0];
+    const excerpt = makeExcerpt(p.intro);
+    const dateStr = new Date(p.createdAt).toLocaleDateString("ko-KR", { timeZone: "Asia/Seoul", month: "long", day: "numeric" });
+    const imgAttrs = i === 0 ? 'loading="eager" fetchpriority="high" decoding="async"' : 'loading="lazy" decoding="async"';
+    const typeTag = p.type === "review" ? `<span class="mono" style="background:var(--amber);color:#3A2E2A;font-size:10px;padding:2px 8px;border-radius:100px;font-weight:700;margin-left:8px;">단일 리뷰</span>` : "";
+    const thumbSrc = firstProduct ? imgProxy(firstProduct.image, { removeBg: true }) : "";
+    const shapeHash = Math.abs([...p.slug].reduce((h, c) => h * 31 + c.charCodeAt(0), 7)); // slug 기반이라 새로고침해도 같은 카드는 같은 모양 유지
+    const shapeVariant = shapeHash % 5 + 1;
+    const colorVariant = Math.floor(shapeHash / 5) % 5 + 1;
+    const fontVariant = Math.floor(shapeHash / 25) % 3 + 1;
+    const thumbHash = Math.abs([...p.slug].reduce((h, c) => h * 17 + c.charCodeAt(0) + 3, 11));
+    const thumbDeco = thumbHash % 5 + 1;
+    const priceTag = firstProduct?.price ? `<div class="price-tag v${shapeVariant} c${colorVariant} f${fontVariant} mono">${Number(firstProduct.price).toLocaleString()}원</div>` : "";
+    return `<a class="entry" href="/${p.slug}">
+      ${firstProduct ? `<div class="entry-thumb d${thumbDeco}"><img src="${thumbSrc}" alt="${firstProduct.altText || p.title}" width="220" height="220" ${imgAttrs}>${priceTag}</div>` : ""}
+      <div class="entry-main">
+        <div style="display:flex;align-items:center;margin-bottom:10px;">
+          <div class="entry-eyebrow" style="margin-bottom:0;">${p.keyword}</div>${typeTag}
+        </div>
+        <h2 class="entry-title">${p.title}</h2>
+        ${excerpt ? `<p class="entry-excerpt">${excerpt}</p>` : ""}
+        <div class="entry-meta">${dateStr}</div>
+      </div>
+    </a>`;
+  }));
+  return htmlList.join("");
+}
+__name(renderEntries, "renderEntries");
+function renderCategoryNav(activeSlug) {
+  const pills = CATEGORIES.map((c) => {
+    const isActive = c.slug === activeSlug;
+    return `<a href="/category/${c.slug}" class="mono" style="display:inline-block;padding:6px 14px;border-radius:100px;font-size:12px;border:1px solid ${isActive ? "var(--accent)" : "var(--border)"};background:${isActive ? "var(--accent)" : "var(--surface)"};color:${isActive ? "#fff" : "var(--text)"};font-weight:${isActive ? "700" : "400"};white-space:nowrap;">${c.name}</a>`;
+  }).join("");
+  return `<div style="display:flex;gap:8px;overflow-x:auto;padding:4px 0 4px;margin-bottom:8px;">${pills}</div>`;
+}
+__name(renderCategoryNav, "renderCategoryNav");
+var HOME_PAGE_SIZE = 20;
+async function handleApiMorePosts(request, env) {
+  const url = new URL(request.url);
+  const offset = parseInt(url.searchParams.get("offset") || "0", 10);
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const pageSlugs = idx.slice(offset, offset + HOME_PAGE_SIZE);
+  const rawResults = await Promise.all(pageSlugs.map((slug) => env.POSTS.get(`post:${slug}`)));
+  const posts = rawResults.filter(Boolean).map((raw) => JSON.parse(raw));
+  const clickCounts = await getClickCounts(env, posts.map((p) => p.slug));
+  posts.forEach((p) => {
+    p.clickCount = clickCounts[p.slug] || 0;
+  });
+  const entries = await renderEntries(posts, env);
+  const hasMore = offset + HOME_PAGE_SIZE < idx.length;
+  return new Response(JSON.stringify({ html: entries, hasMore, nextOffset: offset + HOME_PAGE_SIZE }), {
+    headers: { "Content-Type": "application/json; charset=utf-8" }
+  });
+}
+__name(handleApiMorePosts, "handleApiMorePosts");
+function renderHeroCarousel(posts) {
+  if (!posts.length) return "";
+  const cards = posts.map((p, i) => {
+    const firstProduct = p.products?.[0];
+    if (!firstProduct) return "";
+    const thumbSrc = imgProxy(firstProduct.image, { removeBg: true });
+    const priceStr = firstProduct.price ? `${Number(firstProduct.price).toLocaleString()}원` : "";
+    return `<a class="hero-carousel-card" href="/${p.slug}" data-idx="${i}">
+      <div class="hero-carousel-tag mono">PICK ${String(i + 1).padStart(2, "0")}</div>
+      <div class="hero-carousel-imgbox"><img src="${thumbSrc}" alt="${firstProduct.altText || p.title}" width="180" height="180" loading="lazy" decoding="async"></div>
+      <div class="hero-carousel-info">
+        <div class="hero-carousel-title">${p.title}</div>
+        ${priceStr ? `<div class="hero-carousel-price mono">${priceStr}</div>` : ""}
+      </div>
+    </a>`;
+  }).filter(Boolean).join("");
+  if (!cards) return "";
+  // 무한 루프용: 마지막에 첫 카드 클론을 하나 추가 (사용자가 끝까지 스크롤하면 이걸 거쳐 첫 카드로 순간이동)
+  const firstProduct0 = posts[0].products?.[0];
+  const cloneCard = firstProduct0 ? `<a class="hero-carousel-card" href="/${posts[0].slug}" data-idx="0" data-clone="1" tabindex="-1" aria-hidden="true">
+      <div class="hero-carousel-tag mono">PICK 01</div>
+      <div class="hero-carousel-imgbox"><img src="${imgProxy(firstProduct0.image)}" alt="" width="180" height="180" loading="lazy" decoding="async"></div>
+      <div class="hero-carousel-info">
+        <div class="hero-carousel-title">${posts[0].title}</div>
+        ${firstProduct0.price ? `<div class="hero-carousel-price mono">${Number(firstProduct0.price).toLocaleString()}원</div>` : ""}
+      </div>
+    </a>` : "";
+  const dots = posts.map((_, i) => `<span class="hero-carousel-dot" data-dot="${i}"></span>`).join("");
+  return `<div class="hero-carousel-outer">
+    <div class="hero-carousel-wrap" id="heroCarouselWrap">
+      <div class="hero-carousel-track" id="heroCarouselTrack">${cards}${cloneCard}</div>
+    </div>
+    <div class="hero-carousel-dots" id="heroCarouselDots">${dots}</div>
+  </div>
+  <style>
+    .hero-carousel-outer{position:relative;padding:28px 0 8px;background:radial-gradient(ellipse at 50% 0%,rgba(255,75,62,0.07),transparent 70%);}
+    .hero-carousel-wrap{overflow-x:auto;overflow-y:hidden;padding:8px 0 20px;position:relative;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;}
+    .hero-carousel-wrap::-webkit-scrollbar{display:none;}
+    .hero-carousel-track{display:flex;gap:var(--hc-gap,16px);padding:0 24px;}
+    .hero-carousel-card{display:flex;flex-direction:column;align-items:center;text-align:center;gap:2px;background:rgba(236,237,230,0.55);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);border:1px solid var(--border);border-radius:16px;padding:var(--hc-pad-v,22px) var(--hc-pad-h,24px) 20px;text-decoration:none;color:var(--text);flex-shrink:0;width:var(--hc-card-w,300px);scroll-snap-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.05);position:relative;opacity:0.55;transform:scale(0.9);transition:opacity 0.4s ease,transform 0.4s ease,box-shadow 0.4s ease,background 0.4s ease;}
+    .hero-carousel-card.active{opacity:1;transform:scale(1.05);box-shadow:0 12px 32px rgba(0,0,0,0.09);border-color:var(--accent);z-index:1;}
+    .hero-carousel-tag{position:absolute;top:10px;left:10px;font-size:9px;letter-spacing:0.03em;color:var(--accent-text);font-weight:700;background:rgba(255,255,255,0.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);padding:3px 8px;border-radius:100px;border:1px solid rgba(255,122,133,0.35);}
+    .hero-carousel-card.active .hero-carousel-tag{background:rgba(255,198,92,0.4);color:#8a5a12;border-color:rgba(255,198,92,0.5);}
+    .hero-carousel-imgbox{width:var(--hc-img,150px);height:var(--hc-img,150px);display:flex;align-items:center;justify-content:center;margin:12px 0 10px;}
+    .hero-carousel-card img{max-width:100%;max-height:100%;object-fit:contain;}
+    .hero-carousel-info{width:100%;}
+    .hero-carousel-title{font-size:var(--hc-title-fs,15px);font-weight:700;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.35;min-height:2.7em;}
+    .hero-carousel-price{font-size:var(--hc-price-fs,18px);color:var(--amber-text,#b5750a);margin-top:6px;font-weight:800;}
+    .hero-carousel-dots{display:flex;justify-content:center;gap:7px;padding-bottom:4px;}
+    .hero-carousel-dot{width:6px;height:6px;border-radius:100px;background:var(--border);transition:all 0.35s ease;}
+    .hero-carousel-dot.active{width:20px;background:var(--accent);}
+  </style>
+  <script>
+  (function(){
+    var wrap = document.getElementById('heroCarouselWrap');
+    var track = document.getElementById('heroCarouselTrack');
+    var dotsWrap = document.getElementById('heroCarouselDots');
+    if (!wrap || !track) return;
+    var allEls = Array.prototype.slice.call(track.children);
+    var clone = allEls.filter(function(c){ return c.dataset.clone === '1'; })[0] || null;
+    var cards = allEls.filter(function(c){ return c.dataset.clone !== '1'; });
+    var dots = dotsWrap ? Array.prototype.slice.call(dotsWrap.children) : [];
+    if (cards.length < 2) return;
+    var n = cards.length;
+    var current = 0;
+    var userInteracting = false;
+    var resumeTimer = null;
+    var loopTimer = null;
+
+    var show3 = false;
+    function computeLayout(){
+      var w = wrap.clientWidth;
+      var gap = w < 420 ? 10 : 16;
+      show3 = n >= 3;
+      // 화면 폭을 항상 정확히 3등분 (모바일 포함) — 클램프 없이 꽉 채워서 3개만 보이게
+      var cardW = show3 ? Math.max(92, Math.floor((w - gap * 2) / 3)) : Math.min(300, w - 48);
+      track.style.setProperty('--hc-card-w', cardW + 'px');
+      track.style.setProperty('--hc-gap', gap + 'px');
+      // 카드가 좁아질수록 이미지/여백/폰트도 같이 축소
+      track.style.setProperty('--hc-img', Math.max(56, Math.round(cardW * 0.62)) + 'px');
+      track.style.setProperty('--hc-pad-h', Math.max(8, Math.round(cardW * 0.08)) + 'px');
+      track.style.setProperty('--hc-pad-v', Math.max(10, Math.round(cardW * 0.07)) + 'px');
+      track.style.setProperty('--hc-title-fs', Math.max(11, Math.min(15, Math.round(cardW * 0.075))) + 'px');
+      track.style.setProperty('--hc-price-fs', Math.max(12, Math.min(18, Math.round(cardW * 0.09))) + 'px');
+      var pad = Math.max(10, (w - cardW) / 2);
+      track.style.paddingLeft = pad + 'px';
+      track.style.paddingRight = pad + 'px';
+    }
+    function scrollToCard(el, behavior){
+      var target = el.offsetLeft - (wrap.clientWidth - el.offsetWidth) / 2;
+      target = Math.max(0, Math.min(target, wrap.scrollWidth - wrap.clientWidth));
+      wrap.scrollTo({ left: target, behavior: behavior || 'smooth' });
+    }
+    function setActive(i){
+      current = (i + n) % n;
+      cards.forEach(function(c, idx){ c.classList.toggle('active', idx === current); });
+      dots.forEach(function(d, idx){ d.classList.toggle('active', idx === current); });
+    }
+    function goTo(i, behavior){
+      setActive(i);
+      scrollToCard(cards[current], behavior);
+    }
+    function scheduleNext(){
+      clearInterval(window.__heroCarouselInterval);
+      window.__heroCarouselInterval = setInterval(function(){
+        if (!userInteracting) goTo(current + 1);
+      }, 5000);
+    }
+    function onUserInteract(){
+      userInteracting = true;
+      clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(function(){ userInteracting = false; }, 4000);
+    }
+    wrap.addEventListener('touchstart', onUserInteract, { passive: true });
+    wrap.addEventListener('mousedown', onUserInteract);
+    wrap.addEventListener('wheel', onUserInteract, { passive: true });
+    dots.forEach(function(d, idx){ d.addEventListener('click', function(){ onUserInteract(); goTo(idx); }); });
+
+    function updateActiveByPosition(){
+      var wrapRect = wrap.getBoundingClientRect();
+      var centerX = wrapRect.left + wrapRect.width / 2;
+      var closestIdx = current;
+      var closestDist = Infinity;
+      cards.forEach(function(c, idx){
+        var r = c.getBoundingClientRect();
+        var dist = Math.abs((r.left + r.width / 2) - centerX);
+        if (dist < closestDist) { closestDist = dist; closestIdx = idx; }
+      });
+      setActive(closestIdx);
+    }
+    var scrollRaf = null;
+    wrap.addEventListener('scroll', function(){
+      if (scrollRaf) return;
+      scrollRaf = requestAnimationFrame(function(){
+        scrollRaf = null;
+        updateActiveByPosition();
+      });
+    }, { passive: true });
+
+    // 클론 카드(첫 카드 복제, 맨 끝에 위치)에 도달하면 잠깐 뒤 첫 카드로 순간이동 → 무한 루프처럼 보임
+    if (clone) {
+      var cloneIO = new IntersectionObserver(function(entries){
+        entries.forEach(function(entry){
+          if (entry.isIntersecting && entry.intersectionRatio > 0.6) {
+            clone.classList.add('active');
+            clearTimeout(loopTimer);
+            loopTimer = setTimeout(function(){
+              goTo(0, 'auto');
+            }, 450);
+          }
+        });
+      }, { root: wrap, threshold: [0.6] });
+      cloneIO.observe(clone);
+    }
+
+    computeLayout();
+    var resizeTimer = null;
+    var lastWidth = wrap.clientWidth;
+    window.addEventListener('resize', function(){
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function(){
+        var w = wrap.clientWidth;
+        if (w === lastWidth) return; // 세로 높이만 바뀐 경우(모바일 주소창 접힘 등)는 무시
+        lastWidth = w;
+        computeLayout();
+        goTo(current, 'auto');
+      }, 150);
+    });
+
+    var startIdx = show3 ? 1 : 0;
+    setActive(startIdx);
+    scrollToCard(cards[startIdx], 'auto');
+    scheduleNext();
+  })();
+  </script>`;
+}
+__name(renderHeroCarousel, "renderHeroCarousel");
+function buildTopBannerHtml(candidatePosts) {
+  const bannerPool = (candidatePosts || []).filter((p) => p.products?.[0]?.image && p.products?.[0]?.price);
+  if (!bannerPool.length) return "";
+  const bannerPost = bannerPool[Math.floor(Math.random() * bannerPool.length)];
+  const bp = bannerPost.products[0];
+  return `<div class="top-banner"><a href="/${bannerPost.slug}" class="top-banner-inner">
+      <img class="top-banner-bg" src="${imgProxy(bp.image)}" alt="" aria-hidden="true" loading="eager">
+      <div class="top-banner-scrim"></div>
+      <img class="top-banner-fg" src="${imgProxy(bp.image, { removeBg: true })}" alt="${bp.altText || bannerPost.title}" loading="eager">
+      <div class="top-banner-info">
+        <div class="top-banner-eyebrow">✦ 오늘의 추천템</div>
+        <div class="top-banner-title">${bannerPost.title}</div>
+        <div class="price-tag">${Number(bp.price).toLocaleString()}원</div>
+      </div>
+    </a></div>`;
+}
+__name(buildTopBannerHtml, "buildTopBannerHtml");
+async function renderHomePage(env, request) {
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const mainSlugs = idx.slice(0, HOME_PAGE_SIZE);
+  const mainRaws = await Promise.all(mainSlugs.map((slug) => env.POSTS.get(`post:${slug}`)));
+  const posts = mainRaws.filter(Boolean).map((raw) => JSON.parse(raw));
+  const clickCounts = await getClickCounts(env, posts.map((p) => p.slug));
+  posts.forEach((p) => {
+    p.clickCount = clickCounts[p.slug] || 0;
+  });
+  const entries = await renderEntries(posts, env);
+  const hasMoreInitially = idx.length > HOME_PAGE_SIZE;
+
+  // 히어로 캐러셀용: 현재 화면 리스트(상위 20개)에 없는 글 중 랜덤 9개
+  const remainingSlugs = idx.slice(HOME_PAGE_SIZE);
+  const shuffledRemaining = remainingSlugs.sort(() => Math.random() - 0.5).slice(0, 9);
+  const carouselRaws = await Promise.all(shuffledRemaining.map((slug) => env.POSTS.get(`post:${slug}`)));
+  const carouselPosts = carouselRaws.filter(Boolean).map((raw) => JSON.parse(raw));
+  const heroCarousel = renderHeroCarousel(carouselPosts);
+  const [searchWord, visitStats] = await Promise.all([getRandomItSearchWord(env), recordAndGetVisitStats(env, request)]);
+  const bannerPool = posts.filter((p) => p.products?.[0]?.image && p.products?.[0]?.price);
+  const topBanner = buildTopBannerHtml(bannerPool);
+  const body = `${topBanner}${siteHeader(false, searchWord)}
+    <div class="hero"><div class="wrap">
+      ${heroCarousel}
+    </div></div>
+    <div class="wrap" style="padding-top:20px;">${renderCategoryNav(null)}</div>
+    <div class="wrap">
+      <div class="index" id="postIndex">${entries || '<p style="color:var(--muted)">아직 글이 없습니다.</p>'}</div>
+      <div id="infiniteScrollSentinel" style="height:1px;"></div>
+      <div id="infiniteScrollLoading" style="display:none;text-align:center;padding:20px;color:var(--muted);font-size:13px;">불러오는 중…</div>
+    </div>
+    <footer><div class="wrap">usb.kr — 전자기기 스펙과 가격을 비교합니다. · <a href="/privacy" style="text-decoration:underline;">개인정보처리방침</a></div></footer>
+    <script>
+    (function(){
+      var offset = ${HOME_PAGE_SIZE};
+      var hasMore = ${hasMoreInitially ? "true" : "false"};
+      var loading = false;
+      var listEl = document.getElementById('postIndex');
+      var loadingEl = document.getElementById('infiniteScrollLoading');
+      var sentinel = document.getElementById('infiniteScrollSentinel');
+      if (!hasMore || !sentinel) return;
+      async function loadMore(){
+        if (loading || !hasMore) return;
+        loading = true;
+        loadingEl.style.display = 'block';
+        try {
+          var res = await fetch('/api/posts?offset=' + offset);
+          var data = await res.json();
+          if (data.html) {
+            listEl.insertAdjacentHTML('beforeend', data.html);
+            if (window.__usbkrAnimateIn) window.__usbkrAnimateIn(listEl);
+          }
+          offset = data.nextOffset;
+          hasMore = data.hasMore;
+        } catch(e) {
+          hasMore = false;
+        }
+        loading = false;
+        loadingEl.style.display = 'none';
+        if (!hasMore && observer) observer.disconnect();
+      }
+      var observer = new IntersectionObserver(function(entries){
+        entries.forEach(function(entry){
+          if (entry.isIntersecting) loadMore();
+        });
+      }, { rootMargin: '400px' });
+      observer.observe(sentinel);
+    })();
+    </script>`;
+  return new Response(page("usb.kr - 전자기기 비교 가이드", body, {
+    description: "실시간 쿠팡 가격 데이터를 기반으로, 광고 없이 스펙과 가격만 놓고 전자기기를 비교합니다.",
+    canonicalUrl: "https://usb.kr/"
+  }), {
+    headers: [["Content-Type", "text/html; charset=utf-8"], ...visitCookiePairs(visitStats)]
+  });
+}
+__name(renderHomePage, "renderHomePage");
+async function renderCategoryPage(env, slug, request, ctx) {
+  const category = getCategoryBySlug(slug);
+  if (!category) {
+    if (ctx?.waitUntil && !isLikelyBotUA(request?.headers.get("User-Agent"))) ctx.waitUntil(bumpDailyCounter(env, "notfound", "paths", `/category/${slug}`));
+    return new Response(null, { status: 302, headers: { Location: "/" } });
+  }
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const idxSlice = idx.slice(0, 200);
+  const rawPosts = await Promise.all(idxSlice.map((s) => env.POSTS.get(`post:${s}`)));
+  const posts = [];
+  for (const raw of rawPosts) {
+    if (!raw) continue;
+    const p = JSON.parse(raw);
+    if (category.keywords.includes(p.keyword)) posts.push(p);
+    if (posts.length >= 30) break;
+  }
+  const clickCounts = await getClickCounts(env, posts.map((p) => p.slug));
+  posts.forEach((p) => {
+    p.clickCount = clickCounts[p.slug] || 0;
+  });
+  const entries = await renderEntries(posts, env);
+  const [searchWord, visitStats] = await Promise.all([getRandomItSearchWord(env), recordAndGetVisitStats(env, request)]);
+  const body = `${siteHeader(false, searchWord)}
+    <div class="hero"><div class="wrap">
+      <span class="eyebrow">Category</span>
+      <h1>${category.name}</h1>
+      <p class="sub">${category.name} 카테고리에서 비교/리뷰한 글 모음입니다.</p>
+      <div class="meta-line"><b>${posts.length}</b>건</div>
+    </div></div>
+    <div class="wrap" style="padding-top:20px;">${renderCategoryNav(category.slug)}</div>
+    <div class="wrap"><div class="index">${entries || '<p style="color:var(--muted)">아직 이 카테고리에 글이 없습니다.</p>'}</div></div>
+    <footer><div class="wrap">usb.kr — 전자기기 스펙과 가격을 비교합니다. · <a href="/privacy" style="text-decoration:underline;">개인정보처리방침</a></div></footer>`;
+  return new Response(page(`${category.name} - usb.kr`, body, {
+    description: `${category.name} 카테고리 전자기기 비교/리뷰 모음`,
+    canonicalUrl: `https://usb.kr/category/${category.slug}`
+  }), {
+    headers: [["Content-Type", "text/html; charset=utf-8"], ...visitCookiePairs(visitStats)]
+  });
+}
+__name(renderCategoryPage, "renderCategoryPage");
+function detectDeviceType(userAgent) {
+  const ua = (userAgent || "").toLowerCase();
+  if (/ipad|tablet|(android(?!.*mobile))/.test(ua)) return "tablet";
+  if (/mobile|iphone|android|blackberry|windows phone/.test(ua)) return "mobile";
+  return "desktop";
+}
+__name(detectDeviceType, "detectDeviceType");
+async function recordVisit(env, slug, request) {
+  if (isLikelyBotUA(request.headers.get("User-Agent"))) return; // 봇/크롤러는 조회수에 안 잡히게
+  const existing = await env.DB.prepare("SELECT count, referrers FROM visits WHERE slug = ?").bind(slug).first();
+  let count = existing ? existing.count : 0;
+  let referrers = [];
+  if (existing) {
+    try {
+      referrers = JSON.parse(existing.referrers || "[]");
+    } catch (e) {
+      referrers = [];
+    }
+  }
+  count += 1;
+  const referrer = request.headers.get("Referer") || "direct";
+  referrers.unshift(referrer);
+  referrers = referrers.slice(0, 20);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO visits (slug, count, last_visited_at, referrers) VALUES (?, ?, ?, ?) ON CONFLICT(slug) DO UPDATE SET count = excluded.count, last_visited_at = excluded.last_visited_at, referrers = excluded.referrers"
+  ).bind(slug, count, now, JSON.stringify(referrers)).run();
+  const country = request.headers.get("CF-IPCountry") || request.cf?.country || "unknown";
+  const userAgent = request.headers.get("User-Agent") || "unknown";
+  const language = (request.headers.get("Accept-Language") || "unknown").split(",")[0].trim();
+  const deviceType = detectDeviceType(userAgent);
+  await env.DB.prepare(
+    "INSERT INTO visit_log (slug, visited_at, referrer, country, user_agent, language, device_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).bind(slug, now, referrer, country, userAgent, language, deviceType).run();
+  return count;
+}
+__name(recordVisit, "recordVisit");
+async function getClickCounts(env, slugs) {
+  if (!slugs.length) return {};
+  const placeholders = slugs.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(`SELECT slug, count FROM visits WHERE slug IN (${placeholders})`).bind(...slugs).all();
+  const map = {};
+  for (const row of results) map[row.slug] = row.count;
+  return map;
+}
+__name(getClickCounts, "getClickCounts");
+async function renderPostPage(env, slug, request, ctx) {
+  const raw = await safeKVGet(env, `post:${slug}`);
+  if (!raw) {
+    if (ctx?.waitUntil && !isLikelyBotUA(request?.headers.get("User-Agent"))) ctx.waitUntil(bumpDailyCounter(env, "notfound", "paths", `/${slug}`));
+    return new Response(null, { status: 302, headers: { Location: "/" } });
+  }
+  const p = JSON.parse(raw);
+  const isPreview = new URL(request.url).searchParams.get("preview") === "1";
+  if (!isPreview) {
+    // DB 읽기+쓰기라 페이지 응답을 기다리게 하지 않고 백그라운드로 넘김 (로딩속도에 영향 없게)
+    const visitPromise = recordVisit(env, slug, request);
+    if (ctx?.waitUntil) ctx.waitUntil(visitPromise);
+    else await visitPromise;
+  }
+  const products = p.products || [];
+  const productGroups = [];
+  for (let i = 0; i < products.length; i += 2) {
+    productGroups.push(products.slice(i, i + 2));
+  }
+  const productGroupHtml = /* @__PURE__ */ __name(async (group) => {
+    const blocks = await Promise.all(group.map(async (prod) => `<div class="product-block">
+      <div class="thumb"><img class="thumb-bg" src="${imgProxy(prod.image)}" alt="" aria-hidden="true" loading="lazy"><img class="thumb-fg" src="${imgProxy(prod.image, { removeBg: true })}" alt="${prod.altText || prod.name}" loading="lazy" decoding="async"></div>
+      <div class="pb-scrim"></div>
+      <div class="pb-info">
+        <h3 style="font-size:16px;margin-bottom:6px;">${prod.name}</h3>
+        <div class="price-tag mono" style="margin-bottom:12px;">${Number(prod.price).toLocaleString()}원</div>
+        <a class="cta" href="/out?u=${encodeURIComponent(prod.affiliateUrl)}&s=${encodeURIComponent(p.slug)}" target="_blank" rel="nofollow sponsored">상품보기</a>
+      </div>
+    </div>`));
+    return blocks.join("");
+  }, "productGroupHtml");
+  const productGroupHtmlList = await Promise.all(productGroups.map((g) => productGroupHtml(g)));
+  const introParas = splitParagraphs(p.intro);
+  const sectionSegments = [];
+  (p.sections || []).forEach((s) => {
+    const paras = splitParagraphs(s.body_html);
+    if (paras.length) {
+      sectionSegments.push(`<h2>${s.heading}</h2>${paras[0]}`);
+      for (let i = 1; i < paras.length; i++) sectionSegments.push(paras[i]);
+    } else {
+      sectionSegments.push(`<h2>${s.heading}</h2>`);
+    }
+  });
+  const allSegments = [...introParas, ...sectionSegments];
+  const totalSegments = allSegments.length;
+  const totalGroups = productGroups.length;
+  const insertPoints = [];
+  const usedPoints = /* @__PURE__ */ new Set();
+  if (totalGroups > 0 && totalSegments > 0) {
+    for (let g = 0; g < totalGroups; g++) {
+      let target = Math.round((g + 1) * totalSegments / (totalGroups + 1));
+      target = Math.max(1, Math.min(totalSegments, target));
+      while (usedPoints.has(target) && target < totalSegments) target++;
+      usedPoints.add(target);
+      insertPoints.push(target);
+    }
+  }
+  let groupPtr = 0;
+  let flowHtml = "";
+  allSegments.forEach((seg, idx) => {
+    flowHtml += seg;
+    while (groupPtr < totalGroups && insertPoints[groupPtr] === idx + 1) {
+      flowHtml += `<div class="product-pair">${productGroupHtmlList[groupPtr]}</div>`;
+      groupPtr++;
+    }
+  });
+  while (groupPtr < totalGroups) {
+    flowHtml += `<div class="product-pair">${productGroupHtmlList[groupPtr]}</div>`;
+    groupPtr++;
+  }
+  const videoBlocks = [];
+  if (p.videoTextToVideo) videoBlocks.push(`<video controls autoplay muted playsinline loop preload="auto" style="width:100%;border-radius:10px;background:#000;" src="/video/${p.videoTextToVideo}"></video>`);
+  if (p.videoImageToVideo) videoBlocks.push(`<video controls autoplay muted playsinline loop preload="auto" style="width:100%;border-radius:10px;background:#000;" src="/video/${p.videoImageToVideo}"></video>`);
+  if (!videoBlocks.length && p.type === "review" && p.products?.[0]?.image) {
+    const heroImg = p.products[0];
+    const kbClass = "kb" + (Math.floor(Math.random() * 4) + 1);
+    videoBlocks.push(`<div class="kenburns-wrap" style="aspect-ratio:16/9;"><img class="${kbClass}" src="${imgProxy(heroImg.image)}" alt="${heroImg.altText || heroImg.name}"></div>`);
+  }
+  const videoSection = videoBlocks.length ? `<div style="display:grid;grid-template-columns:repeat(${videoBlocks.length}, 1fr);gap:16px;margin:24px 0;">${videoBlocks.join("")}</div>` : "";
+  const [searchWord, visitStats] = await Promise.all([getRandomItSearchWord(env), isPreview ? getVisitStatsOnly(env) : recordAndGetVisitStats(env, request)]);
+  const idxForBanner = JSON.parse(await env.POSTS.get("index") || "[]").filter((s) => s !== slug);
+  const bannerSlugs = idxForBanner.sort(() => Math.random() - 0.5).slice(0, 6);
+  const bannerRaws = await Promise.all(bannerSlugs.map((s) => env.POSTS.get(`post:${s}`)));
+  const bannerPool = bannerRaws.filter(Boolean).map((raw) => JSON.parse(raw));
+  const topBanner = buildTopBannerHtml(bannerPool);
+  const tldrBlock = p.tldr ? `<div class="tldr-box"><span class="tldr-label">✦ 한줄요약</span><p>${p.tldr}</p></div>` : "";
+  const faqBlock = (p.faq && p.faq.length) ? `<div class="faq-section">
+      <h2>자주 묻는 질문</h2>
+      ${p.faq.map((f) => `<details class="faq-item"><summary>${f.q}</summary><p>${f.a}</p></details>`).join("")}
+    </div>` : "";
+  const body = `${topBanner}${siteHeader(true, searchWord)}
+    <div class="wrap post-body">
+      <h1>${p.title}</h1>
+      <div class="meta">${p.keyword} · ${new Date(p.createdAt).toLocaleDateString("ko-KR", { timeZone: "Asia/Seoul" })}</div>
+      ${tldrBlock}
+      ${videoSection}
+      ${flowHtml}
+      ${p.outro}
+      <div style="display:flex;gap:12px;align-items:flex-start;background:#FFFBEB;border:1.5px solid var(--amber);border-radius:10px;padding:16px 18px;margin:32px 0 0;">
+        <span style="font-size:22px;line-height:1;">⚠️</span>
+        <p style="margin:0;font-size:15px;line-height:1.6;color:#7C2D12;font-weight:500;">
+          이 글은 AI가 자동 생성한 참고용 콘텐츠입니다. 스펙·가격 등 일부 정보가 실제와 다를 수 있으니, <strong>구매 전 반드시 판매 페이지에서 정확한 정보를 직접 확인해주세요.</strong>
+        </p>
+      </div>
+      ${faqBlock}
+    </div>
+<footer><div class="wrap">usb.kr — 쿠팡 파트너스 활동을 통해 일정액의 수수료를 제공받을 수 있습니다. · <a href="/privacy" style="text-decoration:underline;">개인정보처리방침</a></div></footer>`;
+  const postExcerpt = p.metaDescription || makeExcerpt(p.intro, 150) || `${p.keyword} 비교 가이드`;
+  const ogImage = p.products?.[0]?.image ? `https://usb.kr${imgProxy(p.products[0].image)}` : "";
+  return new Response(page(`${p.title} - usb.kr`, body, {
+    description: postExcerpt,
+    canonicalUrl: `https://usb.kr/${p.slug}`,
+    ogImage,
+    jsonLd: await buildJsonLd(p, env)
+  }), {
+    headers: [["Content-Type", "text/html; charset=utf-8"], ...visitCookiePairs(visitStats)]
+  });
+}
+__name(renderPostPage, "renderPostPage");
+function makeExcerpt(html, maxLen = 130) {
+  const text = (html || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return text.length > maxLen ? text.slice(0, maxLen).trim() + "…" : text;
+}
+__name(makeExcerpt, "makeExcerpt");
+function splitParagraphs(html) {
+  if (!html) return [];
+  const matches = html.match(/<p[^>]*>[\s\S]*?<\/p>/gi);
+  return matches && matches.length ? matches : [html];
+}
+__name(splitParagraphs, "splitParagraphs");
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+__name(escapeHtml, "escapeHtml");
+async function renderAdminPage(env, url) {
+  const idxRaw = await env.POSTS.get("index");
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const msg = url?.searchParams.get("msg");
+  // Danawa 제품은 매일 새로 갱신되므로 활성/대기 구분 없음
+  const priorityQueue = await getPriorityKeywords(env);
+  let kvFallbackCount = 0;
+  try {
+    const cnt = env.DB ? await env.DB.prepare("SELECT COUNT(*) as c FROM kv_fallback").first() : null;
+    kvFallbackCount = cnt?.c || 0;
+  } catch (e) {}
+  const kvFallbackBlock = kvFallbackCount > 0 ? `<div class="admin-card alert">
+    <div class="mono" style="font-size:13px;color:#c0392b;">⚠️ KV 한도 초과로 D1에 임시 저장된 항목 ${kvFallbackCount}건 대기중 — 5분마다 자동으로 KV 복구 시도됨</div>
+  </div>` : "";
+  let brokenLinks = [];
+  try {
+    if (env.DB) {
+      const res = await env.DB.prepare("SELECT slug, product_name, url, status_code, fail_count FROM broken_links WHERE fail_count >= ? ORDER BY checked_at DESC LIMIT 20").bind(LINK_CHECK_FAIL_THRESHOLD).all();
+      brokenLinks = res.results || [];
+    }
+  } catch (e) {}
+  const brokenLinksBlock = brokenLinks.length ? `<div class="admin-card alert">
+    <details><summary class="mono title" style="cursor:pointer;">🔗 끊긴 쿠팡 링크 감지 ${brokenLinks.length}건 (연속 ${LINK_CHECK_FAIL_THRESHOLD}회 이상 실패, 5분마다 순환 점검)</summary>
+    <div style="margin-top:10px;">${brokenLinks.map((b) => `<div class="mono" style="font-size:12px;color:#c0392b;padding:4px 0;"><a href="/${escapeHtml(b.slug)}" target="_blank" style="color:#c0392b;text-decoration:underline;">${escapeHtml(b.product_name || b.slug)}</a> — 상태코드 ${b.status_code || "네트워크오류"} (연속 ${b.fail_count}회 실패)</div>`).join("")}</div>
+    </details>
+  </div>` : "";
+  const priorityRows = priorityQueue.map((kw, i) => `<div class="mono pkw-badge" style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--accent);color:#fff;border-radius:100px;font-size:12px;font-weight:700;transition:transform .15s,box-shadow .15s;">${i + 1}. <span class="pkw-text">${escapeHtml(kw)}</span><button type="button" class="pkw-remove" data-kw="${escapeHtml(kw)}" title="예약 취소" style="background:none;border:none;color:#fff;cursor:pointer;font-weight:700;padding:0;font-size:13px;">✕</button></div>`).join("");
+  const priorityBlock = `<div class="admin-card">
+    <div class="admin-card-head"><div class="title">📌 다음 게시물 예약 키워드</div><div class="mono" style="font-size:11px;color:var(--muted);">순서대로 소진 · 실패시 자동 스킵 · 길게 누르면 1순위로</div></div>
+    <form id="pkw-add-form" style="display:flex;gap:8px;margin-bottom:12px;"><input type="text" id="pkw-input" name="priorityKeyword" placeholder="예약할 키워드 입력" maxlength="50" class="mono" style="padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;flex:1;max-width:280px;"><button type="submit">예약 추가</button></form>
+    <div id="pkw-list" style="display:flex;flex-wrap:wrap;gap:8px;">${priorityRows}</div>
+    <div id="pkw-empty" class="mono" style="color:var(--muted);font-size:12px;${priorityRows ? "display:none;" : ""}">예약된 키워드 없음</div>
+    <script>
+    (function(){
+      var list = document.getElementById('pkw-list');
+      var empty = document.getElementById('pkw-empty');
+      function renumber(){
+        var badges = list.querySelectorAll('.pkw-badge');
+        badges.forEach(function(b, i){
+          var firstNode = b.childNodes[0];
+          if (firstNode && firstNode.nodeType === 3) firstNode.textContent = (i+1) + '. ';
+        });
+        empty.style.display = badges.length ? 'none' : '';
+      }
+      function makeBadge(kw){
+        var div = document.createElement('div');
+        div.className = 'mono pkw-badge';
+        div.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--accent);color:#fff;border-radius:100px;font-size:12px;font-weight:700;transition:transform .15s,box-shadow .15s;';
+        div.appendChild(document.createTextNode('. '));
+        var span = document.createElement('span');
+        span.className = 'pkw-text';
+        span.textContent = kw;
+        div.appendChild(span);
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'pkw-remove'; btn.dataset.kw = kw; btn.title = '예약 취소';
+        btn.style.cssText = 'background:none;border:none;color:#fff;cursor:pointer;font-weight:700;padding:0;font-size:13px;';
+        btn.textContent = '✕';
+        div.appendChild(btn);
+        return div;
+      }
+      document.getElementById('pkw-add-form').addEventListener('submit', function(e){
+        e.preventDefault();
+        var input = document.getElementById('pkw-input');
+        var kw = input.value.trim();
+        if (!kw) return;
+        var fd = new FormData(); fd.append('priorityKeyword', kw);
+        fetch('/admin/priority-keyword/add', { method: 'POST', body: fd }).then(function(r){
+          if (r.ok) { list.appendChild(makeBadge(kw)); input.value=''; renumber(); }
+        });
+      });
+      list.addEventListener('click', function(e){
+        var btn = e.target.closest('.pkw-remove');
+        if (!btn) return;
+        var kw = btn.dataset.kw;
+        var fd = new FormData(); fd.append('priorityKeyword', kw);
+        fetch('/admin/priority-keyword/remove', { method: 'POST', body: fd }).then(function(r){
+          if (r.ok) { btn.closest('.pkw-badge').remove(); renumber(); }
+        });
+      });
+      // 롱프레스(마우스 오래누름 / 터치 오래누름)로 1순위 승격 — 맨 앞으로 부드럽게 이동 + 골드 펄스
+      var pressTimer = null;
+      function startPress(badge){
+        badge.style.transform = 'scale(1.08)';
+        badge.style.boxShadow = '0 0 0 2px #fff inset';
+        pressTimer = setTimeout(function(){
+          badge.style.transform = '';
+          badge.style.boxShadow = '';
+          var span = badge.querySelector('.pkw-text');
+          var kw = span ? span.textContent : '';
+          if (!kw) return;
+          var fd = new FormData(); fd.append('priorityKeyword', kw);
+          fetch('/admin/priority-keyword/promote', { method: 'POST', body: fd }).then(function(r){
+            if (!r.ok) return;
+            var firstRect = badge.getBoundingClientRect();
+            list.insertBefore(badge, list.firstChild);
+            renumber();
+            var lastRect = badge.getBoundingClientRect();
+            var dx = firstRect.left - lastRect.left, dy = firstRect.top - lastRect.top;
+            if (badge.animate) {
+              badge.animate([
+                { transform: 'translate(' + dx + 'px,' + dy + 'px)' },
+                { transform: 'translate(0,0)' }
+              ], { duration: 320, easing: 'cubic-bezier(.34,1.56,.64,1)' });
+            }
+            badge.classList.remove('promoted');
+            void badge.offsetWidth;
+            badge.classList.add('promoted');
+          });
+        }, 500);
+      }
+      function cancelPress(badge){
+        clearTimeout(pressTimer);
+        if (badge) { badge.style.transform = ''; badge.style.boxShadow = ''; }
+      }
+      list.addEventListener('mousedown', function(e){
+        var badge = e.target.closest('.pkw-badge');
+        if (!badge || e.target.closest('.pkw-remove')) return;
+        startPress(badge);
+      });
+      list.addEventListener('touchstart', function(e){
+        var badge = e.target.closest('.pkw-badge');
+        if (!badge || e.target.closest('.pkw-remove')) return;
+        startPress(badge);
+      }, { passive: true });
+      ['mouseup','mouseleave'].forEach(function(evt){
+        list.addEventListener(evt, function(e){ cancelPress(e.target.closest('.pkw-badge')); });
+      });
+      ['touchend','touchcancel'].forEach(function(evt){
+        list.addEventListener(evt, function(e){ cancelPress(e.target.closest('.pkw-badge')); });
+      });
+    })();
+    <\/script>
+  </div>`;
+  const priorityUrlQueue = await getPriorityUrls(env);
+  const priorityUrlRows = priorityUrlQueue.map((u, i) => `<div class="mono purl-badge" style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--ink-chip);color:#fff;border-radius:100px;font-size:12px;font-weight:700;transition:transform .15s,box-shadow .15s;max-width:100%;">${i + 1}. <span class="purl-text" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;" title="${escapeHtml(u)}">${escapeHtml(u)}</span><button type="button" class="purl-remove" data-url="${escapeHtml(u)}" title="예약 취소" style="background:none;border:none;color:#fff;cursor:pointer;font-weight:700;padding:0;font-size:13px;flex-shrink:0;">✕</button></div>`).join("");
+  const priorityUrlBlock = `<div class="admin-card">
+    <div class="admin-card-head"><div class="title">🔗 예약 쿠팡 URL</div><div class="mono" style="font-size:11px;color:var(--muted);">예약 키워드보다 먼저 소진 · 길게 누르면 1순위로</div></div>
+    <form id="purl-add-form" style="display:flex;gap:8px;margin-bottom:12px;"><input type="url" id="purl-input" name="priorityUrl" placeholder="쿠팡 상품 URL 붙여넣기" class="mono" style="padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;flex:1;max-width:360px;"><button type="submit">예약 추가</button></form>
+    <div id="purl-list" style="display:flex;flex-wrap:wrap;gap:8px;">${priorityUrlRows}</div>
+    <div id="purl-empty" class="mono" style="color:var(--muted);font-size:12px;${priorityUrlRows ? "display:none;" : ""}">예약된 URL 없음</div>
+    <script>
+    (function(){
+      var list = document.getElementById('purl-list');
+      var empty = document.getElementById('purl-empty');
+      function renumber(){
+        var badges = list.querySelectorAll('.purl-badge');
+        badges.forEach(function(b, i){
+          var firstNode = b.childNodes[0];
+          if (firstNode && firstNode.nodeType === 3) firstNode.textContent = (i+1) + '. ';
+        });
+        empty.style.display = badges.length ? 'none' : '';
+      }
+      function makeBadge(u){
+        var div = document.createElement('div');
+        div.className = 'mono purl-badge';
+        div.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--ink-chip);color:#fff;border-radius:100px;font-size:12px;font-weight:700;transition:transform .15s,box-shadow .15s;max-width:100%;';
+        div.appendChild(document.createTextNode('. '));
+        var span = document.createElement('span');
+        span.className = 'purl-text';
+        span.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;';
+        span.title = u;
+        span.textContent = u;
+        div.appendChild(span);
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'purl-remove'; btn.dataset.url = u; btn.title = '예약 취소';
+        btn.style.cssText = 'background:none;border:none;color:#fff;cursor:pointer;font-weight:700;padding:0;font-size:13px;flex-shrink:0;';
+        btn.textContent = '✕';
+        div.appendChild(btn);
+        return div;
+      }
+      document.getElementById('purl-add-form').addEventListener('submit', function(e){
+        e.preventDefault();
+        var input = document.getElementById('purl-input');
+        var u = input.value.trim();
+        if (!u) return;
+        var fd = new FormData(); fd.append('priorityUrl', u);
+        fetch('/admin/priority-url/add', { method: 'POST', body: fd }).then(function(r){
+          if (r.ok) { list.appendChild(makeBadge(u)); input.value=''; renumber(); }
+        });
+      });
+      list.addEventListener('click', function(e){
+        var btn = e.target.closest('.purl-remove');
+        if (!btn) return;
+        var u = btn.dataset.url;
+        var fd = new FormData(); fd.append('priorityUrl', u);
+        fetch('/admin/priority-url/remove', { method: 'POST', body: fd }).then(function(r){
+          if (r.ok) { btn.closest('.purl-badge').remove(); renumber(); }
+        });
+      });
+      var pressTimer = null;
+      function startPress(badge){
+        badge.style.transform = 'scale(1.08)';
+        badge.style.boxShadow = '0 0 0 2px #fff inset';
+        pressTimer = setTimeout(function(){
+          badge.style.transform = '';
+          badge.style.boxShadow = '';
+          var span = badge.querySelector('.purl-text');
+          var u = span ? span.title : '';
+          if (!u) return;
+          var fd = new FormData(); fd.append('priorityUrl', u);
+          fetch('/admin/priority-url/promote', { method: 'POST', body: fd }).then(function(r){
+            if (!r.ok) return;
+            var firstRect = badge.getBoundingClientRect();
+            list.insertBefore(badge, list.firstChild);
+            renumber();
+            var lastRect = badge.getBoundingClientRect();
+            var dx = firstRect.left - lastRect.left, dy = firstRect.top - lastRect.top;
+            if (badge.animate) {
+              badge.animate([
+                { transform: 'translate(' + dx + 'px,' + dy + 'px)' },
+                { transform: 'translate(0,0)' }
+              ], { duration: 320, easing: 'cubic-bezier(.34,1.56,.64,1)' });
+            }
+            badge.classList.remove('promoted');
+            void badge.offsetWidth;
+            badge.classList.add('promoted');
+          });
+        }, 500);
+      }
+      function cancelPress(badge){
+        clearTimeout(pressTimer);
+        if (badge) { badge.style.transform = ''; badge.style.boxShadow = ''; }
+      }
+      list.addEventListener('mousedown', function(e){
+        var badge = e.target.closest('.purl-badge');
+        if (!badge || e.target.closest('.purl-remove')) return;
+        startPress(badge);
+      });
+      list.addEventListener('touchstart', function(e){
+        var badge = e.target.closest('.purl-badge');
+        if (!badge || e.target.closest('.purl-remove')) return;
+        startPress(badge);
+      }, { passive: true });
+      ['mouseup','mouseleave'].forEach(function(evt){
+        list.addEventListener(evt, function(e){ cancelPress(e.target.closest('.purl-badge')); });
+      });
+      ['touchend','touchcancel'].forEach(function(evt){
+        list.addEventListener(evt, function(e){ cancelPress(e.target.closest('.purl-badge')); });
+      });
+    })();
+    <\/script>
+  </div>`;
+  const activeKeywords = [];
+  const waitingKeywords = KEYWORDS;
+  const keywordButton = /* @__PURE__ */ __name((kw, label, activeStyle) => `<form method="POST" action="/admin/generate" style="margin:0;"><input type="hidden" name="keyword" value="${escapeHtml(kw)}"><button type="submit" class="mono" style="background:${activeStyle ? "var(--accent)" : "var(--surface)"};border:1px solid ${activeStyle ? "var(--accent)" : "var(--border)"};color:${activeStyle ? "#fff" : "var(--text)"};font-weight:${activeStyle ? "700" : "400"};padding:6px 12px;border-radius:100px;font-size:12px;cursor:pointer;">${label}${escapeHtml(kw)}</button></form>`, "keywordButton");
+  const activeButtons = activeKeywords.map((kw, i) => keywordButton(kw, `${i + 1}. `, true)).join("");
+  const waitingButtons = waitingKeywords.map((kw) => keywordButton(kw, "", false)).join("");
+  const rawPostList = await Promise.all(idx.slice(0, 50).map((slug) => env.POSTS.get(`post:${slug}`)));
+  const posts = rawPostList.filter(Boolean).map((raw) => JSON.parse(raw));
+  const viewCounts = await getClickCounts(env, posts.map((p) => p.slug));
+  const lifetimeClicks = await getLifetimeClickData(env);
+  const pendingVideoJobs = await env.POSTS.list({ prefix: "videoJob:" });
+  const pendingByField = { videoTextToVideo: /* @__PURE__ */ new Set(), videoImageToVideo: /* @__PURE__ */ new Set() };
+  for (const k of pendingVideoJobs.keys) {
+    const [, slug, field] = k.name.split(":");
+    if (pendingByField[field]) pendingByField[field].add(slug);
+  }
+  const rows = posts.map((p) => {
+    const viewCount = viewCounts[p.slug] || 0;
+    const realClickCount = (lifetimeClicks.bySlug || {})[p.slug] || 0;
+    const ctr = viewCount ? Math.round(realClickCount / viewCount * 1000) / 10 : 0;
+    const isReview = p.type === "review";
+    const typeBadge = isReview ? `<span class="mono" style="background:var(--amber);color:#3A2E2A;font-size:11px;padding:2px 8px;border-radius:100px;font-weight:700;">리뷰</span>` : `<span class="mono" style="background:var(--accent);color:#fff;font-size:11px;padding:2px 8px;border-radius:100px;font-weight:700;">비교</span>`;
+    const isPendingT2v = pendingByField.videoTextToVideo.has(p.slug) && !p.videoTextToVideo;
+    const isPendingI2v = pendingByField.videoImageToVideo.has(p.slug) && !p.videoImageToVideo;
+    const videoBtn = /* @__PURE__ */ __name((label, mode, done, pending) => {
+      if (done) return `<span class="mono" style="font-size:10px;color:var(--accent-text);">🎬 ${label} 완료</span>`;
+      if (pending) return `<span class="mono" style="font-size:10px;color:var(--amber-text);">⏳ ${label} 생성중</span>`;
+      return `<form method="POST" action="/admin/generate-video" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><input type="hidden" name="mode" value="${mode}"><button type="submit" class="mono" style="font-size:10px;padding:3px 7px;">🎬 ${label}</button></form>`;
+    }, "videoBtn");
+    const videoCell = isReview ? `<div style="display:flex;flex-direction:column;gap:4px;">
+      ${videoBtn("이미지→영상", "i2v", !!p.videoImageToVideo, isPendingI2v)}
+      ${videoBtn("텍스트→영상", "t2v", !!p.videoTextToVideo, isPendingT2v)}
+    </div>` : `<span class="mono" style="font-size:10px;color:var(--muted);">비교글은 미지원</span>`;
+    return `<tr><td>${p.title}</td><td class="mono">${p.keyword}</td><td>${typeBadge}</td><td class="mono">${viewCount}</td><td class="mono">${realClickCount}</td><td class="mono">${ctr}%</td><td class="mono">${new Date(p.createdAt).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })}</td><td>${videoCell}</td><td><a href="/${p.slug}?preview=1" target="_blank">보기</a></td><td><form method="POST" action="/admin/delete" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form></td></tr>`;
+  });
+  const rowsFirst = rows.slice(0, 3).join("");
+  const rowsRest = rows.slice(3).join("");
+  const postsTableHtml = rows.length
+    ? `<div class="table-scroll"><table><thead><tr><th>제목</th><th>키워드</th><th>유형</th><th>조회수</th><th>클릭수</th><th>전환율</th><th>작성일</th><th>영상</th><th></th><th></th></tr></thead><tbody>${rowsFirst}</tbody><tbody id="posts-more-rows" style="display:none;">${rowsRest}</tbody></table></div>${rowsRest ? `<div class="mono" id="posts-more-toggle" onclick="document.getElementById('posts-more-rows').style.display='table-row-group';this.style.display='none';" style="cursor:pointer;font-size:13px;color:var(--muted);margin-top:8px;">▸ 나머지 ${rows.length - 3}건 더 보기</div>` : ""}`
+    : '<table><tbody><tr><td>글이 없습니다.</td></tr></tbody></table>';
+  const modelStatsRaw = await env.POSTS.get("model-stats");
+  const modelStats = modelStatsRaw ? JSON.parse(modelStatsRaw) : {};
+  const lastGenHistRaw = await safeKVGet(env, "cron:generate-history");
+  const lastGenHist = lastGenHistRaw ? JSON.parse(lastGenHistRaw) : [];
+  const lastGenRowsAll = lastGenHist.slice(0, 15).map((g) => {
+    const statusCell = g.ok ? `<span class="mono" style="color:var(--accent-text);">✅ 성공</span>` : `<span class="mono" style="color:#c0392b;">❌ 실패</span>`;
+    const detail = g.ok ? escapeHtml(g.title || g.slug || "") : escapeHtml(g.reason || "알 수 없는 오류");
+    return `<tr><td class="mono" style="white-space:nowrap;">${escapeHtml(g.at || "")}</td><td>${statusCell}</td><td>${detail}</td></tr>`;
+  });
+  const lastGenRowsFirst = lastGenRowsAll.slice(0, 1).join("");
+  const lastGenRowsRest = lastGenRowsAll.slice(1).join("");
+  const lastGenBlock = lastGenHist.length ? `<div class="admin-card">
+    <div class="admin-card-head"><div class="title">🕐 자동생성(2시간 크론) 최근 실행 이력</div></div>
+    <div class="table-scroll"><table><thead><tr><th>시각</th><th>결과</th><th>내용</th></tr></thead><tbody>${lastGenRowsFirst}</tbody><tbody id="gen-hist-more-rows" style="display:none;">${lastGenRowsRest}</tbody></table></div>
+    ${lastGenRowsRest ? `<div class="mono" id="gen-hist-more-toggle" onclick="document.getElementById('gen-hist-more-rows').style.display='table-row-group';this.style.display='none';" style="cursor:pointer;font-size:12px;color:var(--muted);margin-top:6px;">▸ 나머지 ${lastGenRowsAll.length - 1}건 더 보기</div>` : ""}
+  </div>` : "";
+  const modelStatsRows = Object.entries(modelStats)
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([model, s]) => {
+      const rate = s.count ? Math.round(s.needsReviewCount / s.count * 100) : 0;
+      const lastUsed = s.lastUsedAt ? new Date(s.lastUsedAt).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" }) : "-";
+      const lastTitle = s.lastTitle ? escapeHtml(s.lastTitle.slice(0, 40)) : "-";
+      return `<tr><td class="mono">${escapeHtml(model)}</td><td class="mono">${s.count}</td><td class="mono">${s.needsReviewCount}</td><td class="mono">${rate}%</td><td class="mono" style="white-space:nowrap;">${lastUsed}</td><td>${lastTitle}</td></tr>`;
+    }).join("");
+  const cerebrasOn = !!env.CEREBRAS_API_KEY;
+  const groqOn = !!env.GROQ_API_KEY;
+  const workersAiOn = !!env.AI;
+  const modelEntries = Object.entries(modelStats).sort((a, b) => b[1].count - a[1].count);
+  const topModel = modelEntries[0];
+  const statusChip = (label, on) => `<span class="mono" style="display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border-radius:100px;font-size:12px;background:${on ? "var(--green)" : "var(--surface)"};color:${on ? "#0d3d2c" : "var(--muted)"};border:1px solid ${on ? "var(--green)" : "var(--border)"};">${on ? "🟢" : "⚪"} ${label} ${on ? "설정됨" : "미설정"}</span>`;
+  const aiStatusBlock = `<div class="admin-card">
+    <div class="admin-card-head"><div class="title">🤖 AI 모델 설정 상태</div></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+      ${statusChip("Cerebras", cerebrasOn)}
+      ${statusChip("Groq", groqOn)}
+      ${statusChip("Workers AI(최후폴백)", workersAiOn)}
+    </div>
+    <div class="mono" style="font-size:13px;color:${topModel ? "var(--accent-text)" : "var(--muted)"};">
+      ${topModel ? `현재 실제로 가장 많이 쓰이는 모델: <b>${escapeHtml(topModel[0])}</b> (누적 ${topModel[1].count}회 생성)` : "아직 생성 이력 없음 — 글을 하나 생성해보면 여기 모델명이 표시됩니다."}
+    </div>
+  </div>`;
+  const modelStatsTable = modelStatsRows ? `<div class="admin-card"><div class="admin-card-head"><div class="title">🎯 모델별 1차품질 통계 (검수 필요율 낮을수록 좋음)</div></div><div class="table-scroll"><table><thead><tr><th>모델</th><th>생성횟수</th><th>검수필요</th><th>검수필요율</th><th>마지막 사용</th><th>마지막 제목</th></tr></thead><tbody>${modelStatsRows}</tbody></table></div></div>` : "";
+  const lastGen0 = lastGenHist[0];
+  const cronStatCls = lastGen0 ? (lastGen0.ok ? "ok" : "warn") : "";
+  const cronStatText = lastGen0 ? (lastGen0.ok ? "성공" : "실패") : "-";
+  const statStrip = `<div class="admin-stat-strip">
+    <div class="admin-stat"><div class="num">${idx.length}</div><div class="label mono">총 발행 글</div></div>
+    <div class="admin-stat ${cronStatCls}"><div class="num">${cronStatText}</div><div class="label mono">최근 크론 결과</div></div>
+    <div class="admin-stat ${kvFallbackCount > 0 ? "warn" : "ok"}"><div class="num">${kvFallbackCount}</div><div class="label mono">KV 폴백 대기</div></div>
+    <div class="admin-stat ${brokenLinks.length > 0 ? "warn" : "ok"}"><div class="num">${brokenLinks.length}</div><div class="label mono">끊긴 링크</div></div>
+  </div>`;
+  const topActions = `<div class="admin-actions">
+    <form method="POST" action="/admin/generate"><input type="text" name="keyword" placeholder="키워드 (비우면 랜덤)" maxlength="50" class="mono"><button type="submit">지금 1건 생성</button></form>
+    <form method="POST" action="/admin/generate"><input type="text" name="productName" placeholder="특정 상품명 (단일 리뷰 작성)" maxlength="50" class="mono" style="min-width:200px;"><button type="submit">상품 리뷰 작성</button></form>
+    <form method="POST" action="/admin/generate-trending" style="margin:0;"><button type="submit" style="background:var(--amber);color:#3A2E2A;">🔥 베스트상품 랜덤 리뷰</button></form>
+    <form method="POST" action="/admin/generate-from-url"><input type="url" name="coupangUrl" placeholder="쿠팡 상품 URL 붙여넣기" required class="mono" style="min-width:240px;"><button type="submit">🔗 URL로 리뷰 생성</button></form>
+    <form id="ext-auto-generate-form" style="align-items:center;"><input type="url" id="ext-coupang-url" placeholder="쿠팡 상품 URL (확장 자동생성)" required class="mono" style="min-width:240px;"><button type="submit">🧩 확장으로 자동 생성</button><span id="ext-status" class="mono" style="font-size:12px;color:var(--muted);"></span></form>
+  </div>`;
+  const keywordCard = `<div class="admin-card">
+    <div class="admin-card-head"><div class="mono" style="color:var(--accent-text);font-size:13px;">🟢 활성 키워드 · 쿠팡 베스트카테고리 실시간 반영 (지금 로테이션 중, 클릭시 즉시 발행)</div></div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;">${activeButtons}</div>
+    <details style="margin:0;"><summary class="mono" style="cursor:pointer;font-size:13px;color:var(--muted);">⚪ 고정 폴백 후보 ${waitingKeywords.length}개 (쿠팡 수집 실패시에만 사용, 클릭하면 지금 바로 발행도 가능 — 펼치려면 클릭)</summary><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">${waitingButtons}</div></details>
+  </div>`;
+  const postsCard = `<div class="admin-card"><div class="admin-card-head"><div class="title">📝 발행된 글 목록</div></div>${postsTableHtml}</div>`;
+  const body = `${siteHeader()}<div class="wrap admin-shell">${msg ? `<div class="mono" style="padding:10px 14px;margin-bottom:16px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--amber-text);font-size:13px;word-break:break-all;">${escapeHtml(msg)}</div>` : ""}<div class="admin-topbar"><div><div class="eyebrow">Admin Console</div><h2>usb.kr 관리자 대시보드</h2></div></div>${statStrip}${topActions}${kvFallbackBlock}${brokenLinksBlock}${priorityUrlBlock}${priorityBlock}${keywordCard}${lastGenBlock}${aiStatusBlock}${modelStatsTable}${postsCard}</div>`;
+  return new Response(page("관리자 - usb.kr", body, { noindex: true, showPrivacyNotice: false }), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+__name(renderAdminPage, "renderAdminPage");
+async function handleTrendingGenerate(env) {
+  const result = await generateTrendingReview(env);
+  const msg = result?.ok ? `발행 완료: ${result.post.title}` : `생성 실패 — ${result?.reason || "알 수 없는 오류"}`;
+  return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent(msg) } });
+}
+__name(handleTrendingGenerate, "handleTrendingGenerate");
+function decodeHtmlEntities(str) {
+  return str.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+__name(decodeHtmlEntities, "decodeHtmlEntities");
+async function scrapeCoupangProduct(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    return { ok: false, error: "URL 형식이 올바르지 않음" };
+  }
+  if (!/(^|\.)coupang\.com$/i.test(parsed.hostname)) {
+    return { ok: false, error: "coupang.com 도메인 URL만 지원함" };
+  }
+  const browserHeaders = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.coupang.com/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"'
+  };
+  async function tryFetch(targetUrl) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 9000);
+    try {
+      const r = await fetch(targetUrl, { headers: browserHeaders, signal: controller.signal });
+      return { r, error: null };
+    } catch (e) {
+      return { r: null, error: "페이지 요청 네트워크 오류: " + e.message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  let { r: res, error: fetchErr } = await tryFetch(url);
+  if (fetchErr) return { ok: false, error: fetchErr };
+  if (!res.ok && parsed.hostname !== "m.coupang.com") {
+    // www/기본 도메인이 막히면 모바일 페이지로 한 번 더 시도 (봇 차단 우회용)
+    const mobileUrl = url.replace(parsed.hostname, "m.coupang.com");
+    const retry = await tryFetch(mobileUrl);
+    if (retry.r && retry.r.ok) res = retry.r;
+  }
+  if (!res.ok) {
+    return { ok: false, error: `상품 페이지 요청 실패: HTTP ${res.status} (쿠팡 봇 차단으로 추정)` };
+  }
+  const html = await res.text();
+  const titleMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+  const imageMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+  const priceMatch = html.match(/<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["']/i) || html.match(/"salePrice"\s*:\s*"?(\d+)"?/) || html.match(/"finalPrice"\s*:\s*"?(\d+)"?/);
+  const productName = titleMatch ? decodeHtmlEntities(titleMatch[1]).replace(/\s*-\s*쿠팡!?$/i, "").trim() : null;
+  const productImage = imageMatch ? imageMatch[1] : null;
+  const productPrice = priceMatch ? parseInt(priceMatch[1].replace(/[^\d]/g, ""), 10) : null;
+  if (!productName) {
+    return { ok: false, error: "상품명을 페이지에서 찾지 못함(og:title 없음) — 로그인/캡차 페이지로 리다이렉트됐을 수 있음" };
+  }
+  const idMatch = parsed.pathname.match(/products\/(\d+)/);
+  const productId = idMatch ? idMatch[1] : null;
+  return { ok: true, product: { productName, productImage, productPrice, productUrl: url, productId } };
+}
+__name(scrapeCoupangProduct, "scrapeCoupangProduct");
+async function generateProductReviewFromUrl(env, url) {
+  const scraped = await scrapeCoupangProduct(url);
+  if (!scraped.ok) return { ok: false, reason: scraped.error };
+  const target = scraped.product;
+  if (!target.productImage) return { ok: false, reason: "상품 이미지를 페이지에서 찾지 못함" };
+  return await saveProductReviewPost(env, target, target.productName, false);
+}
+__name(generateProductReviewFromUrl, "generateProductReviewFromUrl");
+async function handleGenerateFromUrl(request, env) {
+  const form = await request.formData();
+  const coupangUrl = (form.get("coupangUrl") || "").toString().trim();
+  if (!coupangUrl) {
+    return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent("쿠팡 URL을 입력하세요") } });
+  }
+  const result = await generateProductReviewFromUrl(env, coupangUrl);
+  const msg = result?.ok ? `발행 완료: ${result.post.title}` : `생성 실패 — ${result?.reason || "알 수 없는 오류"}`;
+  return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent(msg) } });
+}
+__name(handleGenerateFromUrl, "handleGenerateFromUrl");
+async function handleGenerateFromExtension(request, env) {
+  const extKey = request.headers.get("X-Ext-Key") || "";
+  if (!env.EXTENSION_API_KEY || extKey !== env.EXTENSION_API_KEY) {
+    return new Response(JSON.stringify({ ok: false, reason: "인증 실패 (X-Ext-Key 불일치)" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, reason: "JSON 파싱 실패" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+  const { productName, productImage, productPrice, productUrl, affiliateUrl } = body || {};
+  if (!productName || !productImage || !productUrl || !affiliateUrl) {
+    return new Response(JSON.stringify({ ok: false, reason: "필수 필드 누락 (productName/productImage/productUrl/affiliateUrl)" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+  const target = {
+    productName,
+    productImage,
+    productPrice: productPrice ? Number(productPrice) : null,
+    productUrl,
+    productId: (() => {
+      const m = (() => {
+        try {
+          return new URL(productUrl).pathname;
+        } catch (e) {
+          return "";
+        }
+      })().match(/products\/(\d+)/);
+      return m ? m[1] : null;
+    })()
+  };
+  const result = await saveProductReviewPost(env, target, productName, false, affiliateUrl);
+  return new Response(JSON.stringify(result?.ok ? { ok: true, title: result.post.title, slug: result.post.slug } : { ok: false, reason: result?.reason || "알 수 없는 오류" }), {
+    status: result?.ok ? 200 : 500,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+__name(handleGenerateFromExtension, "handleGenerateFromExtension");
+async function getPriorityKeywords(env) {
+  try {
+    const raw = await env.POSTS.get("priority-keywords");
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+__name(getPriorityKeywords, "getPriorityKeywords");
+async function savePriorityKeywords(env, list) {
+  await safeKVPut(env, "priority-keywords", JSON.stringify(list.slice(0, 50)));
+}
+__name(savePriorityKeywords, "savePriorityKeywords");
+async function handleAddPriorityKeyword(request, env) {
+  const form = await request.formData();
+  const kw = (form.get("priorityKeyword") || "").toString().trim();
+  if (kw) {
+    const list = await getPriorityKeywords(env);
+    if (!list.includes(kw)) list.push(kw);
+    await savePriorityKeywords(env, list);
+  }
+  return new Response(kw ? "ok" : "empty", { status: kw ? 200 : 400 });
+}
+__name(handleAddPriorityKeyword, "handleAddPriorityKeyword");
+async function handleRemovePriorityKeyword(request, env) {
+  const form = await request.formData();
+  const kw = (form.get("priorityKeyword") || "").toString();
+  const list = (await getPriorityKeywords(env)).filter((k) => k !== kw);
+  await savePriorityKeywords(env, list);
+  return new Response("ok", { status: 200 });
+}
+__name(handleRemovePriorityKeyword, "handleRemovePriorityKeyword");
+async function handlePromotePriorityKeyword(request, env) {
+  const form = await request.formData();
+  const kw = (form.get("priorityKeyword") || "").toString();
+  const list = await getPriorityKeywords(env);
+  const filtered = list.filter((k) => k !== kw);
+  if (filtered.length !== list.length) filtered.unshift(kw); // 목록에 있었을 때만 맨 앞으로 이동
+  await savePriorityKeywords(env, filtered);
+  return new Response("ok", { status: 200 });
+}
+__name(handlePromotePriorityKeyword, "handlePromotePriorityKeyword");
+async function getPriorityUrls(env) {
+  try {
+    const raw = await env.POSTS.get("priority-urls");
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+__name(getPriorityUrls, "getPriorityUrls");
+async function savePriorityUrls(env, list) {
+  await safeKVPut(env, "priority-urls", JSON.stringify(list.slice(0, 50)));
+}
+__name(savePriorityUrls, "savePriorityUrls");
+async function handleAddPriorityUrl(request, env) {
+  const form = await request.formData();
+  const u = (form.get("priorityUrl") || "").toString().trim();
+  if (u) {
+    const list = await getPriorityUrls(env);
+    if (!list.includes(u)) list.push(u);
+    await savePriorityUrls(env, list);
+  }
+  return new Response(u ? "ok" : "empty", { status: u ? 200 : 400 });
+}
+__name(handleAddPriorityUrl, "handleAddPriorityUrl");
+async function handleRemovePriorityUrl(request, env) {
+  const form = await request.formData();
+  const u = (form.get("priorityUrl") || "").toString();
+  const list = (await getPriorityUrls(env)).filter((x) => x !== u);
+  await savePriorityUrls(env, list);
+  return new Response("ok", { status: 200 });
+}
+__name(handleRemovePriorityUrl, "handleRemovePriorityUrl");
+async function handlePromotePriorityUrl(request, env) {
+  const form = await request.formData();
+  const u = (form.get("priorityUrl") || "").toString();
+  const list = await getPriorityUrls(env);
+  const filtered = list.filter((x) => x !== u);
+  if (filtered.length !== list.length) filtered.unshift(u);
+  await savePriorityUrls(env, filtered);
+  return new Response("ok", { status: 200 });
+}
+__name(handlePromotePriorityUrl, "handlePromotePriorityUrl");
+async function handleManualGenerate(request, env) {
+  const form = await request.formData();
+  const customKeyword = (form.get("keyword") || "").toString().trim();
+  const productName = (form.get("productName") || "").toString().trim();
+  let result;
+  if (productName) {
+    await markProductAsUsed(productName, env);
+    result = await generateProductReview(env, productName);
+  } else {
+    result = await generateAndSavePost(env, customKeyword || void 0);
+  }
+  const msg = result?.ok ? `발행 완료: ${result.post.title}` : `생성 실패 — ${result?.reason || "알 수 없는 오류"}`;
+  return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent(msg) } });
+}
+__name(handleManualGenerate, "handleManualGenerate");
+async function handleGenerateVideo(request, env) {
+  const form = await request.formData();
+  const slug = (form.get("slug") || "").toString();
+  const mode = (form.get("mode") || "").toString();
+  const raw = await safeKVGet(env, `post:${slug}`);
+  if (!raw) {
+    return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent("영상 생성 실패 — 글을 찾을 수 없음") } });
+  }
+  const post = JSON.parse(raw);
+  if (post.type !== "review") {
+    return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent("영상 생성 실패 — 비교글은 영상 제작을 지원하지 않음 (리뷰글만 가능)") } });
+  }
+  const firstProduct = post.products?.[0];
+  if (!firstProduct) {
+    return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent("영상 생성 실패 — 상품 이미지 없음") } });
+  }
+  let result;
+  if (mode === "t2v") {
+    result = await startVideoJob({ prompt: buildVideoPrompt(firstProduct.name, false), imageUrl: null, r2Key: `${slug}-t2v.mp4`, slug, field: "videoTextToVideo" }, env);
+  } else {
+    result = await startVideoJob({ prompt: buildVideoPrompt(firstProduct.name, true), imageUrl: firstProduct.image, r2Key: `${slug}-i2v.mp4`, slug, field: "videoImageToVideo" }, env);
+  }
+  if (!result.ok) {
+    return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent("영상 생성 시작 실패 — " + result.error) } });
+  }
+  const modeLabel = mode === "t2v" ? "텍스트→영상" : "이미지→영상";
+  const msg = `영상 생성 시작됨 (${modeLabel}) — 5분마다 자동 확인해서 완료되면 저장됩니다. (${slug})`;
+  return new Response(null, { status: 302, headers: { Location: "/admin?msg=" + encodeURIComponent(msg) } });
+}
+__name(handleGenerateVideo, "handleGenerateVideo");
+async function handleDelete(request, env) {
+  const form = await request.formData();
+  const slug = form.get("slug");
+  try {
+    await env.POSTS.delete(`post:${slug}`);
+    const idxRaw = await env.POSTS.get("index");
+    const idx = idxRaw ? JSON.parse(idxRaw) : [];
+    await safeKVPut(env, "index", JSON.stringify(idx.filter((s) => s !== slug)));
+  } catch (e) {
+    console.log(`[handleDelete 실패] ${slug}: ${e.message}`);
+  }
+  return new Response(null, { status: 302, headers: { Location: "/admin" } });
+}
+__name(handleDelete, "handleDelete");
+
+export {
+  worker_default as default
 };
