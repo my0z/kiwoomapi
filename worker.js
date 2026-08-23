@@ -175,48 +175,75 @@ async function checkWatchlistRiskLevels(env) {
   const items = wlRes.results;
   if (!items.length) return { checked: 0 };
 
+  // 트레일링스톱 최고점 저장용 - relay(상주 프로세스, 메모리로 처리)와 별개 경로.
+  // cron은 Cloudflare Workers라 요청 사이에 메모리가 안 남으므로 D1에 저장해야 함.
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS watchlist_peak (code TEXT PRIMARY KEY, peak_pnl_pct REAL, updated_at TEXT)`
+  ).run().catch(() => {});
+
   const token = await kiwoomIssueToken(env);
   let checked = 0;
-  const AUTO_REMOVE_PNL_PCT = -1.5; // 이 손익률 이하로 떨어지면 관심종목에서 자동 삭제 (손절)
-  const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 이 손익률 이상 오르면 관심종목에서 자동 삭제 (익절)
+  // 2026-08-21 외부 분석 근거로 손절폭 확대: +3.5%/-1.5% 장벽에서 드리프트 0인 무작위 워크라도
+  // 손절이 먼저 맞을 확률이 1.5/(3.5+1.5)=70%로 구조적으로 손절 우위였음. -2.5%로 넓히면 41.7%로
+  // 개선됨. 급등주 장중 변동성(±1.5% 스윙이 몇 분 안에 발생)이 예전 손절폭 안에 있어서 노이즈에
+  // 잦게 걸렸던 문제도 같이 완화됨.
+  const AUTO_REMOVE_PNL_PCT = -2.5;
+  const AUTO_TAKE_PROFIT_PNL_PCT = 3.5;
+  const TRAIL_ACTIVATE_PCT = 2.0; // 이 손익률에 한 번이라도 도달하면 트레일링 스톱 활성화
+  const TRAIL_DISTANCE_PCT = 1.5; // 활성화 후 고점 대비 이만큼 밀리면 조기 청산
+  const stillHeldCodes = new Set(items.map((it) => it.code));
+
   for (const w of items) {
     try {
-      // 일봉은 캐싱된 걸 우선 씀(10분 이내면 재조회 생략, 그 경우 대기도 안 함 - 캐시 함수 내부에서 처리)
-      const ohlc = await getCachedDailyOHLC(env, token, w.code);
       const quoteRaw = await kiwoomQuote(env, token, w.code);
-      const atr = computeATR(ohlc, 14);
-      if (!atr) continue; // ATR 계산 불가 - 아래 finally에서 대기는 그대로 실행됨
       const quote = parseKiwoomQuote(quoteRaw);
-      // ATR 손절/익절 라인은 진입가(entry_price) 기준으로 계산해야 함.
-      // 예전엔 "현재가 ± ATR"로 계산한 뒤 같은 현재가와 비교해서 항상 false가 되는
-      // 자기참조 버그가 있었음(진입가가 없으면 ATR 라인 자체를 계산하지 않음).
-      let stopLoss = null, takeProfit = null, status = "safe";
-      if (w.entry_price && w.entry_price > 0) {
-        stopLoss = Math.round(w.entry_price - atr * 1.5);
-        takeProfit = Math.round(w.entry_price + atr * 2);
-        if (quote.price <= stopLoss) status = "stop_loss_hit";
-        else if (quote.price >= takeProfit) status = "take_profit_hit";
-      }
 
-      // 손익률 -1.5% 이하(손절) 또는 +1.5% 이상(익절) - 관심종목에서 바로 제거 (risk_status도 같이 정리)
       if (w.entry_price && w.entry_price > 0) {
         const pnlPct = ((quote.price - w.entry_price) / w.entry_price) * 100;
-        if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
-          const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
+
+        const peakRow = await env.DB.prepare(`SELECT peak_pnl_pct FROM watchlist_peak WHERE code = ?`).bind(w.code).first().catch(() => null);
+        const prevPeak = peakRow ? peakRow.peak_pnl_pct : 0;
+        const peak = Math.max(prevPeak, pnlPct);
+        if (peak !== prevPeak) {
+          await env.DB.prepare(
+            `INSERT INTO watchlist_peak (code, peak_pnl_pct, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(code) DO UPDATE SET peak_pnl_pct = excluded.peak_pnl_pct, updated_at = excluded.updated_at`
+          ).bind(w.code, peak, new Date().toISOString()).run().catch(() => {});
+        }
+        // 고정 +3.5% 익절선은 승률 35% 안팎 전략에서 드문 대승(오른쪽 꼬리)이 전체 기대값을
+        // 만들어야 하는데 그 꼬리를 정확히 잘라내는 문제가 있었음(외부 분석: +3.9%, +4.6%로
+        // 오버슈트하며 청산된 사례 확인). +2% 한 번이라도 도달하면 활성화되고, 그 뒤로 고점 대비
+        // -1.5% 밀리면(최소 +0.5%는 확정 확보한 채로) 조기 확정 - 계속 오르면 익절선까지 안 잘림.
+        const trailingHit = peak >= TRAIL_ACTIVATE_PCT && pnlPct <= peak - TRAIL_DISTANCE_PCT;
+
+        if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || trailingHit) {
+          const reason = pnlPct >= 0 ? "익절" : "손절"; // trailingHit도 peak>=2%였으므로 pnlPct는 항상 +0.5% 이상
           // 삭제되면 watchlist에서 사라져서 trackWatchlistPerformance가 못 보게 됨 -
           // 확정 손익을 먼저 기록해둬야 성과 통계가 "살아남은 것만" 반영하는 왜곡을 피함
           await recordWatchlistExitPerformance(env, w, quote.price, pnlPct);
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
+          await env.DB.prepare(`DELETE FROM watchlist_peak WHERE code = ?`).bind(w.code).run();
+          const tag = trailingHit ? reason + "(트레일링)" : reason;
           await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[${reason}] [cron]`);
           checked++;
           continue;
         }
       }
 
-      // entry_price가 아직 없어 stopLoss/takeProfit을 계산 못한 틱에는 status/price만 갱신하고
-      // 손절/익절 라인은 기존에 계산해둔 마지막 값을 그대로 유지함(COALESCE) - entry_price가
-      // 나중에 채워지기 전까지 화면에서 라인이 사라졌다 나타났다 깜빡이는 것을 방지.
+      // 화면에 보여주는 손절/익절 라인 - 예전엔 ATR(당일봉 포함 버그로 과대계산돼 손절선이 진입가
+      // 대비 -40%~-70%까지 벌어지는 경우가 있었음) 기반이었는데, 실제 청산 판단은 항상 이 함수의
+      // 고정 손익률 기준을 썼음 - 즉 화면에 보이는 라인과 실제 작동하는 로직이 서로 다른 "장식"
+      // 상태였음. 이제 실제 판단 기준(고정 -2.5%/+3.5%)을 그대로 가격으로 환산해서 보여줘서
+      // 화면 표시와 실제 동작이 항상 일치하게 함.
+      let stopLoss = null, takeProfit = null, status = "safe";
+      if (w.entry_price && w.entry_price > 0) {
+        stopLoss = Math.round(w.entry_price * (1 + AUTO_REMOVE_PNL_PCT / 100));
+        takeProfit = Math.round(w.entry_price * (1 + AUTO_TAKE_PROFIT_PNL_PCT / 100));
+        if (quote.price <= stopLoss) status = "stop_loss_hit";
+        else if (quote.price >= takeProfit) status = "take_profit_hit";
+      }
+
       await env.DB.prepare(
         `INSERT INTO watchlist_risk_status (code, status, price, stop_loss, take_profit, checked_at)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -235,6 +262,15 @@ async function checkWatchlistRiskLevels(env) {
       await sleep(1100); // 키움 TR 초당1건 제한 - continue/에러로 건너뛰지 않도록 finally에 둠
     }
   }
+
+  // 관심종목에서 이미 빠진 종목의 최고점 기록은 정리 (메모리/스토리지 누수 방지)
+  const peakRowsRes = await env.DB.prepare(`SELECT code FROM watchlist_peak`).all().catch(() => ({ results: [] }));
+  for (const r of peakRowsRes.results || []) {
+    if (!stillHeldCodes.has(r.code)) {
+      await env.DB.prepare(`DELETE FROM watchlist_peak WHERE code = ?`).bind(r.code).run().catch(() => {});
+    }
+  }
+
   return { checked };
 }
 
@@ -325,18 +361,22 @@ function computeRealisticPnlServer(entryPrice, exitPrice, budget) {
   return { qty, netPnlAmount, netPnlPct };
 }
 
-// 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가 커져서
-// (체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이 항상 적용.
-// POST /api/watchlist(새로 추가하는 순간)뿐 아니라 cron(scheduled)에서도 매틱 호출함 - 새 추가가
-// 없어도(예: 배포 직후 이미 상한을 넘겨 갖고 있던 경우) 저절로 정리되게 하기 위함. 그냥 지우면
-// 통계가 왜곡되니(생존편향 방지 원칙과 동일) 실제 현재가로 정식 청산 처리 - 익절/손절 자동삭제와
-// 동일하게 watchlist_performance에 기록하고 라벨도 실제 손익 부호에 맞게 붙임.
-const WATCHLIST_MAX_SIZE = 10;
-async function enforceWatchlistCap(env) {
+// 새 종목을 담기 전에 기존 종목들 중에서만 자리를 비워둠 - enforceWatchlistCap(삽입 후 전체를
+// 손익률로 정렬해서 자름)과 순서가 다른 게 핵심. 예전엔 삽입 후에 전체(방금 넣은 것 포함)를
+// 비교했는데, 방금 넣은 종목은 pnl≈0이라 기존 보유(대부분 양수)보다 항상 "최악"으로 잡혀서
+// 편입되자마자 몇 초 안에 퇴출당하는 문제가 있었음(외부 분석: 12:22 배치 10종목 중 7건이
+// 수 초 내 삭제, 그중 6건은 pnl=0인 채로 "익절삭제" 라벨이 붙어 통계까지 오염시킴).
+// 이 함수는 삽입 전에 호출해서, 방금 넣을 종목이 아예 비교 대상에 안 들어가게 함.
+async function makeRoomForNewEntry(env) {
   const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
-  const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
+  const overCount = countRow ? countRow.c - (WATCHLIST_MAX_SIZE - 1) : 0; // 삽입 후 정확히 MAX가 되도록 MAX-1까지 비움
   if (overCount <= 0) return;
+  await evictWorstWatchlistEntries(env, overCount);
+}
 
+// 관심종목 중 손익률이 가장 나쁜 순으로 n개를 실제 현재가로 청산 - enforceWatchlistCap과
+// makeRoomForNewEntry가 공용으로 씀
+async function evictWorstWatchlistEntries(env, n) {
   const allRes = await env.DB.prepare(
     `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`
   )
@@ -345,7 +385,6 @@ async function enforceWatchlistCap(env) {
   const all = allRes.results || [];
   if (!all.length) return;
 
-  // 전체 종목 실시간가를 relay 호출 한 번으로 일괄 조회 (종목마다 따로 조회하지 않아 훨씬 빠르고 가벼움)
   let liveStocks = {};
   try {
     const relayRes = await kiwoomRelayFetch(env, "/realtime/stocks", { method: "GET" });
@@ -353,10 +392,6 @@ async function enforceWatchlistCap(env) {
     liveStocks = relayData.stocks || {};
   } catch (e) { /* 아래에서 종목별 폴백 처리 */ }
 
-  // 가장 오래된 게 아니라 "지금 손익률이 가장 나쁜" 순으로 자름 - 예전엔 added_at 기준이라
-  // 이제 막 상승 중인 젊은 포지션이 익절선 도달 전에 정원초과로 억울하게 끊기는 경우가 있었음
-  // (실측: +1.51% 상태에서 정원초과로 강제청산된 사례 확인됨). 가격 정보가 아예 없는 종목은
-  // 판단 불가하니 가장 나중 순위(맨 뒤)로 미뤄서 우선순위에서 제외.
   const withPnl = all.map((w) => {
     const live = liveStocks[w.code];
     const price = live && live.price ? live.price : 0;
@@ -369,15 +404,11 @@ async function enforceWatchlistCap(env) {
     if (b.pnlPct === null) return -1;
     return a.pnlPct - b.pnlPct; // 손익률 낮은(더 나쁜) 것부터
   });
-  const victims = withPnl.slice(0, overCount);
+  const victims = withPnl.slice(0, n);
 
   for (const w of victims) {
-    // 삭제 직전 재확인 - 조건검색이 짧은 시간에 여러 종목을 몰아서 담을 때, 여러 요청이 거의
-    // 동시에 이 함수를 실행하면서 서로 읽은 스냅샷이 겹쳐 같은 종목을 중복으로 처리하려던 문제가
-    // 있었음(실측: 한 종목이 같은 초에 10번 연속 "정원초과 삭제" 로그가 찍힘). 이미 다른 요청이
-    // 먼저 지웠다면 여기서 저렴하게 건너뛰어서, 불필요한 시세조회/기록/로그가 중복되지 않게 함.
     const stillExists = await env.DB.prepare(`SELECT 1 FROM watchlist WHERE code = ?`).bind(w.code).first().catch(() => null);
-    if (!stillExists) continue;
+    if (!stillExists) continue; // 병렬 요청이 이미 처리했으면 값싸게 건너뜀
 
     try {
       let exitPrice = w.livePrice;
@@ -389,9 +420,6 @@ async function enforceWatchlistCap(env) {
       if (exitPrice > 0 && w.entry_price > 0) {
         const pnlPct = ((exitPrice - w.entry_price) / w.entry_price) * 100;
         await recordWatchlistExitPerformance(env, w, exitPrice, pnlPct);
-        // daily-stats 카운트는 메시지에 정확히 "[익절]" 문자열이 있는지로 익절/손절을 구분함
-        // (다른 청산 경로: cron/relay와 동일한 형식으로 맞춰야 함 - "[익절·정원초과]"처럼 붙이면
-        // 닫는 대괄호 위치가 달라져서 매칭이 안 됨). 태그를 분리해서 [익절] 단독으로 유지.
         const reason = pnlPct >= 0 ? "익절" : "손절";
         await logSystemEvent(env, "watchlist_auto_removed", `${w.name}(${w.code}) 손익률 ${pnlPct.toFixed(2)}% 자동삭제[${reason}] [정원초과][cap${WATCHLIST_MAX_SIZE}]`);
       }
@@ -401,6 +429,19 @@ async function enforceWatchlistCap(env) {
     await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(w.code).run();
     await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(w.code).run();
   }
+}
+
+// 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가 커져서
+// (체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이 항상 적용.
+// cron(scheduled)에서 매틱 호출함 - 새 추가가 없어도(예: 배포 직후 이미 상한을 넘겨 갖고 있던 경우)
+// 저절로 정리되게 하기 위한 안전망. 평소엔 POST 핸들러의 makeRoomForNewEntry가 삽입 전에 미리
+// 자리를 비워서 상한을 안 넘기므로, 이 함수는 그 사이 race condition으로 인한 초과분만 정리하면 됨.
+const WATCHLIST_MAX_SIZE = 10;
+async function enforceWatchlistCap(env) {
+  const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
+  const overCount = countRow ? countRow.c - WATCHLIST_MAX_SIZE : 0;
+  if (overCount <= 0) return;
+  await evictWorstWatchlistEntries(env, overCount);
 }
 
 async function logSystemEvent(env, kind, message) {
@@ -2478,15 +2519,25 @@ function autoAddConditionHits(history, condName) {
     if (autoAddedCondCodes.has(h.code + ':' + h.time)) continue;
     autoAddedCondCodes.add(h.code + ':' + h.time);
     if (watchlistCodes.size >= AUTO_ADD_MAX) continue; // 상한 도달 시 더 안 담음 (기존 종목 유지)
-    // "실시간포착" 보드가 실거래 손실의 대부분(2026-08-09 performance-report: 117건 중 81패, -604,970원)을
-    // 차지한 원인이 필터 없는 무조건 자동편입이었음. relay가 이제 체결(0B)뿐 아니라 호가잔량(0D)도
-    // 구독해서 isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 틱마다 즉시 계산해서
-    // 내려주므로(2분 cron 배치가 아니라 진짜 실시간) - 당일신고가(백테스트 edge -0.075로 가장 일관된
-    // 악재 신호)인데 수급유입 신호가 하나도 없으면 추격매수 위험이 크다고 판단해서 자동편입만 거름.
-    // 편입 직후 몇백ms~몇 초는 relay 구독이 아직 안 붙어 데이터가 없을 수 있는데, 이 경우엔 판단
-    // 근거가 없으니 보수적으로 그냥 담음(막지 않음).
+    // "실시간포착" 보드가 실거래 손실의 대부분을 차지한 원인이 필터 없는 무조건 자동편입이었음.
+    // relay가 체결(0B)뿐 아니라 호가잔량(0D)도 구독해서 isTodayHigh/bidTurnedPositive/buyReqSpike/
+    // sellReqThinning을 틱마다 즉시 계산해서 내려줌(2분 cron 배치가 아니라 진짜 실시간).
+    //
+    // isTodayHigh는 하드블록으로 전환함(2026-08-21 외부 분석 근거) - 예전엔 수급신호가 하나라도
+    // 켜져 있으면 통과시켰는데, 자체 실측(당일신고가 실거래 -1.676%~-1.902%/승률 23.5~29.4%,
+    // n=17)이 백테스트보다 훨씬 나쁘고 일관되게 악재였음. 수급신호 3개 조합의 백테스트 edge가
+    // +0.04~0.064%p/틱에 불과해서 isTodayHigh의 악재 edge를 상쇄 못 함 - 즉 "수급신호 있으니
+    // 괜찮다"는 판단 자체가 데이터로 뒷받침이 안 됨. 편입 직후 relay 구독이 아직 안 붙어 데이터가
+    // 없는 경우엔 판단 근거가 없으니 보수적으로 그냥 담음(막지 않음).
     const liveSig = liveSignalCache[h.code];
-    if (liveSig && liveSig.isTodayHigh && !liveSig.bidTurnedPositive && !liveSig.buyReqSpike && !liveSig.sellReqThinning) continue;
+    if (liveSig && liveSig.isTodayHigh) continue;
+
+    // 14시 이후 신규 자동편입 금지 - 마감(15:30)까지 남은 시간이 짧아 +3.5% 익절 도달은 사실상
+    // 어려운데(추세가 이미 진행된 뒤라 추가 상승 여력 제한적) -1.5% 손절은 언제든 가능해서, 늦은
+    // 시간대 진입은 구조적으로 승산이 나쁨. 기존 관심종목 관리(익절/손절/정원초과)는 계속 정상 작동.
+    const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+    const kstMinutes = kstNow.getUTCHours() * 60 + kstNow.getUTCMinutes();
+    if (kstMinutes >= 14 * 60) continue;
 
     const name = h.name || (byCodeMap[h.code] && byCodeMap[h.code].name) || h.code;
     watchlistCodes.add(h.code);
@@ -4724,13 +4775,16 @@ self.addEventListener('fetch', (e) => {
               // 이번 시도 실패, 다음 루프에서 재시도 (마지막 시도까지 실패하면 0으로 저장, 프론트에서 재시도 유도)
             }
           }
+          // 삽입 전에 기존 종목 중에서만 자리를 미리 비워둠 - 방금 넣을 종목이 비교 대상에 안 들어가서
+          // 편입되자마자 몇 초 안에 퇴출당하는 문제를 원천 차단함 (자세한 이유는 함수 주석 참고)
+          await makeRoomForNewEntry(env);
+
           await env.DB.prepare(
             `INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price, source_board, added_state) VALUES (?, ?, ?, ?, ?, ?)`
           )
             .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
-          await enforceWatchlistCap(env);
 
           // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
           // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
@@ -4931,7 +4985,9 @@ self.addEventListener('fetch', (e) => {
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
           await env.DB.prepare(`DELETE FROM watchlist_risk_status WHERE code = ?`).bind(code).run();
           const pnlStr = typeof pnlPct === "number" ? pnlPct.toFixed(2) : "?";
-          const reason = typeof pnlPct === "number" && pnlPct >= 3.5 ? "익절" : "손절";
+          // 트레일링스톱 도입으로 +0.5~3.4% 사이에서도 익절(조기 확정)이 나올 수 있어서, 예전처럼
+          // ">=3.5%만 익절"로 판정하면 이런 건이 전부 "손절"로 잘못 찍힘. 부호 기준으로 정확히 판정.
+          const reason = typeof pnlPct === "number" && pnlPct >= 0 ? "익절" : "손절";
           await logSystemEvent(env, "watchlist_auto_removed", `${name || code}(${code}) 손익률 ${pnlStr}% 자동삭제[${reason}] [relay]`);
           console.log(`relay ${reason} 자동삭제: ${code} (${pnlStr}%)`);
           return Response.json({ ok: true });
