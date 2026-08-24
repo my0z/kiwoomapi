@@ -524,7 +524,9 @@ async function collectAndStore(env) {
 
 // 7일 지난 데이터 삭제
 async function purgeOldRows(env) {
-  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  // 무료 티어일 땐 스토리지 비용 때문에 7일로 짧게 잡았었음 - 유료 전환(2026-08) 이후로는
+  // 30일로 늘려서 simulate-exits 같은 임계값 재검증 작업에 쓸 표본을 훨씬 크게 확보함.
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const result = await env.DB.prepare(
     `DELETE FROM snapshots WHERE captured_at < ?`
   )
@@ -544,8 +546,8 @@ async function purgeOldRows(env) {
   await env.DB.prepare(`DELETE FROM signal_backtest_history WHERE date < ?`).bind(historyCutoff).run().catch(() => {});
   // daily_ohlc_cache도 하루 지나면 무의미 (다음날은 또 새 일봉이라 어차피 재조회됨)
   await env.DB.prepare(`DELETE FROM daily_ohlc_cache WHERE updated_at < ?`).bind(shortCutoff).run().catch(() => {});
-  // watchlist_fine_snapshots는 30초마다 쌓여서 금방 커짐 - 2일만 유지
-  const fineCutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  // watchlist_fine_snapshots는 30초마다 쌓여서 금방 커짐 - 유료 전환 이후 14일로 확대 (예전엔 2일)
+  const fineCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(`DELETE FROM watchlist_fine_snapshots WHERE captured_at < ?`).bind(fineCutoff).run().catch(() => {});
   await env.DB.prepare(`DELETE FROM system_events WHERE created_at < ?`).bind(cutoff).run().catch(() => {});
 
@@ -4742,9 +4744,8 @@ self.addEventListener('fetch', (e) => {
               )
                 .bind(new Date().toISOString(), addedState || "", code)
                 .run();
-              // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
+              // 유료 전환(2026-08) 이후 KV 쓰기 할당량 걱정 없어져서 즉시 무효화 재도입
+              if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
               return Response.json({ ok: true, entryPrice: existing.entry_price });
             }
             // D1에 없는데 클라이언트만 있던 상태(레이스) - 아래 일반 경로로 신규 추가 진행
@@ -4786,9 +4787,8 @@ self.addEventListener('fetch', (e) => {
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
 
-          // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
+          // 유료 전환(2026-08) 이후 KV 쓰기 할당량 걱정 없어져서 즉시 무효화 재도입
+          if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
           return Response.json({ ok: true, entryPrice });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -4800,9 +4800,8 @@ self.addEventListener('fetch', (e) => {
           const code = url.searchParams.get("code");
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
           await env.DB.prepare(`DELETE FROM watchlist WHERE code = ?`).bind(code).run();
-          // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
+          // 유료 전환(2026-08) 이후 KV 쓰기 할당량 걱정 없어져서 즉시 무효화 재도입
+          if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
           return Response.json({ ok: true });
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
@@ -5092,9 +5091,8 @@ self.addEventListener('fetch', (e) => {
                   .filter((f) => zeroEntryCodes.has(f.code) && f.price > 0)
                   .map((f) => env.DB.prepare(`UPDATE watchlist SET entry_price = ? WHERE code = ?`).bind(f.price, f.code).run())
               );
-              // KV delete 호출 제거 - 관심종목 추가/삭제마다 즉시 무효화하던 게 KV 쓰기 할당량을
-          // 크게 잡아먹던 또 다른 원인이었음. 캐시 TTL이 원래 60초로 짧아서, 그냥 자연만료에
-          // 맡겨도 최대 60초 지연 정도라 실사용에 지장 없음(가격 자체는 실시간 SSE로 별도 갱신됨).
+              // 유료 전환(2026-08) 이후 KV 쓰기 할당량 걱정 없어져서 즉시 무효화 재도입
+              if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
             }
           }
 
@@ -6711,10 +6709,25 @@ self.addEventListener('fetch', (e) => {
           console.error("관심종목 성과추적 실패:", e.message || e);
         });
         await checkRelayHealthForCron(env).catch(() => {}); // 이것 자체가 실패해도 나머지 흐름엔 영향 없음
-        // 미니차트 KV 프리웜은 제거함 - 2분마다 무조건 KV write가 발생해서(장중 하루 약 200회)
-        // Workers KV 무료 티어 쓰기 한도를 크게 잡아먹던 주된 원인이었음. 클라이언트가 실제로 페이지를
-        // 보고 있을 때만(load() 주기 15초) 호출하는 /api/mini-candles-all의 온디맨드 캐시 채움만으로도
-        // 충분해서, 아무도 안 보고 있을 때까지 미리 채워두는 낭비를 없앰.
+        // 미니차트 KV 프리웜 재도입 (유료 전환 이후 KV 쓰기 할당량 걱정 없어짐) - 사용자가 페이지를
+        // 열 때 KV 미스로 relay를 왕복하는 일 없이 항상 즉시 미니차트가 뜨게 함.
+        if (env.RELAY_URL && env.RELAY_SECRET && env.CACHE_KV) {
+          try {
+            const mcRes = await kiwoomRelayFetch(env, "/realtime/mini-candles-all", { method: "GET" });
+            if (mcRes.ok) {
+              const mcData = await mcRes.json();
+              if (mcData.ok) {
+                await env.CACHE_KV.put(
+                  "mini-candles-all-v1",
+                  JSON.stringify({ ok: true, cache: mcData.cache || {} }),
+                  { expirationTtl: 200 }
+                );
+              }
+            }
+          } catch (e) {
+            console.error("미니캔들 KV 프리웜 실패:", e.message || e);
+          }
+        }
       })().catch((e) => {
         console.error("scheduled 정리작업 실패:", e.message || e);
         return logSystemEvent(env, "cron_failure", `정리작업 실패: ${e.message || e}`);
