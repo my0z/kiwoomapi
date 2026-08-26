@@ -63,4 +63,13 @@ head_sampling_rate = 1
 binding = "BACKTEST_R2"
 bucket_name = "kiwoomapi-backtest-raw"
 
+[[analytics_engine_datasets]]
+binding = "SIGNAL_ANALYTICS"
+dataset = "kiwoomapi_signal_backtest"
+
+
+
+
+
+
 
