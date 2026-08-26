@@ -4483,19 +4483,63 @@ async function checkRelayHealthForCron(env) {
 
   if (lastKnownRelayHealthy === null) {
     lastKnownRelayHealthy = healthy; // 최초 1회는 상태만 기억, 로그는 비정상일 때만
-    if (!healthy) await logSystemEvent(env, "relay_unhealthy", detail);
+    if (!healthy) {
+      await logSystemEvent(env, "relay_unhealthy", detail);
+      await kakaoNotify(env, `⚠️ kiwoom relay 비정상\n${detail}`);
+    }
     return;
   }
   if (lastKnownRelayHealthy && !healthy) {
     await logSystemEvent(env, "relay_unhealthy", "웹소켓이 끊긴 것으로 보임: " + detail);
+    await kakaoNotify(env, `⚠️ kiwoom relay 웹소켓 끊김\n${detail}`);
   } else if (!lastKnownRelayHealthy && healthy) {
     await logSystemEvent(env, "relay_recovered", "웹소켓 복구됨: " + detail);
+    await kakaoNotify(env, `✅ kiwoom relay 복구됨\n${detail}`);
   }
   lastKnownRelayHealthy = healthy;
 }
 
+// 카카오 액세스 토큰 갱신 (refresh_token 방식) - 상태 변화 시에만 호출되므로 매번 갱신해도 부담 없음
+async function getKakaoAccessToken(env) {
+  const res = await fetch('https://kauth.kakao.com/oauth/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: env.KAKAO_CLIENT_ID,
+      refresh_token: env.KAKAO_REFRESH_TOKEN
+    })
+  });
+  if (!res.ok) throw new Error(`Kakao token error: ${res.status} ${await res.text()}`);
+  const data = await res.json();
+  return data.access_token;
+}
+
+// 카카오톡 "나에게 보내기"로 알림 발송 - 실패해도 원래 흐름(헬스체크)에 영향 주지 않음
+async function kakaoNotify(env, message) {
+  if (!env.KAKAO_CLIENT_ID || !env.KAKAO_REFRESH_TOKEN) return; // 토큰 미설정이면 조용히 스킵
+  try {
+    const accessToken = await getKakaoAccessToken(env);
+    const templateObject = {
+      object_type: 'text',
+      text: message.slice(0, 200),
+      link: { web_url: 'https://usb.kr', mobile_web_url: 'https://usb.kr' }
+    };
+    await fetch('https://kapi.kakao.com/v2/api/talk/memo/default/send', {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${accessToken}`,
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({ template_object: JSON.stringify(templateObject) })
+    });
+  } catch (e) {
+    // 알림 실패해도 무시 - 헬스체크 로직 자체는 계속 진행돼야 함
+  }
+}
+
 // backtest-signals의 실측 로직 - HTTP 엔드포인트와 매일 자동 실행 cron 둘 다에서 씀
-async function computeSignalBacktest(env, tickLimit) {
+async function computeSignalBacktest(env, tickLimit, collectRaw = false) {
   const timesRes = await env.DB.prepare(
     `SELECT DISTINCT captured_at FROM snapshots ORDER BY captured_at DESC LIMIT ?`
   )
@@ -4531,6 +4575,7 @@ async function computeSignalBacktest(env, tickLimit) {
     stats[name] = { trueCount: 0, trueForwardSum: 0, falseCount: 0, falseForwardSum: 0 };
   });
   let baselineCount = 0, baselineForwardSum = 0;
+  const rawRecords = collectRaw ? [] : null; // R2 원본 보관용 - 기본 호출에선 수집 안 해 성능 영향 없음
 
   for (const [code, rowByTime] of byCode) {
     let runningMaxRate = -Infinity;
@@ -4595,6 +4640,10 @@ async function computeSignalBacktest(env, tickLimit) {
         stats[name][bucket + "Count"]++;
         stats[name][bucket + "ForwardSum"] += forwardDelta;
       });
+
+      if (collectRaw) {
+        rawRecords.push({ code, captured_at: cur.captured_at, change_rate: cur.change_rate, forwardDelta, signals });
+      }
     }
   }
 
@@ -4617,19 +4666,60 @@ async function computeSignalBacktest(env, tickLimit) {
     ticksAnalyzed: times.length,
     baselineAvgForwardDeltaPct: baselineAvg,
     signals: results,
+    ...(collectRaw ? { rawRecords } : {}),
   };
 }
 
 // 매일 장마감 후 한 번, 그날치 신호 검증 결과를 자동으로 남김 - 사람이 매번 URL 안 열어봐도 이력이 쌓이게 함
 async function runDailySignalBacktest(env) {
-  const result = await computeSignalBacktest(env, 300);
+  const result = await computeSignalBacktest(env, 600, true); // Paid 플랜 CPU 여유 확보로 300→600 상향, collectRaw=true로 R2 원본 보관용 틱 데이터도 수집
   if (!result.ok) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const rawRecords = result.rawRecords;
+  const summaryOnly = { ok: result.ok, ticksAnalyzed: result.ticksAnalyzed, baselineAvgForwardDeltaPct: result.baselineAvgForwardDeltaPct, signals: result.signals };
+
+  // D1엔 요약 JSON만 (기존과 동일 - rawRecords는 용량이 커서 D1에 안 넣음)
   await env.DB.prepare(
     `INSERT OR REPLACE INTO signal_backtest_history (date, result_json, created_at) VALUES (?, ?, ?)`
   )
-    .bind(new Date().toISOString().slice(0, 10), JSON.stringify(result), new Date().toISOString())
+    .bind(today, JSON.stringify(summaryOnly), new Date().toISOString())
     .run()
     .catch(() => {});
+
+  // R2: 틱 단위 원본 결과를 날짜별로 통째 보관 - 나중에 지금은 없는 신호를 새로 정의해도
+  // 과거 원본 데이터로 소급 재검증 가능하게 하려는 목적 (요약 JSON만으론 이게 안 됨)
+  if (env.BACKTEST_R2 && rawRecords && rawRecords.length) {
+    try {
+      await env.BACKTEST_R2.put(
+        `backtest-raw/${today}.json`,
+        JSON.stringify({ date: today, ticksAnalyzed: result.ticksAnalyzed, rawRecords }),
+        { httpMetadata: { contentType: 'application/json' } }
+      );
+    } catch (e) {
+      // R2 저장 실패해도 D1 요약 저장엔 영향 없음
+    }
+  }
+
+  // Analytics Engine: 신호별 edge/샘플수를 시계열로 기록 (D1은 요약 JSON 통째 보관용, 이쪽은
+  // "특정 신호의 edge가 최근 N일간 어떻게 변해왔는지" 같은 대용량 집계 쿼리를 빠르게 하려는 용도)
+  if (env.SIGNAL_ANALYTICS) {
+    for (const [signalName, s] of Object.entries(result.signals || {})) {
+      try {
+        env.SIGNAL_ANALYTICS.writeDataPoint({
+          indexes: [signalName], // 신호명 기준으로 빠르게 필터링
+          blobs: [today],
+          doubles: [
+            s.sampleSize ?? 0,
+            s.avgForwardDeltaWhenTrue ?? 0,
+            s.avgForwardDeltaWhenFalse ?? 0,
+            s.edgeVsBaseline ?? 0
+          ]
+        });
+      } catch (e) {
+        // Analytics Engine 기록 실패해도 백테스트 자체 결과 저장엔 영향 없음
+      }
+    }
+  }
 }
 
 // 관심종목 30초 촘촘 기록 - 전체 150~200종목을 이 주기로 D1에 쓰면 하루 쓰기 한도(10만행)를 넘기지만,
