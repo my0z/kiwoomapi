@@ -1,6 +1,7 @@
 name = "kiwoomapi"
 main = "worker.js"
 compatibility_date = "2026-07-15"
+keep_vars=true
 
 [[d1_databases]]
 binding = "DB"
@@ -57,3 +58,9 @@ invocation_logs = true
 enabled = true
 persist = true
 head_sampling_rate = 1
+
+[[r2_buckets]]
+binding = "BACKTEST_R2"
+bucket_name = "kiwoomapi-backtest-raw"
+
+
