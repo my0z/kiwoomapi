@@ -431,6 +431,98 @@ async function evictWorstWatchlistEntries(env, n) {
   }
 }
 
+// SNS 급등 조짐 태깅 - 관심종목 추가 시점에 백그라운드로 실행(ctx.waitUntil, 응답속도에 영향 없음).
+// 블로그/카페/뉴스는 네이버 공식 검색API(openapi.naver.com)를 Worker가 직접 호출 - 스크래핑이
+// 아니라 정식 API라 예전에 Cloudflare IP가 차단됐던 문제(worker.js 상단 주석 참고)와 무관함.
+// 종목토론방 게시글수는 스크래핑이라 relay를 거침(/proxy/naver-board).
+// 아직 필터링엔 안 씀 - added_state에 "SNS급등" 태그만 남겨서, 다른 신호들과 동일하게 며칠간
+// performance-report의 bySignal로 실제 승률/손익에 도움되는지부터 검증한 뒤에 결정.
+async function ensureSnsBuzzTable(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS sns_buzz_snapshots
+     (code TEXT, board_posts INTEGER, blog_recent INTEGER, cafe_recent INTEGER, news_recent INTEGER, captured_at TEXT)`
+  ).run().catch(() => {});
+}
+
+// 네이버 검색API로 최근 60분 이내 게시물 수를 셈 - total 필드는 "역대 누적 색인수"라 급증 감지에
+// 못 쓰므로, 최신순(sort=date)으로 최대 30건을 가져와 pubDate가 60분 이내인 것만 직접 셈.
+async function naverRecentMentionCount(env, query, type) {
+  if (!env.NAVER_CLIENT_ID || !env.NAVER_CLIENT_SECRET) return null; // 시크릿 미등록 시 조용히 스킵
+  try {
+    const res = await fetch(
+      `https://openapi.naver.com/v1/search/${type}.json?query=${encodeURIComponent(query)}&display=30&sort=date`,
+      {
+        headers: {
+          "X-Naver-Client-Id": env.NAVER_CLIENT_ID,
+          "X-Naver-Client-Secret": env.NAVER_CLIENT_SECRET,
+        },
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    let count = 0;
+    for (const item of data.items || []) {
+      // news/blog는 pubDate(RFC822), cafearticle은 별도 날짜 필드가 없어 최신순 정렬만 신뢰
+      const dateStr = item.pubDate;
+      if (dateStr) {
+        const t = new Date(dateStr).getTime();
+        if (!isNaN(t) && t >= cutoff) count++;
+      } else {
+        count++; // 날짜 필드 없는 타입(cafearticle)은 최신순 정렬을 신뢰해 상위 노출분을 그대로 카운트
+      }
+    }
+    return count;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function collectAndTagSnsBuzz(env, code, name, addedAt) {
+  try {
+    await ensureSnsBuzzTable(env);
+
+    const [blogRecent, cafeRecent, newsRecent, boardRes] = await Promise.all([
+      naverRecentMentionCount(env, name, "blog"),
+      naverRecentMentionCount(env, name, "cafearticle"),
+      naverRecentMentionCount(env, name, "news"),
+      kiwoomRelayFetch(env, `/proxy/naver-board?code=${code}`, { method: "GET" })
+        .then((r) => r.json())
+        .catch(() => ({ ok: false })),
+    ]);
+    const boardPosts = boardRes && boardRes.ok ? boardRes.totalPosts : null;
+
+    // 직전 스냅샷(이 종목 기준 가장 최근 것, 오늘이 아니어도 됨) 대비 게시글 증가폭으로 급증 판단
+    const prevRow = await env.DB.prepare(
+      `SELECT board_posts, captured_at FROM sns_buzz_snapshots WHERE code = ? ORDER BY captured_at DESC LIMIT 1`
+    ).bind(code).first().catch(() => null);
+
+    let boardSurge = false;
+    if (prevRow && prevRow.board_posts !== null && boardPosts !== null) {
+      const hoursSince = (Date.now() - new Date(prevRow.captured_at).getTime()) / 3600000;
+      // 너무 오래전(예: 며칠 전) 스냅샷과 비교하면 자연 누적분까지 "급증"으로 오판하므로 24시간 이내만 인정
+      if (hoursSince > 0 && hoursSince <= 24) {
+        const postsPerHour = (boardPosts - prevRow.board_posts) / hoursSince;
+        boardSurge = postsPerHour >= 10; // 시간당 10건 이상 새 글 - 평소 대비 급증으로 간주
+      }
+    }
+    const mentionSurge = (blogRecent || 0) + (cafeRecent || 0) + (newsRecent || 0) >= 5; // 최근 60분 합산 5건 이상
+
+    await env.DB.prepare(
+      `INSERT INTO sns_buzz_snapshots (code, board_posts, blog_recent, cafe_recent, news_recent, captured_at) VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(code, boardPosts, blogRecent, cafeRecent, newsRecent, new Date().toISOString()).run().catch(() => {});
+
+    if (boardSurge || mentionSurge) {
+      await env.DB.prepare(
+        `UPDATE watchlist SET added_state = added_state || ',SNS급등' WHERE code = ? AND added_at = ?`
+      ).bind(code, addedAt).run().catch(() => {});
+      await logSystemEvent(env, "sns_buzz_detected", `${name}(${code}) SNS급등 태그 - 게시판:${boardSurge} 언급량:${mentionSurge}(블로그${blogRecent ?? "-"}/카페${cafeRecent ?? "-"}/뉴스${newsRecent ?? "-"})`);
+    }
+  } catch (e) {
+    // 실패해도 관심종목 추가 자체엔 영향 없음(이미 백그라운드로 분리돼 있음)
+  }
+}
+
 // 관심종목 전역 상한(10개) - 장중 종목 수가 많아질수록 relay 실시간 구독/렌더링 부하가 커져서
 // (체감상 버벅거림) 10개로 못박음. 유입 경로(조건검색 자동편입/수동 별표 클릭) 관계없이 항상 적용.
 // cron(scheduled)에서 매틱 호출함 - 새 추가가 없어도(예: 배포 직후 이미 상한을 넘겨 갖고 있던 경우)
@@ -4568,7 +4660,7 @@ async function computeSignalBacktest(env, tickLimit, collectRaw = false) {
   const signalNames = [
     "accelerating", "bidTurnedPositive", "cntrStrRising",
     "buyReqSpike", "volumeSpike", "isTodayHigh", "pullbackLike",
-    "sellReqThinning", "realPullback", "comboBuySignal", "isGoldenTime", "isLunchLull", "volumeConfirmed", "strongCntrStr",
+    "sellReqThinning", "realPullback", "comboBuySignal", "isGoldenTime", "isLunchLull", "boxBreakout", "volumeConfirmed", "strongCntrStr",
   ];
   const stats = {};
   signalNames.forEach((name) => {
@@ -4587,6 +4679,24 @@ async function computeSignalBacktest(env, tickLimit, collectRaw = false) {
       if (!older || !prev || !cur) continue;
       if (cur.change_rate > runningMaxRate) runningMaxRate = cur.change_rate;
       if (!next) continue;
+
+      // boxBreakout(채널/삼각수렴 압축 후 돌파) 계산용 - 최근 5틱(약10분, 2분간격 기준) 구간을
+      // "박스"로 보고, 그 등락률 범위가 좁게 수렴해 있다가 현재 틱이 그 상단을 뚫으면 돌파로 판정.
+      // 절대가격 데이터가 없어(snapshots엔 등락률만 저장) change_rate를 가격 대용으로 씀 -
+      // 같은 종목 기준 등락률과 가격은 단조증가 관계라 박스 형태 판정엔 문제없음.
+      const t3 = i >= 3 ? rowByTime.get(times[i - 3]) : null;
+      const t4 = i >= 4 ? rowByTime.get(times[i - 4]) : null;
+      const t5 = i >= 5 ? rowByTime.get(times[i - 5]) : null;
+      const boxRows = [t5, t4, t3, older, prev].filter(Boolean);
+      let boxBreakout = false;
+      if (boxRows.length === 5) {
+        const boxHigh = Math.max(...boxRows.map((r) => r.change_rate));
+        const boxLow = Math.min(...boxRows.map((r) => r.change_rate));
+        const boxRangePct = boxHigh - boxLow;
+        // 박스 범위 1.5%p 이내(수렴 상태)로 좁혀져 있다가, 그 상단을 소폭(0.05%p) 넘어서는 순간만
+        // 인정 - 박스 안에서의 미세한 등락은 돌파로 안 침
+        boxBreakout = boxRangePct <= 1.5 && cur.change_rate > boxHigh + 0.05;
+      }
 
       const forwardDelta = next.change_rate - cur.change_rate;
       baselineCount++;
@@ -4633,6 +4743,11 @@ async function computeSignalBacktest(env, tickLimit, collectRaw = false) {
           const m = kst.getUTCHours() * 60 + kst.getUTCMinutes();
           return m >= 13 * 60 && m <= 14 * 60 + 30;
         })(),
+        // 채널/삼각수렴 돌파 - 인스타 교육계정이 소개한 캔들패턴(헤드앤숄더/깃발형/이중바닥/삼각수렴/
+        // 채널) 중 인트라데이 스케일에서 유일하게 시도해볼 만한 "채널"을 등락률 기반으로 근사 구현.
+        // 나머지 넷은 최소 며칠~몇 주짜리 스윙 패턴이라 당일 청산 전제인 이 시스템과 시간축이 안 맞아
+        // 제외함. 실거래 필터 반영 전, 우선 여기서 edge가 실제로 있는지부터 검증(isLunchLull과 동일 절차).
+        boxBreakout,
       };
 
       signalNames.forEach((name) => {
@@ -4870,12 +4985,17 @@ self.addEventListener('fetch', (e) => {
           // 편입되자마자 몇 초 안에 퇴출당하는 문제를 원천 차단함 (자세한 이유는 함수 주석 참고)
           await makeRoomForNewEntry(env);
 
+          const addedAtNow = new Date().toISOString();
           await env.DB.prepare(
             `INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price, source_board, added_state) VALUES (?, ?, ?, ?, ?, ?)`
           )
-            .bind(code, name, new Date().toISOString(), entryPrice, sourceBoard || "", addedState || "")
+            .bind(code, name, addedAtNow, entryPrice, sourceBoard || "", addedState || "")
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
+
+          // SNS 급등 조짐 태깅 - 응답 속도에 영향 안 주게 백그라운드로 실행. 매수/매도 판단에
+          // 아직 안 쓰고 added_state에 태그만 남겨서 며칠간 성과 추적 후 실제 도움되는지 검증할 예정.
+          ctx.waitUntil(collectAndTagSnsBuzz(env, code, name, addedAtNow));
 
           // 유료 전환(2026-08) 이후 KV 쓰기 할당량 걱정 없어져서 즉시 무효화 재도입
           if (env.CACHE_KV) ctx.waitUntil(env.CACHE_KV.delete("watchlist-quotes-v1").catch(() => {}));
