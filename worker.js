@@ -183,12 +183,14 @@ async function checkWatchlistRiskLevels(env) {
 
   const token = await kiwoomIssueToken(env);
   let checked = 0;
-  // 2026-08-21 외부 분석 근거로 손절폭 확대: +3.5%/-1.5% 장벽에서 드리프트 0인 무작위 워크라도
-  // 손절이 먼저 맞을 확률이 1.5/(3.5+1.5)=70%로 구조적으로 손절 우위였음. -2.5%로 넓히면 41.7%로
-  // 개선됨. 급등주 장중 변동성(±1.5% 스윙이 몇 분 안에 발생)이 예전 손절폭 안에 있어서 노이즈에
-  // 잦게 걸렸던 문제도 같이 완화됨.
-  const AUTO_REMOVE_PNL_PCT = -2.5;
-  const AUTO_TAKE_PROFIT_PNL_PCT = 3.5;
+  // 2026-08-21 이론(무작위워크 장벽비율)으로 -1.5%->-2.5% 확대했었으나, 2026-08-27
+  // simulate-exits(30일, 표본227) 재검증에서 뒤집힘: TP값과 무관하게 손절폭이 좁을수록(-1%~-1.5%)
+  // 순손익이 전 구간에서 일관되게 더 좋았음(예: TP3.5/SL-2.5 넷 -144,790원 vs TP4/SL-1.5 넷
+  // +324,181원). 이 시스템은 모멘텀 추격매매라 진입 직후 역행 자체가 "판단이 틀렸다"는 강한 신호이고,
+  // 손절을 넓혀서 버티게 하면 오히려 손실만 키운다는 뜻 - 이론적 장벽비율보다 실측을 신뢰해서 되돌림.
+  // 익절은 3.5%->4%로 소폭 확대(같은 재검증에서 TP4가 TP3.5보다 대체로 우위).
+  const AUTO_REMOVE_PNL_PCT = -1.5;
+  const AUTO_TAKE_PROFIT_PNL_PCT = 4;
   const TRAIL_ACTIVATE_PCT = 2.0; // 이 손익률에 한 번이라도 도달하면 트레일링 스톱 활성화
   const TRAIL_DISTANCE_PCT = 1.5; // 활성화 후 고점 대비 이만큼 밀리면 조기 청산
   const stillHeldCodes = new Set(items.map((it) => it.code));
@@ -1494,38 +1496,39 @@ function computeRecommendations(latest, pullbackCodes) {
       const olderDelta = mom.length ? mom[mom.length - 1].delta : recentDelta; // 가장 오래된 구간(약10분전)
       const accelerating = recentDelta > olderDelta; // 갈수록 빨라지는 중인지 (배지 표시용으로만 씀, 아래 참고)
 
-      // ---- 2026-08-10 backtest-signals(ticks=784) + performance-report(실거래 표본208) 재검증 ----
+      // ---- 2026-08-27 backtest-signals(ticks=1000, 대표본) + performance-report(실거래 표본651) 재검증 ----
       // (edgeVsBaseline: 그 신호가 있었을 때 다음 틱 평균 등락이 전체 평균보다 얼마나 높았는지)
-      // 직전 조정(08-09) 이후 overall이 avgPnlPct -0.388%->-0.102%, 승률 34.7%->41.8%로 개선됨.
-      // "실시간포착"도 -0.517%->-0.135% / 승률 29.9%->40%로 크게 나아짐(자동편입 필터 효과로 보임) - 방향 유지.
-      //   bidTurnedPositive +0.050(표본10060) / buyReqSpike +0.040(표본14659) / sellReqThinning +0.043(표본7815)
-      //     -> 셋 다 대표본에서 안정적으로 유효. 다만 실거래 표본에선 매수전환 -0.735%(n=9)/매수잔량급증 -1.692%(n=11)로
-      //        어긋나는데, 표본이 1만건 대 10건 수준이라 백테스트를 신뢰하되 과신은 피해서 소폭 하향 조정.
-      //   comboBuySignal +0.064(표본4087) -> 개별신호보다 일관되게 강함, 유지
-      //   isTodayHigh -0.067(표본14893) + 실거래 -1.676%/승률29.4%(n=17) -> 백테스트·실거래 모두 일치, 감점 유지
-      //   isGoldenTime +0.048(표본5785) -> 08-09에 "3일 연속 역효과"로 판단해 가점을 뺐는데, 그건 표본307짜리
-      //     소표본 편향이었음이 대표본에서 드러남(부호가 반대로 뒤집힘). 가점 복구.
-      //   realPullback +0.017(표본2831) -> 처음으로 안정적 플러스. 단순 pullbackLike(-0.031)와 정반대라
-      //     "수급유입이 동반된 눌림목만 유효하다"는 가설이 실측으로 확인됨. 지금까지 점수에 안 쓰이던 신호라 신규 도입.
-      //   volumeConfirmed +0.027(표본72) -> 표본이 늘며 다시 플러스로 돌아왔으나 그동안 부호가 계속 뒤집혀온
-      //     신호(표본12 -> +, 표본69 -> -, 표본72 -> +)라 아직 신뢰 낮음. 아주 작게만 반영.
-      //   accelerating -0.013 / cntrStrRising +0.001 / pullbackLike -0.031 -> 무효 내지 역효과, 점수 미반영 유지
-      //   repeatDays===2(2일째등장) 실거래 avgPnlPct +0.736%/승률66.7%(n=18) -> 유효, 유지
+      // 지난 재조정(08-10) 이후 표본이 3배 이상 늘면서 여러 신호의 부호/크기가 다시 바뀜 - 작은 표본에서
+      // 우연히 좋아 보였던 것들이 큰 표본에서 정정된 케이스가 많음. 이번엔 이론적 추정 없이 전부 실측 기준.
+      //   bidTurnedPositive +0.043 / buyReqSpike +0.033 / sellReqThinning +0.037 / comboBuySignal +0.062
+      //     -> 넷 다 여전히 안정적 플러스. comboBuySignal이 가장 강함(유지).
+      //   realPullback -0.0165(표본1530) -> 08-10엔 +0.017(표본2831)로 신규 도입했던 신호인데 표본이
+      //     늘며 완전히 뒤집힘. "수급유입 동반 눌림목" 가설이 대표본에서 기각됨 - 가점 제거.
+      //   isGoldenTime +0.0018(표본1467) -> 08-10엔 +0.048(표본5785)로 부호 복구까지 했었는데, 대표본
+      //     에선 사실상 0에 가까움. 08-09/08-10 두 번의 부호 반전은 소표본 노이즈였던 것으로 결론짓고
+      //     가점을 크게 낮춤(1.5 -> 0.3, 완전 제거는 아직 보류 - 한 번 더 반전된 전례가 있어서).
+      //   volumeConfirmed -0.2603(표본53) / volumeSpike -0.2427(표본108, 별도신호) -> 둘 다 극단적
+      //     음수로 방향이 명확히 일치함. "거래량 급증=수급 확인"이라는 기존 해석이 완전히 틀렸고, 오히려
+      //     "거래량 폭발=클라이맥스(소진성 급등, 직후 반전 위험)"로 재해석하는 게 데이터와 맞음.
+      //     가점 제거하고 오히려 감점으로 전환.
+      //   isTodayHigh -0.0519(표본10751) -> 여전히 강한 악재, 자동편입 하드블록 유지(점수는 참고용으로만 감점 유지)
+      //   accelerating -0.0241 / cntrStrRising -0.0056 / pullbackLike -0.047 / boxBreakout -0.0399
+      //     -> 전부 무효~역효과. boxBreakout은 애초 기대(채널 돌파=매수신호)와 정반대로 나와서 점수 미반영 유지.
       let score = 0;
       score += recentDelta * 4;
-      if (r.bidTurnedPositive) score += 5; // 실거래 표본이 어긋나 과신 피함 - 5.5 -> 5
-      if (r.buyReqSpike) score += 3; // 위와 동일한 이유 - 3.5 -> 3
-      if (r.sellReqThinning) score += 3.5; // 대표본에서 안정적, 실거래 표본(n=2)은 판단 불가 수준이라 유지
+      if (r.bidTurnedPositive) score += 5;
+      if (r.buyReqSpike) score += 3;
+      if (r.sellReqThinning) score += 3.5;
       // 복합신호(강한매수세): 매수전환+매수잔량급증이 동시에 뜨면 개별 신호보다 훨씬 강한 확인 -
       // 둘 다 검증된 신호가 동시에 나타나는 거라 우연히 겹칠 확률이 낮고, 방향성 있는 진짜 수급일 가능성이 큼
       if (r.bidTurnedPositive && r.buyReqSpike) score += 3;
-      // 진짜 눌림목: 되돌림 후 재상승(pullbackLike) 자체는 역효과지만, 거기에 수급유입 신호가 동반되면
-      // 처음으로 뚜렷한 플러스로 바뀜 - 이미 한 번 힘을 보여주고 쉬었다가 실제 수급과 함께 다시 도는 자리
+      // realPullback: 대표본 재검증에서 역전(-0.0165)돼 가점 제거. 배지 표시용으로만 계산은 유지.
       const realPullback = pullbackCodes.has(r.code) && (r.bidTurnedPositive || r.buyReqSpike || r.sellReqThinning);
-      if (realPullback) score += 2;
-      // 거래량 동반 확인: 호가잔량 신호가 실제 체결거래량 증가와 같이 온 경우 - 표본이 작아 가중치는 최소로만
+      // volumeConfirmed: 대표본에서 극단적 악재(-0.26)로 확인돼 가점 제거하고 감점으로 전환 -
+      // "거래량 급증"을 확인신호가 아니라 클라이맥스(소진성 급등) 경고로 재해석함
       const volumeConfirmed = (r.bidTurnedPositive || r.buyReqSpike) && r.volumeSpikeRatio && r.volumeSpikeRatio >= 1.5;
-      if (volumeConfirmed) score += 0.5;
+      if (volumeConfirmed) score -= 3;
+      if (r.volumeSpikeRatio && r.volumeSpikeRatio >= 3) score -= 3; // 거래량 극단치 자체도 별도 감점(호가신호 동반 여부 무관)
       // 체결강도 절대수준: 100 넘는지(방향)뿐 아니라 얼마나 강한지도 봄 - 150 이상은 "강한 매수세 유입"이 통상적 해석 기준
       if ((r.cntr_str || 0) >= 150) score += 1.5;
       // 2일 연속 급등리스트 등장 - 실거래 데이터상 뚜렷한 양의 성과(일회성 반짝보다 지속 관심이 낫다는 근거)
@@ -1538,7 +1541,7 @@ function computeRecommendations(latest, pullbackCodes) {
       if (typeof r.tradeValue === 'number' && r.tradeValue > 0 && r.tradeValue < 1000000000) score -= 2;
       if (recentDelta < 0) score -= 4; // 지금 이 순간 이미 꺾이는 중이면 감점
       if (isLateSession) score -= 2; // 오후 늦은 시각 - 마감까지 회복 시간이 부족
-      if (isGoldenTime) score += 1.5; // 09:00~09:30 - 대표본 재검증에서 유효 확인되어 가점 복구
+      if (isGoldenTime) score += 0.3; // 09:00~09:30 - 대표본 재검증에서 효과가 사실상 소멸(0.0018)해 가점 대폭 축소
       if (weakMarket) score -= 1.5; // 코스피/코스닥 동반 약세 - 급등주 신호 신뢰도 하락
       return { ...r, recoScore: score, accelerating, comboBuySignal: !!(r.bidTurnedPositive && r.buyReqSpike), volumeConfirmed: !!volumeConfirmed, realPullback };
     })
@@ -1977,11 +1980,11 @@ async function load() {
       ? '<div class="momentumLine">' +
         (r.comboBuySignal ? '<span class="delta">🔥강한매수세</span>' : '') +
         (r.comboBuySignal && (r.volumeConfirmed || r.accelerating || r.realPullback) ? ' · ' : '') +
-        (r.volumeConfirmed ? '<span class="delta">✅거래량동반확인</span>' : '') +
+        (r.volumeConfirmed ? '<span class="delta down">⚠️거래량과열주의</span>' : '') +
         (r.volumeConfirmed && (r.accelerating || r.realPullback) ? ' · ' : '') +
         (r.accelerating ? '<span class="delta">⚡가속중</span>' : '') +
         (r.accelerating && r.realPullback ? ' · ' : '') +
-        (r.realPullback ? '<span class="delta">🌊눌림목재상승(수급동반)</span>' : '') +
+        (r.realPullback ? '<span class="delta">🌊눌림목재상승(참고용)</span>' : '') +
         '</div>'
       : ''),
   '데이터 없음', undefined, '추천종목TOP10');
