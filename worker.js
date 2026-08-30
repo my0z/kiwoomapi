@@ -12,7 +12,8 @@
  *
  * Cron (UTC 기준, 평일 KST 09:01~15:15 커버):
  *   2분 간격으로 실행 (UTC 0-6시 범위, 실제 경계는 isMarketHoursKST()에서 처리)
- *   (키움 TR 초당1건 제한에는 여유있게 안 걸림. D1 무료플랜 일 5만건 쓰기 제한 감안한 값)
+ *   (키움 TR 초당1건 제한에는 여유있게 안 걸림. 예전엔 D1 무료플랜 일 5만건 쓰기 제한도 근거였으나
+ *    유료 전환(2026-08) 이후 그 제약은 해소됨 - 지금은 스냅샷 정밀도상 이 정도면 충분해서 유지)
  * (코드 안에서도 09:01~15:15 KST가 아니면 스킵하므로 이중 안전장치)
  */
 
@@ -235,9 +236,9 @@ async function checkWatchlistRiskLevels(env) {
 
       // 화면에 보여주는 손절/익절 라인 - 예전엔 ATR(당일봉 포함 버그로 과대계산돼 손절선이 진입가
       // 대비 -40%~-70%까지 벌어지는 경우가 있었음) 기반이었는데, 실제 청산 판단은 항상 이 함수의
-      // 고정 손익률 기준을 썼음 - 즉 화면에 보이는 라인과 실제 작동하는 로직이 서로 다른 "장식"
-      // 상태였음. 이제 실제 판단 기준(고정 -2.5%/+3.5%)을 그대로 가격으로 환산해서 보여줘서
-      // 화면 표시와 실제 동작이 항상 일치하게 함.
+      // 고정 손익률 기준(AUTO_REMOVE_PNL_PCT/AUTO_TAKE_PROFIT_PNL_PCT)을 썼음 - 즉 화면에 보이는
+      // 라인과 실제 작동하는 로직이 서로 다른 "장식" 상태였음. 이제 그 실제 판단 기준을 그대로
+      // 가격으로 환산해서 보여줘서 화면 표시와 실제 동작이 항상 일치하게 함.
       let stopLoss = null, takeProfit = null, status = "safe";
       if (w.entry_price && w.entry_price > 0) {
         stopLoss = Math.round(w.entry_price * (1 + AUTO_REMOVE_PNL_PCT / 100));
@@ -369,22 +370,23 @@ function computeRealisticPnlServer(entryPrice, exitPrice, budget) {
 // 편입되자마자 몇 초 안에 퇴출당하는 문제가 있었음(외부 분석: 12:22 배치 10종목 중 7건이
 // 수 초 내 삭제, 그중 6건은 pnl=0인 채로 "익절삭제" 라벨이 붙어 통계까지 오염시킴).
 // 이 함수는 삽입 전에 호출해서, 방금 넣을 종목이 아예 비교 대상에 안 들어가게 함.
-async function makeRoomForNewEntry(env) {
+async function makeRoomForNewEntry(env, protectedCode) {
   const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM watchlist`).first().catch(() => null);
   const overCount = countRow ? countRow.c - (WATCHLIST_MAX_SIZE - 1) : 0; // 삽입 후 정확히 MAX가 되도록 MAX-1까지 비움
   if (overCount <= 0) return;
-  await evictWorstWatchlistEntries(env, overCount);
+  await evictWorstWatchlistEntries(env, overCount, protectedCode);
 }
 
 // 관심종목 중 손익률이 가장 나쁜 순으로 n개를 실제 현재가로 청산 - enforceWatchlistCap과
-// makeRoomForNewEntry가 공용으로 씀
-async function evictWorstWatchlistEntries(env, n) {
+// makeRoomForNewEntry가 공용으로 씀. protectedCode가 있으면 그 종목은 아무리 성적이 나빠도
+// 이번 청산 대상에서 제외함 - 방금 막 추가된 종목이 pnl≈0이라 "최악"으로 잘못 잡히는 것 방지.
+async function evictWorstWatchlistEntries(env, n, protectedCode) {
   const allRes = await env.DB.prepare(
     `SELECT code, name, entry_price, added_at, source_board, added_state FROM watchlist`
   )
     .all()
     .catch(() => ({ results: [] }));
-  const all = allRes.results || [];
+  const all = (allRes.results || []).filter((w) => w.code !== protectedCode);
   if (!all.length) return;
 
   let liveStocks = {};
@@ -4840,9 +4842,9 @@ async function runDailySignalBacktest(env) {
   }
 }
 
-// 관심종목 30초 촘촘 기록 - 전체 150~200종목을 이 주기로 D1에 쓰면 하루 쓰기 한도(10만행)를 넘기지만,
-// 관심종목은 보통 15~20개뿐이라 여유 충분함. 새 cron을 안 만들고, 화면이 열려있는 동안 이미 2초마다
-// 도는 실시간 폴링(이 함수를 부르는 /api/realtime-all)에 편승 - 화면 안 보고 있으면 자연히 기록도 안 됨
+// 관심종목 30초 촘촘 기록 - 관심종목은 상한(WATCHLIST_MAX_SIZE=10)이 있어 하루 쓰기 한도(10만행) 대비
+// 여유 충분함. 새 cron을 안 만들고, 화면이 열려있는 동안 이미 2초마다 도는 실시간 폴링(이 함수를 부르는
+// /api/realtime-all)에 편승 - 화면 안 보고 있으면 자연히 기록도 안 됨
 // (Cloudflare cron 최소 단위가 1분이라 cron으로는 애초에 30초 주기가 불가능함)
 const FINE_SNAPSHOT_INTERVAL_MS = 30000;
 async function maybeWriteFineWatchlistSnapshot(env, codes, stocks) {
@@ -4984,10 +4986,6 @@ self.addEventListener('fetch', (e) => {
               // 이번 시도 실패, 다음 루프에서 재시도 (마지막 시도까지 실패하면 0으로 저장, 프론트에서 재시도 유도)
             }
           }
-          // 삽입 전에 기존 종목 중에서만 자리를 미리 비워둠 - 방금 넣을 종목이 비교 대상에 안 들어가서
-          // 편입되자마자 몇 초 안에 퇴출당하는 문제를 원천 차단함 (자세한 이유는 함수 주석 참고)
-          await makeRoomForNewEntry(env);
-
           const addedAtNow = new Date().toISOString();
           await env.DB.prepare(
             `INSERT OR REPLACE INTO watchlist (code, name, added_at, entry_price, source_board, added_state) VALUES (?, ?, ?, ?, ?, ?)`
@@ -4995,6 +4993,12 @@ self.addEventListener('fetch', (e) => {
             .bind(code, name, addedAtNow, entryPrice, sourceBoard || "", addedState || "")
             .run();
           await logSystemEvent(env, "watchlist_added", `${name}(${code}) 관심종목 추가 [${sourceBoard || "수동"}]`);
+
+          // 정원초과 정리(relay 왕복 포함)를 백그라운드로 이동 - 예전엔 삽입 전에 매번 기다리게 했는데,
+          // 장중 관심종목이 거의 항상 꽉 차있는 상태라(하루 수십 번 추가/삭제) 활동이 많을수록 이 대기가
+          // 잦아져서 "장중에 버벅거림"의 주요 원인이 됐음. 방금 넣은 종목(code)은 청산 후보에서 제외해
+          // 두므로 백그라운드로 미뤄도 예전 버그(신규종목 pnl≈0으로 즉시퇴출)는 재발하지 않음.
+          ctx.waitUntil(makeRoomForNewEntry(env, code));
 
           // SNS 급등 조짐 태깅 - 응답 속도에 영향 안 주게 백그라운드로 실행. 매수/매도 판단에
           // 아직 안 쓰고 added_state에 태그만 남겨서 며칠간 성과 추적 후 실제 도움되는지 검증할 예정.
@@ -5772,14 +5776,29 @@ self.addEventListener('fetch', (e) => {
           const code = url.searchParams.get("code");
           const period = url.searchParams.get("period") || "5";
           if (!code) return Response.json({ ok: false, error: "code 누락" }, { status: 400 });
+
+          // 모달이 열려있는 동안 3초마다 자동갱신되는데(CHART_REFRESH_MS), 그때마다 키움 TR을
+          // 새로 호출하면 대부분 안 바뀐 과거 봉까지 매번 다시 받아오는 낭비가 큼. 15초 캐시로
+          // 3초 주기 요청 중 대부분(약 4~5번 중 1번만 실제 조회)을 즉시 응답 처리 - 체감 로딩속도
+          // 개선 + 키움 TR 호출량(초당1건 제한 공유자원) 절약.
+          const CACHE_KEY = `chart-v1-${code}-${period}`;
+          if (env.CACHE_KV) {
+            const cached = await env.CACHE_KV.get(CACHE_KEY, "json").catch(() => null);
+            if (cached) return Response.json(cached);
+          }
+
           const token = await kiwoomIssueToken(env);
           const raw = await kiwoomChart(env, token, code, period);
           const parsed = parseKiwoomChart(raw);
-          return Response.json({
+          const payload = {
             ok: true,
             prices: parsed.map((p) => p.price),
             times: parsed.map((p) => p.time),
-          });
+          };
+          if (env.CACHE_KV) {
+            ctx.waitUntil(env.CACHE_KV.put(CACHE_KEY, JSON.stringify(payload), { expirationTtl: 15 }).catch(() => {}));
+          }
+          return Response.json(payload);
         } catch (e) {
           return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
         }
