@@ -1,8 +1,13 @@
 {
-  "name": "naversise",
+  "name": "kiwoom-relay",
   "version": "1.0.0",
   "private": true,
+  "description": "키움증권 웹소켓 실시간 시세 릴레이 (Oracle VM 상주 프로세스)",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
   "dependencies": {
-    "fflate": "^0.8.2"
+    "ws": "^8.18.0"
   }
 }
