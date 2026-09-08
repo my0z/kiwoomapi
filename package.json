@@ -1,13 +1,10 @@
 {
-  "name": "kiwoom-relay",
+  "name": "kiwoomapi",
   "version": "1.0.0",
   "private": true,
-  "description": "키움증권 웹소켓 실시간 시세 릴레이 (Oracle VM 상주 프로세스)",
-  "main": "relay.js",
-  "scripts": {
-    "start": "node relay.js"
-  },
+  "description": "kiwoomapi Cloudflare Worker",
+  "main": "worker.js",
   "dependencies": {
-    "ws": "^8.18.0"
+    "fflate": "^0.8.3"
   }
 }
